@@ -179,7 +179,7 @@ fn is_wrapper_invocation(args: &[OsString]) -> bool {
         .and_then(OsStr::to_str)
         .unwrap_or_default();
     let name = name.strip_suffix(".exe").unwrap_or(name);
-    name == "rustc" || name.starts_with("rustc-")
+    name == "rustc" || name.starts_with("rustc-") || name == "clippy-driver"
 }
 
 fn run_cli() -> Result<i32> {
@@ -954,7 +954,8 @@ fn is_relevant_environment_name(name: &str) -> bool {
         "TZ",
     ];
     const PREFIXES: &[&str] = &[
-        "AR_", "CARGO_", "CC_", "CFLAGS", "CPPFLAGS", "CXX_", "CXXFLAGS", "DEP_", "LDFLAGS", "RUST",
+        "AR_", "CARGO_", "CC_", "CFLAGS", "CLIPPY_", "CPPFLAGS", "CXX_", "CXXFLAGS", "DEP_",
+        "LDFLAGS", "RUST",
     ];
     const BELLOWS_CONTROL: &[&str] = &[
         "BELLOWS_AUTH_TOKEN",
@@ -2312,6 +2313,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recognizes_rustc_and_clippy_wrapper_invocations() {
+        for compiler in ["rustc", "rustc-1.92.0", "clippy-driver"] {
+            assert!(is_wrapper_invocation(&[
+                OsString::from("bellows"),
+                OsString::from(compiler),
+                OsString::from("-vV"),
+            ]));
+        }
+        assert!(!is_wrapper_invocation(&[
+            OsString::from("bellows"),
+            OsString::from("doctor"),
+        ]));
+    }
+
+    #[test]
     fn parses_cacheable_library_invocation() {
         let dir = std::env::temp_dir().join(format!("bellows-cli-test-{}", now_ms()));
         fs::create_dir_all(dir.join("out")).unwrap();
@@ -2506,5 +2522,7 @@ mod tests {
         assert!(is_relevant_environment_name("RUSTFLAGS"));
         assert!(is_relevant_environment_name("CARGO_MANIFEST_DIR"));
         assert!(is_relevant_environment_name("CC_x86_64_unknown_linux_gnu"));
+        assert!(is_relevant_environment_name("CLIPPY_ARGS"));
+        assert!(is_relevant_environment_name("CLIPPY_CONF_DIR"));
     }
 }

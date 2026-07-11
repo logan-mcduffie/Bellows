@@ -489,16 +489,25 @@ impl Invocation {
         if args.iter().any(|arg| arg == "-Z" || arg.starts_with("-Z")) {
             return Err("unstable compiler flags are not modeled".into());
         }
+        let crate_name = option_value(&args, "--crate-name").ok_or("missing --crate-name")?;
+        let declared_crate_types = multi_option_values(&args, "--crate-type");
+        let crate_types = if declared_crate_types.is_empty() {
+            vec!["bin".to_owned()]
+        } else {
+            declared_crate_types
+                .iter()
+                .flat_map(|value| value.split(','))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        if crate_types
+            .iter()
+            .any(|kind| !matches!(kind.as_str(), "lib" | "rlib"))
+        {
+            return Err(format!("linked crate type {}", crate_types.join(",")));
+        }
         if has_native_or_external_codegen_inputs(&args) {
             return Err("native linker or external codegen inputs are not modeled".into());
-        }
-        let crate_name = option_value(&args, "--crate-name").ok_or("missing --crate-name")?;
-        let crate_types = option_value(&args, "--crate-type").unwrap_or_else(|| "bin".into());
-        if crate_types
-            .split(',')
-            .any(|kind| !matches!(kind, "lib" | "rlib"))
-        {
-            return Err(format!("linked crate type {crate_types}"));
         }
         let out_dir = PathBuf::from(option_value(&args, "--out-dir").ok_or("missing --out-dir")?);
         let extra_filename =
@@ -583,8 +592,6 @@ fn has_native_or_external_codegen_inputs(args: &[String]) -> bool {
         };
         codegen.is_some_and(|value| {
             [
-                "link-arg=",
-                "link-args=",
                 "linker=",
                 "linker-plugin-lto=",
                 "profile-use=",
@@ -2329,6 +2336,81 @@ mod tests {
     }
 
     #[test]
+    fn accepts_inert_library_link_arguments() {
+        let dir = std::env::temp_dir().join(format!("bellows-cli-link-arg-{}", now_ms()));
+        fs::create_dir_all(dir.join("out")).unwrap();
+        fs::write(dir.join("lib.rs"), "pub fn answer() -> u8 { 42 }").unwrap();
+        let base = vec![
+            OsString::from("rustc"),
+            OsString::from("--crate-name"),
+            OsString::from("demo"),
+            dir.join("lib.rs").into_os_string(),
+            OsString::from("--crate-type=rlib"),
+            OsString::from("--emit=dep-info,metadata,link"),
+            OsString::from("-Cextra-filename=-abc"),
+            OsString::from("--out-dir"),
+            dir.join("out").into_os_string(),
+        ];
+
+        for link_args in [
+            vec![
+                OsString::from("-C"),
+                OsString::from("link-arg=-fuse-ld=lld"),
+            ],
+            vec![OsString::from("-Clink-arg=-fuse-ld=lld")],
+            vec![OsString::from("-Clink-args=-fuse-ld=lld")],
+            vec![
+                OsString::from("-C"),
+                OsString::from("link-arg=-Wl,-rpath,/x"),
+            ],
+        ] {
+            let mut raw = base.clone();
+            raw.extend(link_args);
+            Invocation::analyze(&raw).unwrap();
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn link_arguments_do_not_make_linked_crates_cacheable() {
+        for crate_type in ["bin", "rlib,cdylib"] {
+            let raw = vec![
+                OsString::from("rustc"),
+                OsString::from("--crate-name=demo"),
+                OsString::from(format!("--crate-type={crate_type}")),
+                OsString::from("-C"),
+                OsString::from("link-arg=-fuse-ld=lld"),
+            ];
+            assert!(Invocation::analyze(&raw).unwrap_err().contains("linked"));
+        }
+        let repeated = vec![
+            OsString::from("rustc"),
+            OsString::from("--crate-name=demo"),
+            OsString::from("--crate-type"),
+            OsString::from("rlib"),
+            OsString::from("--crate-type"),
+            OsString::from("cdylib"),
+            OsString::from("-C"),
+            OsString::from("link-arg=-fuse-ld=lld"),
+        ];
+        assert!(
+            Invocation::analyze(&repeated)
+                .unwrap_err()
+                .contains("linked crate type rlib,cdylib")
+        );
+        let default_bin = vec![
+            OsString::from("rustc"),
+            OsString::from("--crate-name=demo"),
+            OsString::from("-Clink-arg=-fuse-ld=lld"),
+        ];
+        assert!(
+            Invocation::analyze(&default_bin)
+                .unwrap_err()
+                .contains("linked")
+        );
+    }
+
+    #[test]
     fn bypasses_linked_and_incremental_invocations() {
         let bin = vec![
             OsString::from("rustc"),
@@ -2361,10 +2443,59 @@ mod tests {
             "-C".into(),
             "profile-use=/tmp/default.profdata".into()
         ]));
+        for input in [
+            vec!["-l".into(), "foo".into()],
+            vec!["-lstatic=foo".into()],
+            vec!["-Lnative=/opt/sdk".into()],
+            vec!["-C".into(), "linker-plugin-lto=/opt/plugin".into()],
+            vec!["-Cllvm-plugins=/opt/plugin".into()],
+            vec!["-Clinker=mold".into()],
+        ] {
+            assert!(has_native_or_external_codegen_inputs(&input));
+        }
         assert!(!has_native_or_external_codegen_inputs(&[
             "-L".into(),
             "dependency=/tmp/target".into()
         ]));
+        assert!(!has_native_or_external_codegen_inputs(&[
+            "-C".into(),
+            "link-arg=-fuse-ld=lld".into()
+        ]));
+    }
+
+    #[test]
+    fn rustc_library_link_arguments_are_byte_inert() {
+        let dir = std::env::temp_dir().join(format!("bellows-cli-link-inert-{}", now_ms()));
+        let plain = dir.join("plain");
+        let linked = dir.join("linked");
+        fs::create_dir_all(&plain).unwrap();
+        fs::create_dir_all(&linked).unwrap();
+        let source = dir.join("lib.rs");
+        fs::write(&source, "pub fn answer() -> u8 { 42 }").unwrap();
+
+        let compile = |out_dir: &Path, with_link_arg: bool| {
+            let mut command = Command::new("rustc");
+            command
+                .arg("--crate-name=demo")
+                .arg(&source)
+                .arg("--crate-type=rlib")
+                .arg("--emit=link,metadata")
+                .arg("--out-dir")
+                .arg(out_dir);
+            if with_link_arg {
+                command.arg("-Clink-arg=-fuse-ld=lld");
+            }
+            assert!(command.status().unwrap().success());
+        };
+        compile(&plain, false);
+        compile(&linked, true);
+        for output in ["libdemo.rlib", "libdemo.rmeta"] {
+            assert_eq!(
+                fs::read(plain.join(output)).unwrap(),
+                fs::read(linked.join(output)).unwrap()
+            );
+        }
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -1,0 +1,7 @@
+[package]
+name = "phase3-generator"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+

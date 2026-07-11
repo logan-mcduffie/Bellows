@@ -1,0 +1,8 @@
+[workspace]
+members = ["crates/forge-core", "crates/forge-engine", "crates/forge-cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+

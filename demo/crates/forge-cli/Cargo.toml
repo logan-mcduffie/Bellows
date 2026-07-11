@@ -1,0 +1,8 @@
+[package]
+name = "forge-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+forge-engine = { path = "../forge-engine" }
+

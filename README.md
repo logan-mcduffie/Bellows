@@ -99,8 +99,10 @@ receiving runner.
 
 The transparent rustc wrapper conservatively bypasses final binaries, tests, examples, procedural
 macros, dynamic/static libraries, compiler probes, incremental sessions, and
-ambiguous emit sets. Native search/link flags, response files, unstable flags,
-and external codegen inputs also bypass until modeled. Final binaries,
+ambiguous emit sets. Link arguments are inert for the cached library-only
+outputs and remain part of the cache key. Native search paths/libraries,
+explicit linkers, response files, unstable flags, and external codegen inputs
+still bypass until modeled. Final binaries,
 build-script products, and nested Cargo output can instead use `bellows action
 run`, whose explicit input/output manifest and isolated offline sandbox become
 the correctness boundary. A bypass is visible, not a silent correctness bet.

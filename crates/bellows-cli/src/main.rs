@@ -1028,7 +1028,9 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
     inputs.sort();
     inputs.dedup();
     for path in inputs {
-        let absolute = absolute_path(&path, &workspace);
+        let absolute = absolute_path(&path, &workspace)
+            .canonicalize()
+            .with_context(|| format!("canonicalize compiler input {}", path.display()))?;
         hash_field(
             &mut hasher,
             &format!(
@@ -1479,6 +1481,9 @@ fn capture_outputs(
                 absolute.display()
             )
         }
+        let absolute = absolute
+            .canonicalize()
+            .with_context(|| format!("canonicalize rustc dependency {}", absolute.display()))?;
         files.push(FileInput {
             path: identity.normalizer.normalize(&absolute.to_string_lossy()),
             digest: digest_file(&absolute)?,
@@ -1543,6 +1548,7 @@ fn tee(mut reader: impl Read, mut writer: impl Write) -> Result<Vec<u8>> {
 }
 
 fn publish(remote: &Remote, captured: Captured) -> Result<String> {
+    validate_candidate_manifest(&captured.candidate).context("validate captured candidate")?;
     for (digest, bytes) in captured.blobs {
         remote.put_blob(&digest, bytes)?;
     }
@@ -2546,7 +2552,7 @@ mod tests {
         fs::write(out_dir.join(rmeta_name), b"metadata").unwrap();
         fs::write(
             out_dir.join(dep_name),
-            format!("{rmeta_name}: {}\n", source.display()),
+            format!("{rmeta_name}: {}/src/../src/lib.rs\n", workspace.display()),
         )
         .unwrap();
         let invocation = Invocation {
@@ -2566,6 +2572,7 @@ mod tests {
         let stderr = format!("warning in {}", workspace.display()).into_bytes();
         let captured =
             capture_outputs(&invocation, &identity, stdout.clone(), stderr.clone()).unwrap();
+        assert_eq!(captured.candidate.files[0].path, "$WORKSPACE/src/lib.rs");
         assert_eq!(
             captured.candidate.stdout.len,
             identity.normalizer.normalize_bytes(&stdout).len() as u64

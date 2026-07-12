@@ -964,18 +964,24 @@ fn normalizer(workspace: &Path, out_dir: &Path) -> PathNormalizer {
     let target = target_root(workspace, out_dir);
     let mut bases = vec![("$WORKSPACE".into(), workspace.to_path_buf())];
     if let Some(target) = target {
-        bases.push(("$TARGET".into(), target));
+        bases.push(("$TARGET".into(), canonical_base(target)));
     }
-    if let Some(value) = env::var_os("CARGO_HOME") {
-        bases.push(("$CARGO_HOME".into(), PathBuf::from(value)));
+    let home = env::var_os("HOME").map(PathBuf::from);
+    if let Some(cargo_home) = env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|home| home.join(".cargo")))
+    {
+        bases.push(("$CARGO_HOME".into(), canonical_base(cargo_home)));
     }
-    if let Some(value) = env::var_os("RUSTUP_HOME") {
-        bases.push(("$RUSTUP_HOME".into(), PathBuf::from(value)));
-    }
-    if let Some(value) = env::var_os("HOME") {
-        bases.push(("$HOME".into(), PathBuf::from(value)));
+    bases.push(("$RUSTUP_HOME".into(), canonical_base(rustup_home())));
+    if let Some(home) = home {
+        bases.push(("$HOME".into(), canonical_base(home)));
     }
     PathNormalizer::new(bases)
+}
+
+fn canonical_base(path: PathBuf) -> PathBuf {
+    path.canonicalize().unwrap_or(path)
 }
 
 fn target_root(workspace: &Path, out_dir: &Path) -> Option<PathBuf> {
@@ -2506,6 +2512,19 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn normalizer_bases_resolve_symlinked_mounts() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        let alias = temp.path().join("alias");
+        fs::create_dir(&real).unwrap();
+        symlink(&real, &alias).unwrap();
+        assert_eq!(canonical_base(alias), real.canonicalize().unwrap());
+    }
+
     #[test]
     fn prior_protocol_candidates_are_cleanly_rejected() {
         let workspace = std::env::temp_dir().join(format!("bellows-protocol-test-{}", now_ms()));
@@ -2541,7 +2560,11 @@ mod tests {
     #[test]
     fn captured_stream_lengths_describe_normalized_bytes() {
         let temp = tempfile::tempdir().unwrap();
-        let workspace = temp.path().join("a-very-long-workspace-name");
+        let workspace = temp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("a-very-long-workspace-name");
         let out_dir = workspace.join("target/debug/deps");
         fs::create_dir_all(&out_dir).unwrap();
         let source = workspace.join("src/lib.rs");

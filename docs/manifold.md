@@ -94,5 +94,12 @@ canonical lanes:
   to CI. Its syntactic surface result is diagnostic only and must never skip a
   required Manifold lane.
 
+# Exact-diagnostics tests
+
+Compiler-output snapshot tools such as `trybuild` and `macrotest` must run with
+`RUSTC_WRAPPER` disabled. Bellows remaps dependency metadata paths for portable
+cache hits; rustc cannot reopen those virtual paths to render dependency source
+snippets required by exact diagnostic fixtures.
+
 GPU/browser execution boundaries remain unchanged throughout: compilation and
 archives may move, but RTX 5080 golden/pixel tests execute on the GPU runner.

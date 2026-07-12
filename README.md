@@ -30,7 +30,8 @@ The showcase proves, with machine-checked assertions:
 3. Cached final links, build-script output, and a nested Cargo generator.
 4. Authenticated, toolchain-attested, single-flight remote Cargo execution.
 5. Advisory private/public-surface change analysis and downstream closure.
-6. Publish-once archive safety, precise invalidation, and reference-aware GC.
+6. Publish-once archive safety, precise invalidation, reference-aware GC, and
+   publication-race protection.
 
 For the shorter compiler-cache correctness suite, run `./scripts/demo.sh`. It
 proves these seven Phase 1 behaviors in a disposable workspace:
@@ -70,8 +71,10 @@ its verified runner-local L1 before the organization cache; set `BELLOWS_L1=0`
 when measuring remote behavior in isolation.
 
 For authentication, start `bellowsd` with `--auth-token` or
-`BELLOWS_AUTH_TOKEN` and give the client the same environment variable. Server
-data is durable across restarts.
+`BELLOWS_AUTH_TOKEN` and give the client the same environment variable. A
+non-loopback listener refuses to start without authentication. Server data is
+durable across restarts. See the [operator runbook](docs/operations.md) before
+running a shared service.
 
 ## What is safe to cache today
 
@@ -128,8 +131,13 @@ still use consistent checkout layouts for the best hit rate.
 | `bellowsd` | Run the durable HTTP CAS/action-cache service |
 
 Configuration is available as flags or `BELLOWS_SERVER`, `BELLOWS_AUTH_TOKEN`,
-`BELLOWS_DATA_DIR`, `BELLOWS_LISTEN`, and `BELLOWS_MAX_BLOB_MB` environment
-variables. The default per-blob upload ceiling is 512 MiB.
+`BELLOWS_DATA_DIR`, `BELLOWS_LISTEN`, `BELLOWS_MAX_BLOB_MB`, and
+`BELLOWS_MAX_REQUESTS` environment variables. The default per-blob upload
+ceiling is 512 MiB and the default concurrent request ceiling is 128.
+Client connection and overall request timeouts can be bounded with
+`BELLOWS_CONNECT_TIMEOUT_MS` (100–30,000) and `BELLOWS_REQUEST_TIMEOUT_MS`
+(1,000–600,000). `BELLOWS_MAX_WAIT_MS` bounds single-flight waiting from zero
+to 600,000 ms.
 
 ## Manifold
 
@@ -141,8 +149,9 @@ Bellows binary. See [the Manifold integration guide](docs/manifold.md).
 The first gains come from sharing stable Rust library work across fresh cloud
 runners and suppressing simultaneous cold duplication. GPU execution remains
 on the RTX 5080; Bellows only supplies portable compiler products there.
-The [validation record](docs/validation.md) includes a two-run Manifold smoke
-measurement and the exact local acceptance commands.
+The [validation record](docs/validation.md) includes the two-run smoke,
+full-pipeline cold/warm WarpBuild dogfood, browser parity, production canary,
+RTX 5080 evidence, and the exact local acceptance commands.
 
 ## Architecture and scope
 
@@ -156,8 +165,9 @@ The [product concept](bellows-concept.md) describes the commercial and
 compiler-internal destination. The [five-phase plan](five-phase-plan.md) records
 the implemented demonstrator's correctness boundaries and acceptance gates.
 
-Bellows is an advanced demonstrator, not yet a production managed service. In
-particular, it does not provide TLS termination, tenant isolation, quotas,
+Bellows' compiler cache is hardened for Manifold's trusted single-tenant use,
+but it is not yet a generally managed multi-tenant service. In particular, it
+does not provide TLS termination, tenant isolation, account quotas,
 microVM sandboxing, or a stable public protocol. Remote execution is disabled by
 default, requires bearer authentication, and provides trusted-single-tenant
 process/workspace isolation—not a hostile multi-tenant security boundary.
@@ -173,3 +183,6 @@ generic/inline/default-method/macro caveat, and it never authorizes a cache hit;
 stable downstream skipping still requires compiler-produced metadata.
 The current acceptance suite and Manifold integration target Linux runners;
 Windows dep-info and artifact behavior have not yet been qualified.
+
+The wire and on-disk formats are versioned but not yet stable. Review the
+[protocol policy](docs/protocol.md) before upgrading a running service.

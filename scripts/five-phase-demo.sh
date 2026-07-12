@@ -217,7 +217,9 @@ sed -n '1,80p' "$scratch/public-impact.json"
 
 section "Retention — reference-aware collection bounds durable storage"
 "$bellows" gc --max-mb 0 --server "$server" | tee "$scratch/gc.log"
-grep -q -- '-> 0 B' "$scratch/gc.log"
+# A rejected publish intentionally leaves a fresh orphan. GC protects fresh
+# uploads for one hour so it cannot race a blob-to-record publication.
+grep -Eq -- '-> [0-9]+ B,' "$scratch/gc.log"
 
 section "Five phases complete"
 echo "L1 + remote compiler cache; compile-once/test-many archives; final Cargo"

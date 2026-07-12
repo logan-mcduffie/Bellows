@@ -11,6 +11,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 scripts/demo.sh
 scripts/five-phase-demo.sh
+scripts/hardening.sh
 ```
 
 All passed. The demo machine-checks cold publication, fresh-runner remote hits,
@@ -22,7 +23,14 @@ publish-once test archives with two executors, cached final binaries, a
 `build.rs` that launches a nested offline Cargo generator, authenticated and
 toolchain-attested remote execution with concurrent single-flight, syntactic
 private/public surface analysis, downstream dependency closure, and
-reference-aware collection to a zero-byte budget.
+reference-aware collection to a zero-byte target while preserving a tiny fresh
+unpublished blob through its publication grace window.
+
+The hardening suite additionally verifies non-loopback authentication refusal,
+invalid resource-limit rejection, correct and incorrect bearer tokens,
+single-process data-directory ownership, liveness, clean SIGTERM shutdown,
+malformed server configuration fallback, corrupt L1 quarantine, and offline
+official-rustc fallback.
 
 Authentication was separately checked by starting `bellowsd --auth-token
 secret`: unauthenticated and incorrect-token health requests returned 401,
@@ -53,6 +61,35 @@ The fresh-runner smoke check was approximately 43% faster. It restored
 `serde-derive`, the proc-macro-consuming `serde` action, and downstream products
 whose extern identity changed bypassed or missed conservatively.
 
-This is a small integration smoke measurement, not a forecast for Manifold's
-full workflow. Full-pipeline acceptance still requires two representative CI
-runs and end-to-end wall-time, transfer, storage, and hit-rate comparison.
+## Manifold production dogfood
+
+Manifold PR [#133](https://github.com/Manifold-Game/manifold/pull/133) pins
+Bellows commit `f0d9ed1187f37c578a15f3db2ba23cee39350b66`. A full cold CI run
+([29175374542, attempt 1](https://github.com/Manifold-Game/manifold/actions/runs/29175374542))
+recorded 5,467 compiler misses, zero hits, zero fallbacks, and zero corrupt
+restores. The exact-ref rerun recorded 5,467 hits, zero misses, zero fallbacks,
+and zero corrupt restores. Both completed the required CPU matrix and retained
+RTX 5080 GPU gates successfully.
+
+The final integration commit was then validated cold and warm in
+[run 29176974713](https://github.com/Manifold-Game/manifold/actions/runs/29176974713).
+Both attempts passed the complete CI gate. The associated
+[browser parity run](https://github.com/Manifold-Game/manifold/actions/runs/29176974730)
+passed real-game jco/wasmtime parity, seeded pixel rendering, and dual-world
+single-player boot; the
+[production canary](https://github.com/Manifold-Game/manifold/actions/runs/29176974719)
+also passed its WarpBuild cache round trip.
+
+The same dogfood pass corrected Manifold's nextest partition and stabilized its
+Wasmtime component cache. The native integration lane now runs only real
+integration binaries (1,563 tests in the final merge candidate), with these
+measured Nextest execution times:
+
+| Runner state | Before | Final |
+|---|---:|---:|
+| Fresh WarpBuild VM | 229.57s | 44.53s |
+| Fresh VM with restored runtime cache | n/a | 8.56s |
+
+The complete integration job fell from 527 seconds to 311 seconds cold and 248
+seconds warm. This is end-to-end production evidence rather than an extrapolation
+from the small smoke target above.

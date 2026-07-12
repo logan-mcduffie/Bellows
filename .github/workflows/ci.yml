@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -16,5 +19,47 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - run: cargo build --workspace --bins --release --locked
       - run: scripts/demo.sh
+      - run: scripts/five-phase-demo.sh
+      - run: scripts/hardening.sh
 
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: docker build --tag bellows:test .
+      - name: Verify container auth policy and health
+        run: |
+          set -euo pipefail
+          wait_healthy() {
+            for attempt in $(seq 1 30); do
+              status="$(docker inspect --format '{{.State.Health.Status}}' bellows-test)"
+              [ "$status" = healthy ] && return 0
+              [ "$status" = unhealthy ] && return 1
+              sleep 1
+            done
+            return 1
+          }
+          docker volume create bellows-test-data >/dev/null
+          docker run --detach --rm --name bellows-test \
+            --env BELLOWS_AUTH_TOKEN=ci-secret \
+            --volume bellows-test-data:/var/lib/bellows \
+            bellows:test
+          wait_healthy
+          docker stop --time 10 bellows-test
+          docker run --detach --rm --name bellows-test \
+            --env BELLOWS_AUTH_TOKEN=ci-secret \
+            --volume bellows-test-data:/var/lib/bellows \
+            bellows:test
+          wait_healthy
+          docker stop --time 10 bellows-test
+          docker volume rm bellows-test-data >/dev/null
+
+  security-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

@@ -3,11 +3,15 @@ use bellows_core::{
     ActionCandidate, ArchiveManifest, Artifact, CandidateIndex, DeclaredActionRecord, EnvInput,
     Event, ExecuteRequest, ExecuteResponse, FileInput, GcReport, GcRequest, HealthResponse,
     LeaseRequest, LeaseResponse, PROTOCOL_VERSION, PathNormalizer, PlatformIdentity, ServerStats,
-    Store, StreamArtifact, atomic_write, declared_action_key, digest_bytes, digest_file, now_ms,
-    parse_dep_info, rustup_home, tree_digest, validate_declared_command, validate_relative_path,
+    Store, StreamArtifact, atomic_write, compiler_action_key, declared_action_key, digest_bytes,
+    digest_file, now_ms, parse_dep_info, rustup_home, tree_digest, validate_archive_manifest,
+    validate_candidate_manifest, validate_declared_command, validate_declared_record,
+    validate_relative_path,
 };
 use clap::{Args, Parser, Subcommand};
+use fs2::FileExt;
 use reqwest::StatusCode;
+use reqwest::Url;
 use reqwest::blocking::{Client, RequestBuilder};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -282,12 +286,38 @@ struct Remote {
 
 impl Remote {
     fn new(base: &str, token: Option<String>) -> Result<Self> {
+        let parsed = Url::parse(base).context("parse Bellows server URL")?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            bail!(
+                "Bellows server must be an HTTP(S) base URL without credentials, query, or fragment"
+            )
+        }
+        let connect_timeout = bounded_timeout(
+            "BELLOWS_CONNECT_TIMEOUT_MS",
+            env::var("BELLOWS_CONNECT_TIMEOUT_MS").ok().as_deref(),
+            2_000,
+            100,
+            30_000,
+        )?;
+        let request_timeout = bounded_timeout(
+            "BELLOWS_REQUEST_TIMEOUT_MS",
+            env::var("BELLOWS_REQUEST_TIMEOUT_MS").ok().as_deref(),
+            120_000,
+            1_000,
+            600_000,
+        )?;
         Ok(Self {
-            base: base.trim_end_matches('/').to_owned(),
+            base: parsed.as_str().trim_end_matches('/').to_owned(),
             token: token.filter(|value| !value.is_empty()),
             client: Client::builder()
-                .connect_timeout(Duration::from_secs(2))
-                .timeout(Duration::from_secs(120))
+                .connect_timeout(connect_timeout)
+                .timeout(request_timeout)
                 .build()?,
         })
     }
@@ -364,10 +394,16 @@ impl Remote {
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        Ok(Some(response.error_for_status()?.json()?))
+        let record: DeclaredActionRecord = response.error_for_status()?.json()?;
+        validate_declared_record(&record)?;
+        if record.key != key {
+            bail!("remote declared record does not match requested key")
+        }
+        Ok(Some(record))
     }
 
     fn put_declared(&self, record: &DeclaredActionRecord) -> Result<()> {
+        validate_declared_record(record)?;
         self.auth(
             self.client
                 .put(format!("{}/v1/declared/{}", self.base, record.key)),
@@ -385,10 +421,16 @@ impl Remote {
         if response.status() == StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        Ok(Some(response.error_for_status()?.json()?))
+        let manifest: ArchiveManifest = response.error_for_status()?.json()?;
+        validate_archive_manifest(&manifest)?;
+        if manifest.name != name {
+            bail!("remote archive does not match requested name")
+        }
+        Ok(Some(manifest))
     }
 
     fn put_archive(&self, manifest: &ArchiveManifest) -> Result<()> {
+        validate_archive_manifest(manifest)?;
         self.auth(
             self.client
                 .put(format!("{}/v1/archives/{}", self.base, manifest.name)),
@@ -451,6 +493,25 @@ impl Remote {
             )
             .send();
     }
+}
+
+fn bounded_timeout(
+    name: &str,
+    value: Option<&str>,
+    default_ms: u64,
+    minimum_ms: u64,
+    maximum_ms: u64,
+) -> Result<Duration> {
+    let milliseconds = match value {
+        Some(value) => value
+            .parse::<u64>()
+            .with_context(|| format!("{name} must be an integer number of milliseconds"))?,
+        None => default_ms,
+    };
+    if !(minimum_ms..=maximum_ms).contains(&milliseconds) {
+        bail!("{name} must be between {minimum_ms} and {maximum_ms} milliseconds")
+    }
+    Ok(Duration::from_millis(milliseconds))
 }
 
 #[derive(Debug)]
@@ -647,15 +708,34 @@ struct Identity {
 }
 
 fn rustc_wrapper(raw: &[OsString]) -> Result<ExitStatus> {
+    match cache_or_compile(raw) {
+        Ok(status) => Ok(status),
+        Err(error) => {
+            let crate_name = wrapper_crate_name(raw);
+            record_event(
+                "fallback",
+                crate_name,
+                None,
+                None,
+                &format!("cache pipeline failed; retrying official rustc: {error:#}"),
+            );
+            passthrough(raw)
+        }
+    }
+}
+
+fn wrapper_crate_name(raw: &[OsString]) -> &str {
+    raw.windows(2)
+        .find(|pair| pair[0] == "--crate-name")
+        .and_then(|pair| pair[1].to_str())
+        .unwrap_or("rustc")
+}
+
+fn cache_or_compile(raw: &[OsString]) -> Result<ExitStatus> {
     let invocation = match Invocation::analyze(raw) {
         Ok(invocation) => invocation,
         Err(reason) => {
-            let crate_name = raw
-                .windows(2)
-                .find(|pair| pair[0] == "--crate-name")
-                .and_then(|pair| pair[1].to_str())
-                .unwrap_or("rustc");
-            record_event("bypass", crate_name, None, None, &reason);
+            record_event("bypass", wrapper_crate_name(raw), None, None, &reason);
             return passthrough(raw);
         }
     };
@@ -673,16 +753,56 @@ fn rustc_wrapper(raw: &[OsString]) -> Result<ExitStatus> {
         }
     };
     let server = env::var("BELLOWS_SERVER").unwrap_or_else(|_| "http://127.0.0.1:7878".into());
-    let remote = Remote::new(&server, env::var("BELLOWS_AUTH_TOKEN").ok())?;
+    let remote = match Remote::new(&server, env::var("BELLOWS_AUTH_TOKEN").ok()) {
+        Ok(remote) => remote,
+        Err(error) => {
+            record_event(
+                "fallback",
+                &invocation.crate_name,
+                Some(&identity.static_key),
+                None,
+                &format!("invalid remote configuration: {error}"),
+            );
+            return passthrough(raw);
+        }
+    };
     let l1 = if env::var("BELLOWS_L1").as_deref() == Ok("0") {
         None
     } else {
-        Store::open(state_dir(&identity.workspace).join("l1")).ok()
+        match Store::open(state_dir(&identity.workspace).join("l1")) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                record_event(
+                    "fallback",
+                    &invocation.crate_name,
+                    Some(&identity.static_key),
+                    None,
+                    &format!("L1 is unavailable: {error:#}"),
+                );
+                None
+            }
+        }
     };
     if let Some(store) = &l1 {
-        let index = store.read_candidates(&identity.static_key)?;
-        if let Some(status) = try_l1_candidates(store, &invocation, &identity, &index)? {
-            return Ok(status);
+        match store.read_candidates(&identity.static_key) {
+            Ok(index) => match try_l1_candidates(store, &invocation, &identity, &index) {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) => {}
+                Err(error) => record_event(
+                    "fallback",
+                    &invocation.crate_name,
+                    Some(&identity.static_key),
+                    None,
+                    &format!("L1 restore failed: {error:#}"),
+                ),
+            },
+            Err(error) => record_event(
+                "fallback",
+                &invocation.crate_name,
+                Some(&identity.static_key),
+                None,
+                &format!("L1 index is unavailable or corrupt: {error:#}"),
+            ),
         }
     }
 
@@ -728,13 +848,26 @@ fn rustc_wrapper(raw: &[OsString]) -> Result<ExitStatus> {
                     None,
                     "another runner owns this cold action",
                 );
-                let deadline = Instant::now()
-                    + Duration::from_millis(
-                        env::var("BELLOWS_MAX_WAIT_MS")
-                            .ok()
-                            .and_then(|v| v.parse().ok())
-                            .unwrap_or(30_000),
-                    );
+                let max_wait = match bounded_timeout(
+                    "BELLOWS_MAX_WAIT_MS",
+                    env::var("BELLOWS_MAX_WAIT_MS").ok().as_deref(),
+                    30_000,
+                    0,
+                    600_000,
+                ) {
+                    Ok(duration) => duration,
+                    Err(error) => {
+                        record_event(
+                            "fallback",
+                            &invocation.crate_name,
+                            Some(&identity.static_key),
+                            None,
+                            &format!("invalid single-flight wait limit: {error}"),
+                        );
+                        Duration::ZERO
+                    }
+                };
+                let deadline = Instant::now() + max_wait;
                 while Instant::now() < deadline && now_ms() < expires_ms {
                     thread::sleep(Duration::from_millis(retry_after_ms.clamp(50, 1_000)));
                     if let Ok(index) = remote.candidates(&identity.static_key)
@@ -831,18 +964,24 @@ fn normalizer(workspace: &Path, out_dir: &Path) -> PathNormalizer {
     let target = target_root(workspace, out_dir);
     let mut bases = vec![("$WORKSPACE".into(), workspace.to_path_buf())];
     if let Some(target) = target {
-        bases.push(("$TARGET".into(), target));
+        bases.push(("$TARGET".into(), canonical_base(target)));
     }
-    if let Some(value) = env::var_os("CARGO_HOME") {
-        bases.push(("$CARGO_HOME".into(), PathBuf::from(value)));
+    let home = env::var_os("HOME").map(PathBuf::from);
+    if let Some(cargo_home) = env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|home| home.join(".cargo")))
+    {
+        bases.push(("$CARGO_HOME".into(), canonical_base(cargo_home)));
     }
-    if let Some(value) = env::var_os("RUSTUP_HOME") {
-        bases.push(("$RUSTUP_HOME".into(), PathBuf::from(value)));
-    }
-    if let Some(value) = env::var_os("HOME") {
-        bases.push(("$HOME".into(), PathBuf::from(value)));
+    bases.push(("$RUSTUP_HOME".into(), canonical_base(rustup_home())));
+    if let Some(home) = home {
+        bases.push(("$HOME".into(), canonical_base(home)));
     }
     PathNormalizer::new(bases)
+}
+
+fn canonical_base(path: PathBuf) -> PathBuf {
+    path.canonicalize().unwrap_or(path)
 }
 
 fn target_root(workspace: &Path, out_dir: &Path) -> Option<PathBuf> {
@@ -895,7 +1034,9 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
     inputs.sort();
     inputs.dedup();
     for path in inputs {
-        let absolute = absolute_path(&path, &workspace);
+        let absolute = absolute_path(&path, &workspace)
+            .canonicalize()
+            .with_context(|| format!("canonicalize compiler input {}", path.display()))?;
         hash_field(
             &mut hasher,
             &format!(
@@ -981,9 +1122,7 @@ fn validate_candidate(
     candidate: &ActionCandidate,
     identity: &Identity,
 ) -> std::result::Result<(), String> {
-    if candidate.protocol != PROTOCOL_VERSION {
-        return Err(format!("protocol {} is unsupported", candidate.protocol));
-    }
+    validate_candidate_manifest(candidate).map_err(|error| error.to_string())?;
     for input in &candidate.files {
         let localized = identity.normalizer.localize(&input.path);
         let path = absolute_path(Path::new(&localized), &identity.workspace);
@@ -1113,6 +1252,7 @@ fn restore(
     identity: &Identity,
     candidate: &ActionCandidate,
 ) -> Result<()> {
+    validate_candidate_manifest(candidate)?;
     let supplied = candidate
         .artifacts
         .iter()
@@ -1128,11 +1268,22 @@ fn restore(
             bail!("manifest is missing expected output {expected}")
         }
     }
+    let mut downloaded = Vec::with_capacity(candidate.artifacts.len());
     for artifact in &candidate.artifacts {
         if !invocation.expected_names.contains(&artifact.file_name) {
             bail!("manifest contains unexpected output {}", artifact.file_name)
         }
         let stored = remote.blob(&artifact.digest)?;
+        downloaded.push((artifact, stored));
+    }
+    let stdout_blob = remote.blob(&candidate.stdout.digest)?;
+    let stderr_blob = remote.blob(&candidate.stderr.digest)?;
+    if stdout_blob.len() as u64 != candidate.stdout.len
+        || stderr_blob.len() as u64 != candidate.stderr.len
+    {
+        bail!("compiler stream length does not match manifest")
+    }
+    for (artifact, stored) in downloaded {
         if let Some(store) = l1 {
             let _ = store.put_blob(&artifact.digest, &stored);
         }
@@ -1151,8 +1302,6 @@ fn restore(
             )?;
         }
     }
-    let stdout_blob = remote.blob(&candidate.stdout.digest)?;
-    let stderr_blob = remote.blob(&candidate.stderr.digest)?;
     if let Some(store) = l1 {
         let _ = store.put_blob(&candidate.stdout.digest, &stdout_blob);
         let _ = store.put_blob(&candidate.stderr.digest, &stderr_blob);
@@ -1170,6 +1319,7 @@ fn restore_l1(
     identity: &Identity,
     candidate: &ActionCandidate,
 ) -> Result<()> {
+    validate_candidate_manifest(candidate)?;
     let supplied = candidate
         .artifacts
         .iter()
@@ -1185,6 +1335,7 @@ fn restore_l1(
             bail!("L1 manifest is missing expected output {expected}")
         }
     }
+    let mut downloaded = Vec::with_capacity(candidate.artifacts.len());
     for artifact in &candidate.artifacts {
         if !invocation.expected_names.contains(&artifact.file_name) {
             bail!(
@@ -1193,6 +1344,16 @@ fn restore_l1(
             )
         }
         let stored = store.read_blob(&artifact.digest)?;
+        downloaded.push((artifact, stored));
+    }
+    let stdout_blob = store.read_blob(&candidate.stdout.digest)?;
+    let stderr_blob = store.read_blob(&candidate.stderr.digest)?;
+    if stdout_blob.len() as u64 != candidate.stdout.len
+        || stderr_blob.len() as u64 != candidate.stderr.len
+    {
+        bail!("L1 compiler stream length does not match manifest")
+    }
+    for (artifact, stored) in downloaded {
         let bytes = if artifact.file_name.ends_with(".d") {
             identity.normalizer.localize_bytes(&stored)
         } else {
@@ -1200,12 +1361,8 @@ fn restore_l1(
         };
         atomic_write(&invocation.out_dir.join(&artifact.file_name), &bytes)?;
     }
-    let stdout = identity
-        .normalizer
-        .localize_bytes(&store.read_blob(&candidate.stdout.digest)?);
-    let stderr = identity
-        .normalizer
-        .localize_bytes(&store.read_blob(&candidate.stderr.digest)?);
+    let stdout = identity.normalizer.localize_bytes(&stdout_blob);
+    let stderr = identity.normalizer.localize_bytes(&stderr_blob);
     std::io::stdout().write_all(&stdout)?;
     std::io::stderr().write_all(&stderr)?;
     Ok(())
@@ -1324,12 +1481,19 @@ fn capture_outputs(
     let mut files = Vec::new();
     for path in file_paths {
         let absolute = absolute_path(&path, &identity.workspace);
-        if absolute.is_file() {
-            files.push(FileInput {
-                path: identity.normalizer.normalize(&absolute.to_string_lossy()),
-                digest: digest_file(&absolute)?,
-            });
+        if !absolute.is_file() {
+            bail!(
+                "rustc dependency disappeared before capture: {}",
+                absolute.display()
+            )
         }
+        let absolute = absolute
+            .canonicalize()
+            .with_context(|| format!("canonicalize rustc dependency {}", absolute.display()))?;
+        files.push(FileInput {
+            path: identity.normalizer.normalize(&absolute.to_string_lossy()),
+            digest: digest_file(&absolute)?,
+        });
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
     files.dedup_by(|a, b| a.path == b.path);
@@ -1348,9 +1512,11 @@ fn capture_outputs(
     let normalized_stderr = identity.normalizer.normalize_bytes(&stderr);
     let stdout_digest = digest_bytes(&normalized_stdout);
     let stderr_digest = digest_bytes(&normalized_stderr);
+    let stdout_len = normalized_stdout.len() as u64;
+    let stderr_len = normalized_stderr.len() as u64;
     blobs.insert(stdout_digest.clone(), normalized_stdout);
     blobs.insert(stderr_digest.clone(), normalized_stderr);
-    let action_key = compute_action_key(&identity.static_key, &files, &env_inputs);
+    let action_key = compiler_action_key(&identity.static_key, &files, &env_inputs);
     let candidate = ActionCandidate {
         protocol: PROTOCOL_VERSION,
         static_key: identity.static_key.clone(),
@@ -1362,11 +1528,11 @@ fn capture_outputs(
         artifacts,
         stdout: StreamArtifact {
             digest: stdout_digest,
-            len: stdout.len() as u64,
+            len: stdout_len,
         },
         stderr: StreamArtifact {
             digest: stderr_digest,
-            len: stderr.len() as u64,
+            len: stderr_len,
         },
     };
     Ok(Captured { candidate, blobs })
@@ -1387,23 +1553,8 @@ fn tee(mut reader: impl Read, mut writer: impl Write) -> Result<Vec<u8>> {
     Ok(captured)
 }
 
-fn compute_action_key(static_key: &str, files: &[FileInput], env: &[EnvInput]) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hash_field(&mut hasher, "static", static_key.as_bytes());
-    hash_field(
-        &mut hasher,
-        "files",
-        &serde_json::to_vec(files).unwrap_or_default(),
-    );
-    hash_field(
-        &mut hasher,
-        "env",
-        &serde_json::to_vec(env).unwrap_or_default(),
-    );
-    hasher.finalize().to_hex().to_string()
-}
-
 fn publish(remote: &Remote, captured: Captured) -> Result<String> {
+    validate_candidate_manifest(&captured.candidate).context("validate captured candidate")?;
     for (digest, bytes) in captured.blobs {
         remote.put_blob(&digest, bytes)?;
     }
@@ -1472,7 +1623,9 @@ fn record_event(
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path)
         && let Ok(line) = serde_json::to_string(&event)
     {
-        let _ = writeln!(file, "{line}");
+        let _ = file.lock_exclusive();
+        let _ = file.write_all(format!("{line}\n").as_bytes());
+        let _ = file.unlock();
     }
     if matches!(
         kind,
@@ -1487,22 +1640,29 @@ fn read_events() -> Result<Vec<Event>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    fs::read_to_string(path)?
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| Ok(serde_json::from_str(line)?))
-        .collect()
+    let mut file = fs::OpenOptions::new().read(true).open(path)?;
+    file.lock_shared()?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+    file.unlock()?;
+    let mut events = Vec::new();
+    let mut corrupt = 0usize;
+    for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+        match serde_json::from_str(line) {
+            Ok(event) => events.push(event),
+            Err(_) => corrupt += 1,
+        }
+    }
+    if corrupt > 0 {
+        eprintln!("bellows: ignored {corrupt} malformed event-log line(s)");
+    }
+    Ok(events)
 }
 
 fn doctor(server: &str, token: Option<&str>) -> Result<()> {
     let remote = Remote::new(server, token.map(str::to_owned))?;
     let health = remote.health().context("connect to bellowsd")?;
-    if health.protocol != PROTOCOL_VERSION {
-        bail!(
-            "protocol mismatch: client {PROTOCOL_VERSION}, server {}",
-            health.protocol
-        )
-    }
+    validate_protocol(health.protocol)?;
     let rustc = Command::new("rustc")
         .arg("-vV")
         .output()
@@ -1512,6 +1672,16 @@ fn doctor(server: &str, token: Option<&str>) -> Result<()> {
     println!("✓ protocol {}", health.protocol);
     println!("✓ {}", compiler.lines().next().unwrap_or("rustc"));
     println!("✓ local fallback enabled");
+    Ok(())
+}
+
+fn validate_protocol(server_protocol: u32) -> Result<()> {
+    if server_protocol != PROTOCOL_VERSION {
+        bail!(
+            "protocol mismatch: client {PROTOCOL_VERSION}, server {}",
+            server_protocol
+        )
+    }
     Ok(())
 }
 
@@ -1638,16 +1808,15 @@ fn run_archive(command: ArchiveCommands) -> Result<()> {
             let manifest = remote
                 .archive(&name)?
                 .with_context(|| format!("archive {name} does not exist"))?;
-            if manifest.protocol != PROTOCOL_VERSION
-                || tree_digest(&manifest.files) != manifest.tree_digest
-            {
-                bail!("archive manifest failed integrity validation")
+            validate_archive_manifest(&manifest)?;
+            let mut staged = Vec::with_capacity(manifest.files.len());
+            for artifact in &manifest.files {
+                staged.push((artifact, remote.blob(&artifact.digest)?));
             }
             fs::create_dir_all(&path)?;
             let restore_root = path.canonicalize()?;
-            for artifact in &manifest.files {
+            for (artifact, bytes) in staged {
                 let relative = validate_relative_path(&artifact.file_name)?;
-                let bytes = remote.blob(&artifact.digest)?;
                 let destination = safe_destination(&restore_root, &relative)?;
                 atomic_write(&destination, &bytes)?;
                 set_file_executable(&destination, artifact.executable)?;
@@ -1933,18 +2102,23 @@ fn restore_declared_record(
     workspace: &Path,
     record: &DeclaredActionRecord,
 ) -> Result<()> {
-    if record.protocol != PROTOCOL_VERSION {
-        bail!("declared record protocol mismatch")
-    }
+    validate_declared_record(record)?;
+    let mut staged = Vec::with_capacity(record.outputs.len());
     for artifact in &record.outputs {
         let relative = validate_relative_path(&artifact.file_name)?;
         let bytes = remote.blob(&artifact.digest)?;
+        staged.push((artifact, relative, bytes));
+    }
+    let stdout = remote.blob(&record.stdout.digest)?;
+    let stderr = remote.blob(&record.stderr.digest)?;
+    if stdout.len() as u64 != record.stdout.len || stderr.len() as u64 != record.stderr.len {
+        bail!("declared stream length does not match manifest")
+    }
+    for (artifact, relative, bytes) in staged {
         let destination = safe_destination(workspace, &relative)?;
         atomic_write(&destination, &bytes)?;
         set_file_executable(&destination, artifact.executable)?;
     }
-    let stdout = remote.blob(&record.stdout.digest)?;
-    let stderr = remote.blob(&record.stderr.digest)?;
     std::io::stdout().write_all(&stdout)?;
     std::io::stderr().write_all(&stderr)?;
     Ok(())
@@ -2311,6 +2485,127 @@ fn display_names(names: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_skew_is_rejected_in_both_directions() {
+        assert!(validate_protocol(PROTOCOL_VERSION).is_ok());
+        assert!(validate_protocol(PROTOCOL_VERSION - 1).is_err());
+        assert!(validate_protocol(PROTOCOL_VERSION + 1).is_err());
+    }
+
+    #[test]
+    fn remote_configuration_rejects_unsafe_urls_and_unbounded_timeouts() {
+        for url in [
+            "file:///tmp/cache",
+            "http://user:secret@localhost:7878",
+            "http://localhost:7878?token=secret",
+            "://not-a-url",
+        ] {
+            assert!(Remote::new(url, None).is_err(), "accepted {url}");
+        }
+        assert!(Remote::new("http://127.0.0.1:7878", None).is_ok());
+        assert!(bounded_timeout("TEST", Some("99"), 2_000, 100, 30_000).is_err());
+        assert!(bounded_timeout("TEST", Some("30001"), 2_000, 100, 30_000).is_err());
+        assert_eq!(
+            bounded_timeout("TEST", Some("2500"), 2_000, 100, 30_000).unwrap(),
+            Duration::from_millis(2_500)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalizer_bases_resolve_symlinked_mounts() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real");
+        let alias = temp.path().join("alias");
+        fs::create_dir(&real).unwrap();
+        symlink(&real, &alias).unwrap();
+        assert_eq!(canonical_base(alias), real.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn prior_protocol_candidates_are_cleanly_rejected() {
+        let workspace = std::env::temp_dir().join(format!("bellows-protocol-test-{}", now_ms()));
+        let identity = Identity {
+            static_key: digest_bytes(b"identity"),
+            normalizer: PathNormalizer::new(vec![("$WORKSPACE".into(), workspace.clone())]),
+            workspace,
+        };
+        let candidate = ActionCandidate {
+            protocol: PROTOCOL_VERSION - 1,
+            static_key: identity.static_key.clone(),
+            action_key: digest_bytes(b"action"),
+            crate_name: "fixture".into(),
+            created_ms: 0,
+            files: vec![],
+            env: vec![],
+            artifacts: vec![],
+            stdout: StreamArtifact {
+                digest: digest_bytes(b""),
+                len: 0,
+            },
+            stderr: StreamArtifact {
+                digest: digest_bytes(b""),
+                len: 0,
+            },
+        };
+        assert_eq!(
+            validate_candidate(&candidate, &identity).unwrap_err(),
+            format!("unsupported candidate protocol {}", PROTOCOL_VERSION - 1)
+        );
+    }
+
+    #[test]
+    fn captured_stream_lengths_describe_normalized_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("a-very-long-workspace-name");
+        let out_dir = workspace.join("target/debug/deps");
+        fs::create_dir_all(&out_dir).unwrap();
+        let source = workspace.join("src/lib.rs");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, "pub fn answer() -> u8 { 42 }").unwrap();
+        let dep_name = "fixture-abc.d";
+        let rmeta_name = "libfixture-abc.rmeta";
+        fs::write(out_dir.join(rmeta_name), b"metadata").unwrap();
+        fs::write(
+            out_dir.join(dep_name),
+            format!("{rmeta_name}: {}/src/../src/lib.rs\n", workspace.display()),
+        )
+        .unwrap();
+        let invocation = Invocation {
+            rustc: PathBuf::from("rustc"),
+            args: vec![],
+            crate_name: "fixture".into(),
+            out_dir: out_dir.clone(),
+            expected_names: BTreeSet::from([dep_name.into(), rmeta_name.into()]),
+            explicit_inputs: vec![source],
+        };
+        let identity = Identity {
+            static_key: digest_bytes(b"identity"),
+            normalizer: PathNormalizer::new(vec![("$WORKSPACE".into(), workspace.clone())]),
+            workspace: workspace.clone(),
+        };
+        let stdout = format!("compiled {}", workspace.display()).into_bytes();
+        let stderr = format!("warning in {}", workspace.display()).into_bytes();
+        let captured =
+            capture_outputs(&invocation, &identity, stdout.clone(), stderr.clone()).unwrap();
+        assert_eq!(captured.candidate.files[0].path, "$WORKSPACE/src/lib.rs");
+        assert_eq!(
+            captured.candidate.stdout.len,
+            identity.normalizer.normalize_bytes(&stdout).len() as u64
+        );
+        assert_eq!(
+            captured.candidate.stderr.len,
+            identity.normalizer.normalize_bytes(&stderr).len() as u64
+        );
+        assert_ne!(captured.candidate.stdout.len, stdout.len() as u64);
+    }
 
     #[test]
     fn recognizes_rustc_and_clippy_wrapper_invocations() {

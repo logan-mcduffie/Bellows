@@ -24,6 +24,8 @@ use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod terminal;
+
 #[derive(Parser, Debug)]
 #[command(name = "bellows", version, about = "Cargo-native remote builds")]
 struct Cli {
@@ -168,7 +170,10 @@ fn main() -> ExitCode {
         Ok(0) => ExitCode::SUCCESS,
         Ok(code) => ExitCode::from(code.clamp(1, 255) as u8),
         Err(error) => {
-            eprintln!("bellows: {error:#}");
+            eprintln!(
+                "{}",
+                terminal::error(terminal::stderr_color(), &format!("{error:#}"))
+            );
             ExitCode::FAILURE
         }
     }
@@ -233,11 +238,20 @@ fn run_cli() -> Result<i32> {
             let report = Remote::new(&connection.server, connection.token)?
                 .gc(max_mb.saturating_mul(1024 * 1024))?;
             println!(
-                "GC: {} -> {}, {} records and {} blobs evicted",
-                human_bytes(report.bytes_before),
-                human_bytes(report.bytes_after),
-                report.records_evicted,
-                report.blobs_evicted
+                "{}",
+                terminal::status(
+                    terminal::stdout_color(),
+                    "gc",
+                    &format!(
+                        "{} → {}",
+                        human_bytes(report.bytes_before),
+                        human_bytes(report.bytes_after)
+                    ),
+                    &format!(
+                        "{} records · {} blobs evicted",
+                        report.records_evicted, report.blobs_evicted
+                    ),
+                )
             );
             Ok(0)
         }
@@ -262,8 +276,13 @@ fn run_command(server: String, token: Option<String>, command: Vec<OsString>) ->
         child.env("BELLOWS_AUTH_TOKEN", token);
     }
     eprintln!(
-        "bellows: feeding the forge — {}",
-        display_command(program, arguments)
+        "{}",
+        terminal::status(
+            terminal::stderr_color(),
+            "running",
+            "cargo",
+            &display_command(program, arguments),
+        )
     );
     let status = child.status().context("start wrapped command")?;
     Ok(status.code().unwrap_or(1))
@@ -1631,7 +1650,10 @@ fn record_event(
         kind,
         "hit" | "l1_hit" | "miss" | "bypass" | "fallback" | "wait" | "single_flight" | "corrupt"
     ) {
-        eprintln!("bellows [{kind}] {crate_name}: {detail}");
+        eprintln!(
+            "{}",
+            terminal::status(terminal::stderr_color(), kind, crate_name, detail)
+        );
     }
 }
 
@@ -1654,7 +1676,14 @@ fn read_events() -> Result<Vec<Event>> {
         }
     }
     if corrupt > 0 {
-        eprintln!("bellows: ignored {corrupt} malformed event-log line(s)");
+        eprintln!(
+            "{}",
+            terminal::warning(
+                terminal::stderr_color(),
+                "event log",
+                &format!("ignored {corrupt} malformed line(s)"),
+            )
+        );
     }
     Ok(events)
 }
@@ -1668,10 +1697,32 @@ fn doctor(server: &str, token: Option<&str>) -> Result<()> {
         .output()
         .context("run rustc -vV")?;
     let compiler = String::from_utf8_lossy(&rustc.stdout);
-    println!("✓ bellowsd {} ({})", health.version, server);
-    println!("✓ protocol {}", health.protocol);
-    println!("✓ {}", compiler.lines().next().unwrap_or("rustc"));
-    println!("✓ local fallback enabled");
+    let color = terminal::stdout_color();
+    println!("{}", terminal::heading(color, "Bellows · Doctor"));
+    println!(
+        "{}",
+        terminal::success(
+            color,
+            "bellowsd",
+            &format!("v{} · {server}", health.version)
+        )
+    );
+    println!(
+        "{}",
+        terminal::success(color, "protocol", &health.protocol.to_string())
+    );
+    println!(
+        "{}",
+        terminal::success(
+            color,
+            "compiler",
+            compiler.lines().next().unwrap_or("rustc")
+        )
+    );
+    println!(
+        "{}",
+        terminal::success(color, "fallback", "official rustc enabled")
+    );
     Ok(())
 }
 
@@ -1703,16 +1754,36 @@ fn show_stats(server: &str, token: Option<&str>, json: bool) -> Result<()> {
             serde_json::to_string_pretty(&CombinedStats { remote, events })?
         );
     } else {
-        println!("Bellows remote cache");
-        println!("  compiler actions {:>8}", remote.candidates);
-        println!("  declared actions {:>8}", remote.declared_actions);
-        println!("  archives         {:>8}", remote.archives);
-        println!("  blobs         {:>8}", remote.blobs);
-        println!("  stored bytes  {:>8}", human_bytes(remote.blob_bytes));
-        println!("  active leases {:>8}", remote.active_leases);
-        println!("This workspace");
+        let color = terminal::stdout_color();
+        println!("{}", terminal::heading(color, "Bellows · Cache statistics"));
+        println!("{}", terminal::section(color, "Remote cache"));
+        println!(
+            "{}",
+            terminal::key_value(color, "compiler actions", remote.candidates)
+        );
+        println!(
+            "{}",
+            terminal::key_value(color, "declared actions", remote.declared_actions)
+        );
+        println!(
+            "{}",
+            terminal::key_value(color, "archives", remote.archives)
+        );
+        println!("{}", terminal::key_value(color, "blobs", remote.blobs));
+        println!(
+            "{}",
+            terminal::key_value(color, "stored", human_bytes(remote.blob_bytes))
+        );
+        println!(
+            "{}",
+            terminal::key_value(color, "active leases", remote.active_leases)
+        );
+        println!("{}", terminal::section(color, "This workspace"));
         for (kind, count) in events {
-            println!("  {kind:<13} {count:>8}");
+            println!(
+                "{}",
+                terminal::key_value(color, &kind.replace('_', " "), count)
+            );
         }
     }
     Ok(())
@@ -1733,12 +1804,29 @@ fn explain(limit: usize, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&selected)?);
     } else if selected.is_empty() {
-        println!("No recent misses or bypasses.");
+        println!(
+            "{}",
+            terminal::success(
+                terminal::stdout_color(),
+                "clean",
+                "no recent misses, bypasses, or integrity failures",
+            )
+        );
     } else {
+        let color = terminal::stdout_color();
+        println!(
+            "{}",
+            terminal::heading(color, "Bellows · Recent cache decisions")
+        );
         for event in selected {
             println!(
-                "{} {:<18} {:<24} {}",
-                event.timestamp_ms, event.kind, event.crate_name, event.detail
+                "{}",
+                terminal::status(
+                    color,
+                    &event.kind,
+                    &event.crate_name,
+                    &format!("{} · {}", event.timestamp_ms, event.detail),
+                )
             );
         }
     }
@@ -1794,9 +1882,17 @@ fn run_archive(command: ArchiveCommands) -> Result<()> {
             };
             remote.put_archive(&manifest)?;
             println!(
-                "published archive {name} {} ({} files)",
-                &manifest.tree_digest[..12],
-                manifest.files.len()
+                "{}",
+                terminal::status(
+                    terminal::stdout_color(),
+                    "published",
+                    &name,
+                    &format!(
+                        "{} · {} files",
+                        &manifest.tree_digest[..12],
+                        manifest.files.len()
+                    ),
+                )
             );
         }
         ArchiveCommands::Restore {
@@ -1822,9 +1918,17 @@ fn run_archive(command: ArchiveCommands) -> Result<()> {
                 set_file_executable(&destination, artifact.executable)?;
             }
             println!(
-                "restored archive {name} {} ({} files)",
-                &manifest.tree_digest[..12],
-                manifest.files.len()
+                "{}",
+                terminal::status(
+                    terminal::stdout_color(),
+                    "restored",
+                    &name,
+                    &format!(
+                        "{} · {} files",
+                        &manifest.tree_digest[..12],
+                        manifest.files.len()
+                    ),
+                )
             );
         }
     }
@@ -1857,7 +1961,10 @@ fn run_declared_action(args: DeclaredRunArgs, remote_execution: bool) -> Result<
     let remote = Remote::new(&args.connection.server, args.connection.token)?;
     if let Some(record) = remote.declared(&key)? {
         restore_declared_record(&remote, &workspace, &record)?;
-        println!("declared action HIT: {} ({})", args.name, &key[..12]);
+        println!(
+            "{}",
+            terminal::status(terminal::stdout_color(), "hit", &args.name, &key[..12],)
+        );
         return Ok(());
     }
 
@@ -1876,14 +1983,17 @@ fn run_declared_action(args: DeclaredRunArgs, remote_execution: bool) -> Result<
     let record = if remote_execution {
         let response = remote.execute(&request)?;
         println!(
-            "remote execution {}: {} ({})",
-            if response.cache_hit {
-                "HIT"
-            } else {
-                "EXECUTED"
-            },
-            args.name,
-            &key[..12]
+            "{}",
+            terminal::status(
+                terminal::stdout_color(),
+                if response.cache_hit {
+                    "hit"
+                } else {
+                    "executed"
+                },
+                &args.name,
+                &key[..12],
+            )
         );
         response.record
     } else {
@@ -1892,7 +2002,10 @@ fn run_declared_action(args: DeclaredRunArgs, remote_execution: bool) -> Result<
             remote.put_blob(&digest, bytes)?;
         }
         remote.put_declared(&record)?;
-        println!("declared action MISS: {} ({})", args.name, &key[..12]);
+        println!(
+            "{}",
+            terminal::status(terminal::stdout_color(), "miss", &args.name, &key[..12],)
+        );
         record
     };
     restore_declared_record(&remote, &workspace, &record)?;
@@ -2343,8 +2456,13 @@ fn create_workspace_snapshot(name: &str) -> Result<()> {
     let path = snapshot_path(name)?;
     atomic_write(&path, &serde_json::to_vec_pretty(&snapshot)?)?;
     println!(
-        "captured workspace snapshot {name} ({} packages)",
-        snapshot.packages.len()
+        "{}",
+        terminal::status(
+            terminal::stdout_color(),
+            "captured",
+            name,
+            &format!("{} packages", snapshot.packages.len()),
+        )
     );
     Ok(())
 }
@@ -2452,24 +2570,45 @@ fn compare_workspace_snapshots(before: &str, after: &str, json: bool) -> Result<
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
-        println!("Bellows compiler-aware impact: {before} -> {after}");
+        let color = terminal::stdout_color();
         println!(
-            "  source changed: {}",
-            display_names(&report.source_changed)
+            "{}",
+            terminal::heading(color, &format!("Bellows · Impact · {before} → {after}"))
         );
         println!(
-            "  syntactic surface changed: {}",
-            display_names(&report.syntactic_surface_changed)
+            "{}",
+            terminal::key_value(
+                color,
+                "source changed",
+                display_names(&report.source_changed)
+            )
         );
         println!(
-            "  private/relink research candidates: {}",
-            display_names(&report.private_implementation_candidates)
+            "{}",
+            terminal::key_value(
+                color,
+                "surface changed",
+                display_names(&report.syntactic_surface_changed),
+            )
         );
         println!(
-            "  affected downstream: {}",
-            display_names(&report.affected_downstream)
+            "{}",
+            terminal::key_value(
+                color,
+                "relink candidates",
+                display_names(&report.private_implementation_candidates),
+            )
         );
-        println!("  caveat: {}", report.caveat);
+        println!(
+            "{}",
+            terminal::key_value(
+                color,
+                "affected downstream",
+                display_names(&report.affected_downstream),
+            )
+        );
+        println!("{}", terminal::section(color, "Caveat"));
+        println!("  {}", report.caveat);
     }
     Ok(())
 }

@@ -56,20 +56,20 @@ section "Phase 1 — L1, remote CAS, exact rustc reuse, graceful hierarchy"
   cd "$scratch/workspace"
   CARGO_TARGET_DIR="$scratch/p1-cold" "$bellows" run -- cargo build
 ) 2>&1 | tee "$scratch/p1-cold.log"
-grep -q 'bellows \[miss\] forge_core' "$scratch/p1-cold.log"
+grep -q 'CACHE MISS.*forge_core' "$scratch/p1-cold.log"
 
 (
   cd "$scratch/workspace"
   CARGO_TARGET_DIR="$scratch/p1-l1" "$bellows" run -- cargo build
 ) 2>&1 | tee "$scratch/p1-l1.log"
-grep -q 'bellows \[l1_hit\] forge_core' "$scratch/p1-l1.log"
+grep -q 'LOCAL HIT.*forge_core' "$scratch/p1-l1.log"
 
 rm -rf "$scratch/client-state/l1"
 (
   cd "$scratch/workspace"
   CARGO_TARGET_DIR="$scratch/p1-remote" "$bellows" run -- cargo build
 ) 2>&1 | tee "$scratch/p1-remote.log"
-grep -q 'bellows \[hit\] forge_core' "$scratch/p1-remote.log"
+grep -q 'CACHE HIT.*forge_core' "$scratch/p1-remote.log"
 
 section "Phase 2 — compile once, restore and execute many"
 mkdir -p "$scratch/test-archive"
@@ -103,7 +103,7 @@ section "Phase 3 — declared Cargo action caches final linked output"
     --server "$server" -- \
     cargo build --locked --offline -p forge-cli
 ) 2>&1 | tee "$scratch/action-miss.log"
-grep -q 'declared action MISS' "$scratch/action-miss.log"
+grep -q 'CACHE MISS.*final-link-v1' "$scratch/action-miss.log"
 rm -rf "$scratch/workspace/target"
 (
   cd "$scratch/workspace"
@@ -114,7 +114,7 @@ rm -rf "$scratch/workspace/target"
     cargo build --locked --offline -p forge-cli
   ./target/debug/forge-cli
 ) 2>&1 | tee "$scratch/action-hit.log"
-grep -q 'declared action HIT' "$scratch/action-hit.log"
+grep -q 'CACHE HIT.*final-link-v1' "$scratch/action-hit.log"
 grep -q 'Bellows remembered this build' "$scratch/action-hit.log"
 
 sed -i 's/    42/    43/' "$scratch/workspace/crates/forge-core/src/temperature.rs"
@@ -127,7 +127,7 @@ rm -rf "$scratch/workspace/target"
     --server "$server" -- \
     cargo build --locked --offline -p forge-cli
 ) 2>&1 | tee "$scratch/action-invalidated.log"
-grep -q 'declared action MISS' "$scratch/action-invalidated.log"
+grep -q 'CACHE MISS.*final-link-v1' "$scratch/action-invalidated.log"
 
 cp -a "$root/demo/phase3-fixture" "$scratch/nested-action"
 rm -rf "$scratch/nested-action/target" "$scratch/nested-action/generator/target"
@@ -140,7 +140,7 @@ rm -rf "$scratch/nested-action/target" "$scratch/nested-action/generator/target"
     cargo build --locked --offline
   ./target/debug/phase3-fixture
 ) 2>&1 | tee "$scratch/nested-action-miss.log"
-grep -q 'declared action MISS' "$scratch/nested-action-miss.log"
+grep -q 'CACHE MISS.*nested-build-script-v1' "$scratch/nested-action-miss.log"
 grep -q 'build.rs → nested Cargo → cached binary' "$scratch/nested-action-miss.log"
 rm -rf "$scratch/nested-action/target" "$scratch/nested-action/generator/target"
 (
@@ -151,7 +151,7 @@ rm -rf "$scratch/nested-action/target" "$scratch/nested-action/generator/target"
     --server "$server" -- \
     cargo build --locked --offline
 ) 2>&1 | tee "$scratch/nested-action-hit.log"
-grep -q 'declared action HIT' "$scratch/nested-action-hit.log"
+grep -q 'CACHE HIT.*nested-build-script-v1' "$scratch/nested-action-hit.log"
 
 section "Phase 4 — authenticated, attested, single-flight remote execution"
 sed -i 's/    43/    44/' "$scratch/workspace/crates/forge-core/src/temperature.rs"
@@ -180,8 +180,8 @@ remote_b=$!
 wait "$remote_a"
 wait "$remote_b"
 cat "$scratch/remote-a.log" "$scratch/remote-b.log"
-grep -q 'remote execution EXECUTED' "$scratch/remote-a.log" "$scratch/remote-b.log"
-grep -Eq 'remote execution HIT|declared action HIT' "$scratch/remote-a.log" "$scratch/remote-b.log"
+grep -q 'EXECUTED.*remote-link-v1' "$scratch/remote-a.log" "$scratch/remote-b.log"
+grep -Eq 'CACHE HIT|EXECUTED' "$scratch/remote-a.log" "$scratch/remote-b.log"
 "$scratch/remote-a/target/debug/forge-cli" | grep -q '44°'
 "$scratch/remote-b/target/debug/forge-cli" | grep -q '44°'
 unset BELLOWS_ACTION_DELAY_MS
@@ -219,7 +219,7 @@ section "Retention — reference-aware collection bounds durable storage"
 "$bellows" gc --max-mb 0 --server "$server" | tee "$scratch/gc.log"
 # A rejected publish intentionally leaves a fresh orphan. GC protects fresh
 # uploads for one hour so it cannot race a blob-to-record publication.
-grep -Eq -- '-> [0-9]+ B,' "$scratch/gc.log"
+grep -Eq -- '(→|->) [0-9]+ B' "$scratch/gc.log"
 
 section "Five phases complete"
 echo "L1 + remote compiler cache; compile-once/test-many archives; final Cargo"

@@ -59,7 +59,7 @@ section "Cold runner A: compile and publish"
     GITHUB_SHA=aaaaaaaa GITHUB_ENV="$scratch/github-env-a" \
     "$bellows" run --server "$server" -- cargo build
 ) 2>&1 | tee "$scratch/cold.log"
-grep -q 'bellows \[miss\] forge_core' "$scratch/cold.log"
+grep -q 'CACHE MISS.*forge_core' "$scratch/cold.log"
 
 section "Fresh runner B: restore libraries remotely, link locally"
 (
@@ -69,7 +69,7 @@ section "Fresh runner B: restore libraries remotely, link locally"
     "$bellows" run --server "$server" -- cargo build
   "$scratch/runner-b-target/debug/forge-cli"
 ) 2>&1 | tee "$scratch/fresh.log"
-grep -q 'bellows \[hit\] forge_core' "$scratch/fresh.log"
+grep -q 'CACHE HIT.*forge_core' "$scratch/fresh.log"
 grep -q 'Bellows remembered this build' "$scratch/fresh.log"
 
 section "Durability: restart bellowsd and restore from the same CAS"
@@ -82,7 +82,7 @@ start_server
   CARGO_TARGET_DIR="$scratch/runner-restarted-target" \
     "$bellows" run --server "$server" -- cargo build
 ) 2>&1 | tee "$scratch/restarted.log"
-grep -q 'bellows \[hit\] forge_core' "$scratch/restarted.log"
+grep -q 'CACHE HIT.*forge_core' "$scratch/restarted.log"
 
 section "Explainable invalidation: change a transitive module"
 sed -i 's/    42/    43/' "$workspace/crates/forge-core/src/temperature.rs"
@@ -112,8 +112,8 @@ first=$!
 second=$!
 wait "$first"
 wait "$second"
-cat "$scratch/runner-d.log" "$scratch/runner-e.log" | grep -E 'bellows \[(wait|single_flight|hit|miss)\]' || true
-grep -q 'bellows \[single_flight\]' "$scratch/runner-d.log" "$scratch/runner-e.log"
+cat "$scratch/runner-d.log" "$scratch/runner-e.log" | grep -E 'WAITING|SHARED HIT|CACHE HIT|CACHE MISS' || true
+grep -q 'SHARED HIT' "$scratch/runner-d.log" "$scratch/runner-e.log"
 
 section "Integrity: corrupt remote content and recover with a safe miss"
 while IFS= read -r victim; do
@@ -125,7 +125,7 @@ rm -rf "$scratch/runner-f-target"
   CARGO_TARGET_DIR="$scratch/runner-f-target" \
     "$bellows" run --server "$server" -- cargo build
 ) 2>&1 | tee "$scratch/integrity.log"
-grep -q 'bellows \[corrupt\]' "$scratch/integrity.log"
+grep -q 'REJECTED' "$scratch/integrity.log"
 
 section "Graceful fallback: stop bellowsd and keep building"
 kill "$server_pid"

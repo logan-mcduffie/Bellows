@@ -133,6 +133,13 @@ regression tests; verification is not deferred to a final testing phase.
 
 ## Completion evidence
 
+Accepted on 2026-07-11 against Bellows
+`f0d9ed1187f37c578a15f3db2ba23cee39350b66` and Manifold PR
+[#133](https://github.com/Manifold-Game/manifold/pull/133). Cold and exact-ref
+warm WarpBuild runs, the full CPU matrix, browser parity, the Bellows production
+canary, and retained RTX 5080 gates all passed. Cold/warm compiler telemetry
+reported zero fallback and corruption events.
+
 - Every repository gate and adversarial test passes repeatedly.
 - Forced server loss, corrupt blobs/indexes, malformed manifests, and cancelled
   owners all lead to safe local work or bounded retry.

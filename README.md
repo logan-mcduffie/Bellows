@@ -149,8 +149,9 @@ Bellows binary. See [the Manifold integration guide](docs/manifold.md).
 The first gains come from sharing stable Rust library work across fresh cloud
 runners and suppressing simultaneous cold duplication. GPU execution remains
 on the RTX 5080; Bellows only supplies portable compiler products there.
-The [validation record](docs/validation.md) includes a two-run Manifold smoke
-measurement and the exact local acceptance commands.
+The [validation record](docs/validation.md) includes the two-run smoke,
+full-pipeline cold/warm WarpBuild dogfood, browser parity, production canary,
+RTX 5080 evidence, and the exact local acceptance commands.
 
 ## Architecture and scope
 

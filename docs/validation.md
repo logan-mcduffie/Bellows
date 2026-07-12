@@ -61,6 +61,35 @@ The fresh-runner smoke check was approximately 43% faster. It restored
 `serde-derive`, the proc-macro-consuming `serde` action, and downstream products
 whose extern identity changed bypassed or missed conservatively.
 
-This is a small integration smoke measurement, not a forecast for Manifold's
-full workflow. Full-pipeline acceptance still requires two representative CI
-runs and end-to-end wall-time, transfer, storage, and hit-rate comparison.
+## Manifold production dogfood
+
+Manifold PR [#133](https://github.com/Manifold-Game/manifold/pull/133) pins
+Bellows commit `f0d9ed1187f37c578a15f3db2ba23cee39350b66`. A full cold CI run
+([29175374542, attempt 1](https://github.com/Manifold-Game/manifold/actions/runs/29175374542))
+recorded 5,467 compiler misses, zero hits, zero fallbacks, and zero corrupt
+restores. The exact-ref rerun recorded 5,467 hits, zero misses, zero fallbacks,
+and zero corrupt restores. Both completed the required CPU matrix and retained
+RTX 5080 GPU gates successfully.
+
+The final integration commit was then validated cold and warm in
+[run 29176974713](https://github.com/Manifold-Game/manifold/actions/runs/29176974713).
+Both attempts passed the complete CI gate. The associated
+[browser parity run](https://github.com/Manifold-Game/manifold/actions/runs/29176974730)
+passed real-game jco/wasmtime parity, seeded pixel rendering, and dual-world
+single-player boot; the
+[production canary](https://github.com/Manifold-Game/manifold/actions/runs/29176974719)
+also passed its WarpBuild cache round trip.
+
+The same dogfood pass corrected Manifold's nextest partition and stabilized its
+Wasmtime component cache. The native integration lane now runs only real
+integration binaries (1,563 tests in the final merge candidate), with these
+measured Nextest execution times:
+
+| Runner state | Before | Final |
+|---|---:|---:|
+| Fresh WarpBuild VM | 229.57s | 44.53s |
+| Fresh VM with restored runtime cache | n/a | 8.56s |
+
+The complete integration job fell from 527 seconds to 311 seconds cold and 248
+seconds warm. This is end-to-end production evidence rather than an extrapolation
+from the small smoke target above.

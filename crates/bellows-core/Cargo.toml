@@ -9,6 +9,6 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
+fs2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-

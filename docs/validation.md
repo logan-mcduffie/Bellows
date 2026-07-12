@@ -11,6 +11,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 scripts/demo.sh
 scripts/five-phase-demo.sh
+scripts/hardening.sh
 ```
 
 All passed. The demo machine-checks cold publication, fresh-runner remote hits,
@@ -22,7 +23,14 @@ publish-once test archives with two executors, cached final binaries, a
 `build.rs` that launches a nested offline Cargo generator, authenticated and
 toolchain-attested remote execution with concurrent single-flight, syntactic
 private/public surface analysis, downstream dependency closure, and
-reference-aware collection to a zero-byte budget.
+reference-aware collection to a zero-byte target while preserving a tiny fresh
+unpublished blob through its publication grace window.
+
+The hardening suite additionally verifies non-loopback authentication refusal,
+invalid resource-limit rejection, correct and incorrect bearer tokens,
+single-process data-directory ownership, liveness, clean SIGTERM shutdown,
+malformed server configuration fallback, corrupt L1 quarantine, and offline
+official-rustc fallback.
 
 Authentication was separately checked by starting `bellowsd --auth-token
 secret`: unauthenticated and incorrect-token health requests returned 401,

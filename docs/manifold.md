@@ -1,41 +1,36 @@
 # Manifold integration
 
-Bellows fits Manifold at the existing `.github/actions/setup-sccache` seam. No
-Cargo command, test partition, toolchain pin, or hardware boundary needs to
-change.
+Bellows is integrated at Manifold's CI setup seam. Cargo commands, test
+partitions, toolchain pins, and hardware boundaries stay unchanged.
 
-## Runner preparation
+## Current WarpBuild topology
 
-Build a release binary and install `bellows` on every runner image. Run one
-organization-scoped `bellowsd` near the Hetzner runners, preferably behind TLS,
-with a persistent data volume and bearer token:
+CPU jobs run on ephemeral WarpBuild runners. Each job restores a Bellows binary
+pinned by full commit SHA, restores a lane-specific content store with
+`actions/cache`, and starts an authenticated loopback-only `bellowsd`. The job
+quiesces the daemon and bounds the store before the cache post-step archives it.
+This topology needs no public Bellows service or long-lived runner.
 
-```bash
-bellowsd --listen 127.0.0.1:7878 --data-dir /var/lib/bellows
-```
+The two GPU execution jobs remain on the local `[self-hosted, gpu]` runner.
+Bellows may restore portable compiler outputs there, but browser pixels and GPU
+tests still execute on the RTX 5080.
 
-Expose its URL and token as `BELLOWS_SERVER_URL` and `BELLOWS_AUTH_TOKEN`
-repository or organization secrets. The demonstrator server is single-tenant;
-do not expose it directly to the public internet.
+The production actions live in Manifold as `setup-bellows-warp`,
+`setup-bellows`, and `teardown-bellows-warp`. The Bellows source repository
+remains independent; Manifold consumes an immutable commit rather than a
+mutable branch or local checkout.
 
 ## Workflow migration
 
-Copy `action.yml` from this repository into
-`.github/actions/setup-bellows/action.yml`, then replace:
-
-```yaml
-- uses: ./.github/actions/setup-sccache
-  with:
-    target-namespace: clippy
-```
-
-with:
+For another trusted GitHub Actions deployment, copy `action.yml` into a local
+composite action and invoke it after starting or connecting to an authenticated
+service:
 
 ```yaml
 - uses: ./.github/actions/setup-bellows
   with:
-    server-url: ${{ secrets.BELLOWS_SERVER_URL }}
-    auth-token: ${{ secrets.BELLOWS_AUTH_TOKEN }}
+    server-url: ${{ steps.bellows-service.outputs.server }}
+    auth-token: ${{ steps.bellows-service.outputs.token }}
     target-namespace: clippy
 ```
 
@@ -48,9 +43,8 @@ The namespace map remains unchanged:
 | Stable browser parity | `browser-stable` |
 | Pinned-nightly threaded WASM | `threaded` |
 
-The action retains `CARGO_INCREMENTAL=0`, stripped CI debug profiles, persistent
-target directories, and the existing target-root separation between cloud and
-GPU hosts.
+The action retains `CARGO_INCREMENTAL=0` and target-root separation. Manifold's
+workflow owns any project-specific profile overrides.
 
 ## Expected first-phase result
 
@@ -66,10 +60,9 @@ GPU hosts.
 - GPU and browser pixel gates still execute on the RTX 5080; only eligible
   compiler products are restored there.
 
-Use `bellows stats` after two identical full runs and compare end-to-end workflow
-wall time, bytes restored, compiler hits, single-flight waits, and bypass
-reasons. `bellows explain --json` is suitable for attaching diagnostics to CI
-artifacts.
+Use `bellows stats` after cold and warm runs and compare end-to-end workflow wall
+time, bytes restored, compiler hits, single-flight waits, and bypass reasons.
+`bellows explain --json` is suitable for attaching diagnostics to CI artifacts.
 
 ## Later-phase pilot lanes
 

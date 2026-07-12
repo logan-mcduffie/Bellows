@@ -11,18 +11,24 @@ use bellows_core::{
     ExecuteRequest, ExecuteResponse, GcReport, GcRequest, HealthResponse, LeaseRequest,
     LeaseResponse, PROTOCOL_VERSION, PathNormalizer, PlatformIdentity, ServerStats, Store,
     atomic_write, declared_action_key, digest_bytes, now_ms, rustup_home,
-    validate_declared_command, validate_relative_path,
+    validate_archive_manifest, validate_candidate_manifest, validate_declared_command,
+    validate_declared_record, validate_relative_path,
 };
 use clap::Parser;
+use fs2::FileExt;
 use serde_json::json;
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
+use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tower::limit::ConcurrencyLimitLayer;
+
+const MAX_JSON_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -37,6 +43,8 @@ struct Args {
     data_dir: PathBuf,
     #[arg(long, env = "BELLOWS_AUTH_TOKEN")]
     auth_token: Option<String>,
+    #[arg(long, env = "BELLOWS_ALLOW_INSECURE_NO_AUTH", default_value_t = false)]
+    allow_insecure_no_auth: bool,
     #[arg(long, default_value_t = 8)]
     max_candidates: usize,
     #[arg(long, env = "BELLOWS_MAX_BLOB_MB", default_value_t = 512)]
@@ -45,11 +53,14 @@ struct Args {
     enable_execution: bool,
     #[arg(long, env = "BELLOWS_MAX_EXECUTORS", default_value_t = 2)]
     max_executors: usize,
+    #[arg(long, env = "BELLOWS_MAX_REQUESTS", default_value_t = 128)]
+    max_requests: usize,
 }
 
 #[derive(Clone)]
 struct AppState {
     store: Store,
+    _server_lock: Arc<File>,
     auth_token: Option<String>,
     max_candidates: usize,
     leases: Arc<StdMutex<HashMap<String, Lease>>>,
@@ -77,7 +88,11 @@ impl IntoResponse for ApiError {
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
 fn internal(error: impl std::fmt::Display) -> ApiError {
-    ApiError(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+    eprintln!("bellowsd internal error: {error}");
+    ApiError(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal server error".into(),
+    )
 }
 
 fn authorize(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
@@ -88,7 +103,10 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
-    if supplied == Some(expected.as_str()) {
+    let supplied = supplied.unwrap_or_default();
+    let expected_hash = blake3::hash(expected.as_bytes());
+    let supplied_hash = blake3::hash(supplied.as_bytes());
+    if bool::from(expected_hash.as_bytes().ct_eq(supplied_hash.as_bytes())) {
         Ok(())
     } else {
         Err(ApiError(
@@ -101,14 +119,54 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if args.max_candidates == 0 {
+        bail!("--max-candidates must be greater than zero")
+    }
+    if args.max_blob_mb == 0 {
+        bail!("--max-blob-mb must be greater than zero")
+    }
+    if args.max_executors == 0 {
+        bail!("--max-executors must be greater than zero")
+    }
+    if args.max_requests == 0 {
+        bail!("--max-requests must be greater than zero")
+    }
+    if args.auth_token.as_deref().is_some_and(str::is_empty) {
+        bail!("--auth-token may not be empty")
+    }
+    if !args.listen.ip().is_loopback() && args.auth_token.is_none() && !args.allow_insecure_no_auth
+    {
+        bail!(
+            "refusing unauthenticated non-loopback listener {}; set BELLOWS_AUTH_TOKEN or explicitly pass --allow-insecure-no-auth",
+            args.listen
+        )
+    }
     if args.enable_execution && args.auth_token.is_none() {
         anyhow::bail!("--enable-execution requires --auth-token")
     }
     if args.enable_execution {
         PlatformIdentity::detect().context("detect remote executor toolchain")?;
     }
+    let store = Store::open(&args.data_dir)?;
+    store
+        .check_writable()
+        .context("verify writable server data directory")?;
+    let server_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(store.root().join(".server.lock"))
+        .context("open server data-directory lock")?;
+    server_lock.try_lock_exclusive().with_context(|| {
+        format!(
+            "data directory {} is already owned by another bellowsd process",
+            store.root().display()
+        )
+    })?;
     let state = AppState {
-        store: Store::open(&args.data_dir)?,
+        store,
+        _server_lock: Arc::new(server_lock),
         auth_token: args.auth_token,
         max_candidates: args.max_candidates,
         leases: Arc::new(StdMutex::new(HashMap::new())),
@@ -117,10 +175,10 @@ async fn main() -> Result<()> {
         execution_locks: Arc::new(AsyncMutex::new(HashMap::new())),
         executor_slots: Arc::new(Semaphore::new(args.max_executors.max(1))),
     };
-    let app = Router::new()
+    let api = Router::new()
+        .route("/live", get(live))
         .route("/v1/health", get(health))
         .route("/v1/stats", get(stats))
-        .route("/v1/blobs/{digest}", get(get_blob).put(put_blob))
         .route("/v1/actions/{static_key}", get(get_candidates))
         .route("/v1/actions/{static_key}/{action_key}", put(put_candidate))
         .route("/v1/declared/{key}", get(get_declared).put(put_declared))
@@ -129,9 +187,15 @@ async fn main() -> Result<()> {
         .route("/v1/admin/gc", post(gc))
         .route("/v1/leases/{static_key}", post(acquire_lease))
         .route("/v1/leases/{static_key}/{token}", delete(release_lease))
+        .layer(DefaultBodyLimit::max(MAX_JSON_BODY_BYTES));
+    let blobs = Router::new()
+        .route("/v1/blobs/{digest}", get(get_blob).put(put_blob))
         .layer(DefaultBodyLimit::max(
             args.max_blob_mb.saturating_mul(1024 * 1024),
-        ))
+        ));
+    let app = api
+        .merge(blobs)
+        .layer(ConcurrencyLimitLayer::new(args.max_requests))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(args.listen)
@@ -149,7 +213,22 @@ async fn main() -> Result<()> {
 }
 
 async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut terminate) = signal(SignalKind::terminate()) {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {},
+                _ = terminate.recv() => {},
+            }
+            return;
+        }
+    }
     let _ = tokio::signal::ctrl_c().await;
+}
+
+async fn live() -> StatusCode {
+    StatusCode::NO_CONTENT
 }
 
 async fn health(
@@ -157,6 +236,11 @@ async fn health(
     headers: HeaderMap,
 ) -> ApiResult<Json<HealthResponse>> {
     authorize(&state, &headers)?;
+    let store = state.store.clone();
+    tokio::task::spawn_blocking(move || store.check_writable())
+        .await
+        .map_err(internal)?
+        .map_err(internal)?;
     Ok(Json(HealthResponse {
         service: "bellowsd".into(),
         protocol: PROTOCOL_VERSION,
@@ -170,13 +254,18 @@ async fn get_blob(
     headers: HeaderMap,
 ) -> ApiResult<Vec<u8>> {
     authorize(&state, &headers)?;
-    state.store.read_blob(&digest).map_err(|error| {
-        if state.store.blob_path(&digest).is_ok_and(|p| !p.exists()) {
-            ApiError(StatusCode::NOT_FOUND, "blob not found".into())
-        } else {
-            internal(error)
-        }
+    let store = state.store.clone();
+    tokio::task::spawn_blocking(move || {
+        store.read_blob(&digest).map_err(|error| {
+            if store.blob_path(&digest).is_ok_and(|p| !p.exists()) {
+                ApiError(StatusCode::NOT_FOUND, "blob not found".into())
+            } else {
+                internal(error)
+            }
+        })
     })
+    .await
+    .map_err(internal)?
 }
 
 async fn put_blob(
@@ -192,7 +281,11 @@ async fn put_blob(
             "blob digest mismatch".into(),
         ));
     }
-    let created = state.store.put_blob(&digest, &body).map_err(internal)?;
+    let store = state.store.clone();
+    let created = tokio::task::spawn_blocking(move || store.put_blob(&digest, &body))
+        .await
+        .map_err(internal)?
+        .map_err(internal)?;
     Ok(if created {
         StatusCode::CREATED
     } else {
@@ -226,25 +319,34 @@ async fn put_candidate(
             "action key does not match path".into(),
         ));
     }
-    let mut referenced = candidate
-        .artifacts
-        .iter()
-        .map(|a| &a.digest)
-        .collect::<Vec<_>>();
-    referenced.push(&candidate.stdout.digest);
-    referenced.push(&candidate.stderr.digest);
-    for digest in referenced {
-        state.store.read_blob(digest).map_err(|_| {
-            ApiError(
-                StatusCode::BAD_REQUEST,
-                format!("referenced blob {digest} is absent or corrupt"),
-            )
-        })?;
-    }
     let _guard = state
         .writes
         .lock()
         .map_err(|_| internal("write lock poisoned"))?;
+    validate_candidate_manifest(&candidate)
+        .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
+    for artifact in &candidate.artifacts {
+        state.store.read_blob(&artifact.digest).map_err(|_| {
+            ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("referenced blob {} is absent or corrupt", artifact.digest),
+            )
+        })?;
+    }
+    for stream in [&candidate.stdout, &candidate.stderr] {
+        let bytes = state.store.read_blob(&stream.digest).map_err(|_| {
+            ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("referenced blob {} is absent or corrupt", stream.digest),
+            )
+        })?;
+        if bytes.len() as u64 != stream.len {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                "compiler stream length does not match manifest".into(),
+            ));
+        }
+    }
     state
         .store
         .put_candidate(candidate, state.max_candidates)
@@ -279,11 +381,11 @@ async fn put_declared(
             "declared key does not match path".into(),
         ));
     }
-    verify_declared_record(&state.store, &record)?;
     let _guard = state
         .writes
         .lock()
         .map_err(|_| internal("write lock poisoned"))?;
+    verify_declared_record(&state.store, &record)?;
     let created = state.store.put_declared(&record).map_err(internal)?;
     Ok(if created {
         StatusCode::CREATED
@@ -319,6 +421,12 @@ async fn put_archive(
             "archive name does not match path".into(),
         ));
     }
+    validate_archive_manifest(&manifest)
+        .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let _guard = state
+        .writes
+        .lock()
+        .map_err(|_| internal("write lock poisoned"))?;
     for file in &manifest.files {
         validate_relative_path(&file.file_name)
             .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
@@ -335,10 +443,6 @@ async fn put_archive(
             "archive tree digest mismatch".into(),
         ));
     }
-    let _guard = state
-        .writes
-        .lock()
-        .map_err(|_| internal("write lock poisoned"))?;
     let created = state.store.put_archive(&manifest).map_err(|error| {
         if error.to_string().contains("already bound") {
             ApiError(StatusCode::CONFLICT, error.to_string())
@@ -426,14 +530,20 @@ async fn gc(
     Json(request): Json<GcRequest>,
 ) -> ApiResult<Json<GcReport>> {
     authorize(&state, &headers)?;
-    let _guard = state
-        .writes
-        .lock()
-        .map_err(|_| internal("write lock poisoned"))?;
-    Ok(Json(state.store.gc(request.max_bytes).map_err(internal)?))
+    let store = state.store.clone();
+    let writes = state.writes.clone();
+    let report = tokio::task::spawn_blocking(move || {
+        let _guard = writes.lock().map_err(|_| internal("write lock poisoned"))?;
+        store.gc(request.max_bytes).map_err(internal)
+    })
+    .await
+    .map_err(internal)??;
+    Ok(Json(report))
 }
 
 fn verify_declared_record(store: &Store, record: &DeclaredActionRecord) -> ApiResult<()> {
+    validate_declared_record(record)
+        .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
     validate_declared_command(&record.command)
         .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
     let expected_key = declared_action_key(
@@ -479,12 +589,18 @@ fn verify_declared_record(store: &Store, record: &DeclaredActionRecord) -> ApiRe
         }
     }
     for stream in [&record.stdout, &record.stderr] {
-        store.read_blob(&stream.digest).map_err(|_| {
+        let bytes = store.read_blob(&stream.digest).map_err(|_| {
             ApiError(
                 StatusCode::BAD_REQUEST,
                 format!("stream blob {} is absent or corrupt", stream.digest),
             )
         })?;
+        if bytes.len() as u64 != stream.len {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                "stream length does not match manifest".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -742,22 +858,6 @@ async fn release_lease(
 
 async fn stats(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<ServerStats>> {
     authorize(&state, &headers)?;
-    let (blobs, blob_bytes) =
-        count_files(&state.store.root().join("blobs"), false).map_err(internal)?;
-    let (action_indexes, _) =
-        count_files(&state.store.root().join("actions"), true).map_err(internal)?;
-    let (declared_actions, _) =
-        count_files(&state.store.root().join("declared"), true).map_err(internal)?;
-    let (archives, _) =
-        count_files(&state.store.root().join("archives"), true).map_err(internal)?;
-    let mut candidates = 0;
-    visit_files(&state.store.root().join("actions"), &mut |path| {
-        let bytes = fs::read(path)?;
-        let index: CandidateIndex = serde_json::from_slice(&bytes)?;
-        candidates += index.candidates.len() as u64;
-        Ok(())
-    })
-    .map_err(internal)?;
     let active_leases = state
         .leases
         .lock()
@@ -765,7 +865,27 @@ async fn stats(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<J
         .values()
         .filter(|lease| lease.expires_ms > now_ms())
         .count() as u64;
-    Ok(Json(ServerStats {
+    let store = state.store.clone();
+    let result = tokio::task::spawn_blocking(move || collect_stats(&store, active_leases))
+        .await
+        .map_err(internal)?
+        .map_err(internal)?;
+    Ok(Json(result))
+}
+
+fn collect_stats(store: &Store, active_leases: u64) -> Result<ServerStats> {
+    let (blobs, blob_bytes) = count_files(&store.root().join("blobs"), false)?;
+    let (action_indexes, _) = count_files(&store.root().join("actions"), true)?;
+    let (declared_actions, _) = count_files(&store.root().join("declared"), true)?;
+    let (archives, _) = count_files(&store.root().join("archives"), true)?;
+    let mut candidates = 0;
+    visit_files(&store.root().join("actions"), &mut |path| {
+        let bytes = fs::read(path)?;
+        let index: CandidateIndex = serde_json::from_slice(&bytes)?;
+        candidates += index.candidates.len() as u64;
+        Ok(())
+    })?;
+    Ok(ServerStats {
         blobs,
         blob_bytes,
         action_indexes,
@@ -773,7 +893,7 @@ async fn stats(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<J
         active_leases,
         declared_actions,
         archives,
-    }))
+    })
 }
 
 fn count_files(root: &FsPath, only_json: bool) -> Result<(u64, u64)> {

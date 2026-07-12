@@ -1,5 +1,5 @@
 name: Setup Bellows
-description: Configure Cargo-native remote compiler reuse on a self-hosted runner
+description: Configure a required Bellows compiler cache for a GitHub Actions Rust job
 
 inputs:
   server-url:
@@ -7,62 +7,87 @@ inputs:
     required: true
   auth-token:
     description: Bellows bearer token
-    required: false
+    required: true
   bellows-binary:
     description: Preinstalled Bellows client command or absolute path
     default: bellows
   target-namespace:
-    description: Persistent Cargo target namespace for this workload
+    description: Isolated Cargo target namespace for this workload
     default: stable
+  l1:
+    description: Enable the runner-local L1 cache (0 or 1)
+    default: "1"
+
+outputs:
+  binary:
+    description: Resolved Bellows client path
+    value: ${{ steps.configure.outputs.binary }}
+  state-dir:
+    description: Bellows runner-local state directory
+    value: ${{ steps.configure.outputs.state-dir }}
 
 runs:
   using: composite
   steps:
-    - name: Configure Bellows
+    - name: Configure required Bellows backend
+      id: configure
       shell: bash
       env:
         INPUT_SERVER: ${{ inputs.server-url }}
         INPUT_TOKEN: ${{ inputs.auth-token }}
         INPUT_BINARY: ${{ inputs.bellows-binary }}
         TARGET_NAMESPACE: ${{ inputs.target-namespace }}
+        INPUT_L1: ${{ inputs.l1 }}
       run: |
         set -euo pipefail
-        case "$TARGET_NAMESPACE" in
-          stable|clippy|browser-stable|threaded) ;;
-          *) echo "unsupported Cargo target namespace: $TARGET_NAMESPACE" >&2; exit 2 ;;
+        [ -n "$INPUT_SERVER" ] || { echo "Bellows server URL is required" >&2; exit 2; }
+        [ -n "$INPUT_TOKEN" ] || { echo "Bellows auth token is required" >&2; exit 2; }
+        [[ "$INPUT_SERVER$INPUT_TOKEN" != *$'\n'* ]] || { echo "Bellows inputs may not contain newlines" >&2; exit 2; }
+        [[ "$TARGET_NAMESPACE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || {
+          echo "invalid Cargo target namespace: $TARGET_NAMESPACE" >&2
+          exit 2
+        }
+        case "$INPUT_L1" in
+          0|1) ;;
+          *) echo "Bellows L1 must be 0 or 1" >&2; exit 2 ;;
         esac
 
-        binary="$(command -v "$INPUT_BINARY" || true)"
-        [ -n "$binary" ] || {
-          echo "Bellows is not installed: $INPUT_BINARY" >&2
-          exit 1
-        }
+        if [[ "$INPUT_BINARY" == */* ]]; then
+          binary="$(realpath "$INPUT_BINARY")"
+          [ -x "$binary" ] || { echo "Bellows binary is not executable: $binary" >&2; exit 1; }
+        else
+          binary="$(command -v "$INPUT_BINARY" || true)"
+          [ -n "$binary" ] || { echo "Bellows is not installed: $INPUT_BINARY" >&2; exit 1; }
+        fi
 
-        target_root="${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}"
+        target_root="${BELLOWS_CARGO_TARGET_ROOT:-${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}}"
         target_dir="$target_root/$TARGET_NAMESPACE"
-        mkdir -p "$target_dir" "$RUNNER_TEMP/bellows"
+        state_dir="${BELLOWS_STATE_DIR:-$RUNNER_TEMP/bellows/$GITHUB_RUN_ID-$GITHUB_JOB}"
+        mkdir -p "$target_dir" "$state_dir"
+        echo "::add-mask::$INPUT_TOKEN"
 
         {
           echo "BELLOWS_SERVER=$INPUT_SERVER"
+          echo "BELLOWS_AUTH_TOKEN=$INPUT_TOKEN"
           echo "BELLOWS_WORKSPACE=$GITHUB_WORKSPACE"
-          echo "BELLOWS_STATE_DIR=$RUNNER_TEMP/bellows"
+          echo "BELLOWS_STATE_DIR=$state_dir"
+          echo "BELLOWS_L1=$INPUT_L1"
           echo "RUSTC_WRAPPER=$binary"
           echo "CARGO_INCREMENTAL=0"
-          echo "CARGO_PROFILE_TEST_DEBUG=0"
-          echo "CARGO_PROFILE_DEV_DEBUG=0"
-          echo "MANIFOLD_CARGO_TARGET_ROOT=$target_root"
+          echo "BELLOWS_CARGO_TARGET_ROOT=$target_root"
           echo "CARGO_TARGET_DIR=$target_dir"
         } >> "$GITHUB_ENV"
-        if [ -n "$INPUT_TOKEN" ]; then
-          echo "BELLOWS_AUTH_TOKEN=$INPUT_TOKEN" >> "$GITHUB_ENV"
-        fi
+
+        echo "binary=$binary" >> "$GITHUB_OUTPUT"
+        echo "state-dir=$state_dir" >> "$GITHUB_OUTPUT"
         echo "Bellows target namespace: $TARGET_NAMESPACE -> $target_dir"
 
-    - name: Verify Bellows service
+    - name: Verify required Bellows service
       shell: bash
       env:
         BELLOWS_SERVER: ${{ inputs.server-url }}
         BELLOWS_AUTH_TOKEN: ${{ inputs.auth-token }}
-        INPUT_BINARY: ${{ inputs.bellows-binary }}
-      run: "$INPUT_BINARY" doctor
-
+        BELLOWS_STATE_DIR: ${{ steps.configure.outputs.state-dir }}
+        BELLOWS_L1: ${{ inputs.l1 }}
+        BELLOWS_BINARY: ${{ steps.configure.outputs.binary }}
+      run: '"$BELLOWS_BINARY" doctor'

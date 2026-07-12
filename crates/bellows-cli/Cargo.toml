@@ -15,8 +15,8 @@ anyhow.workspace = true
 bellows-core = { path = "../bellows-core" }
 blake3.workspace = true
 clap.workspace = true
+fs2.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
-

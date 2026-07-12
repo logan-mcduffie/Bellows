@@ -14,8 +14,12 @@ path = "src/main.rs"
 anyhow.workspace = true
 axum.workspace = true
 bellows-core = { path = "../bellows-core" }
+blake3.workspace = true
 clap.workspace = true
+fs2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+subtle.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+tower.workspace = true

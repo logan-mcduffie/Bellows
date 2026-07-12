@@ -139,6 +139,12 @@ Client connection and overall request timeouts can be bounded with
 (1,000–600,000). `BELLOWS_MAX_WAIT_MS` bounds single-flight waiting from zero
 to 600,000 ms.
 
+Terminal output uses aligned, Cargo-style status labels and semantic color.
+Color is automatic for interactive terminals and supported CI providers,
+including GitHub Actions. Set `BELLOWS_COLOR=always|never|auto` to override
+detection; `NO_COLOR` and `TERM=dumb` disable color in automatic mode. JSON
+output remains free of styling and safe to pipe into other tools.
+
 ## Manifold
 
 Manifold can replace its `setup-sccache` seam while retaining its stable,

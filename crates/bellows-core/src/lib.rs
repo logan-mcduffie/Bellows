@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
+#[cfg(unix)]
 use std::fs::File;
 use std::io::Write;
 use std::path::Component;
@@ -1105,6 +1106,8 @@ pub fn validate_declared_command(command: &[String]) -> Result<()> {
         let windows_absolute =
             payload.as_bytes().get(1) == Some(&b':') || payload.starts_with("\\\\");
         if Path::new(payload).is_absolute()
+            || payload.starts_with('/')
+            || payload.starts_with('\\')
             || windows_absolute
             || payload.split(['/', '\\']).any(|segment| segment == "..")
         {
@@ -1167,9 +1170,24 @@ impl PathNormalizer {
     pub fn new(mut bases: Vec<(String, PathBuf)>) -> Self {
         let mut rendered = Vec::new();
         for (token, path) in bases.drain(..) {
-            let value = path.to_string_lossy().trim_end_matches('/').to_owned();
-            if !value.is_empty() && !rendered.iter().any(|(_, p)| p == &value) {
-                rendered.push((token, value));
+            let value = path
+                .to_string_lossy()
+                .trim_end_matches(['/', '\\'])
+                .to_owned();
+            let mut variants = vec![value.clone()];
+            if let Some(without_verbatim_prefix) = value.strip_prefix(r"\\?\") {
+                variants.push(without_verbatim_prefix.to_owned());
+            }
+            variants.extend(
+                variants
+                    .clone()
+                    .into_iter()
+                    .map(|variant| variant.replace('\\', "/")),
+            );
+            for variant in variants {
+                if !variant.is_empty() && !rendered.iter().any(|(_, p)| p == &variant) {
+                    rendered.push((token.clone(), variant));
+                }
             }
         }
         rendered.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
@@ -1184,12 +1202,28 @@ impl PathNormalizer {
             })
     }
 
+    /// Normalize a filesystem path into the platform-neutral form used by
+    /// candidate manifests.
+    pub fn normalize_path(&self, value: &str) -> String {
+        self.normalize(value).replace('\\', "/")
+    }
+
     pub fn localize(&self, value: &str) -> String {
         self.bases
             .iter()
             .fold(value.to_owned(), |text, (token, path)| {
                 text.replace(token, path)
             })
+    }
+
+    /// Localize a portable manifest path using native separators. Windows
+    /// verbatim paths do not accept a mixed `/` suffix reliably.
+    pub fn localize_path(&self, value: &str) -> String {
+        #[cfg(windows)]
+        let value = value.replace('/', "\\");
+        #[cfg(not(windows))]
+        let value = value.to_owned();
+        self.localize(&value)
     }
 
     pub fn normalize_bytes(&self, bytes: &[u8]) -> Vec<u8> {
@@ -1262,13 +1296,19 @@ pub fn parse_dep_info(text: &str) -> (Vec<String>, Vec<(String, Option<String>)>
 fn split_makefile_words(value: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
-    let mut escaped = false;
-    for ch in value.chars() {
-        if escaped {
-            current.push(ch);
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            // Make dep-info escapes whitespace (and a literal backslash), but
+            // rustc emits ordinary Windows paths with unescaped separators.
+            // Treating every backslash as an escape turns C:\\Users into
+            // C:Users and makes an otherwise cacheable input disappear.
+            match chars.peek().copied() {
+                Some(next) if next.is_whitespace() || (cfg!(not(windows)) && next == '\\') => {
+                    current.push(chars.next().expect("peeked character"));
+                }
+                _ => current.push('\\'),
+            }
         } else if ch.is_whitespace() {
             if !current.is_empty() {
                 words.push(std::mem::take(&mut current));
@@ -1276,9 +1316,6 @@ fn split_makefile_words(value: &str) -> Vec<String> {
         } else {
             current.push(ch);
         }
-    }
-    if escaped {
-        current.push('\\');
     }
     if !current.is_empty() {
         words.push(current);
@@ -1336,6 +1373,34 @@ mod tests {
     }
 
     #[test]
+    fn normalized_manifest_paths_use_portable_separators() {
+        let n = PathNormalizer::new(vec![(
+            "$CARGO_HOME".into(),
+            PathBuf::from(r"C:\Users\alice\.cargo"),
+        )]);
+        assert_eq!(
+            n.normalize_path(r"C:\Users\alice\.cargo\registry\src\lib.rs"),
+            "$CARGO_HOME/registry/src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn normalizes_windows_verbatim_and_regular_spellings_to_the_same_token() {
+        let n = PathNormalizer::new(vec![(
+            "$TARGET".into(),
+            PathBuf::from(r"\\?\C:\build\target"),
+        )]);
+        assert_eq!(n.normalize(r"C:\build\target\debug"), r"$TARGET\debug");
+        assert_eq!(n.normalize(r"\\?\C:\build\target\debug"), r"$TARGET\debug");
+        assert_eq!(n.normalize("C:/build/target/debug"), "$TARGET/debug");
+        #[cfg(windows)]
+        assert_eq!(
+            n.localize_path("$TARGET/debug/deps"),
+            r"\\?\C:\build\target\debug\deps"
+        );
+    }
+
+    #[test]
     fn parses_files_and_environment_from_dep_info() {
         let dep = "target/foo.rlib: src/lib.rs src/a\\ b.rs \\\n src/nested.rs\n\n# env-dep:MODE=fast\n# env-dep:OPTIONAL\n";
         let (files, env) = parse_dep_info(dep);
@@ -1347,6 +1412,14 @@ mod tests {
                 ("OPTIONAL".into(), None)
             ]
         );
+    }
+
+    #[test]
+    fn preserves_windows_dep_info_separators() {
+        let dep = "C:\\target\\foo.rlib: C:\\src\\lib.rs C:\\src\\a\\ b.rs\n";
+        let (files, env) = parse_dep_info(dep);
+        assert_eq!(files, vec![r"C:\src\a b.rs", r"C:\src\lib.rs"]);
+        assert!(env.is_empty());
     }
 
     #[test]

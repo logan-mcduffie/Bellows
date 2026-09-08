@@ -1025,6 +1025,17 @@ fn absolute_path(path: &Path, workspace: &Path) -> PathBuf {
     }
 }
 
+#[cfg(windows)]
+fn native_dependency_path(path: &Path) -> PathBuf {
+    let rendered = path.to_string_lossy().replace('/', "\\");
+    PathBuf::from(rendered.strip_prefix(r"\\?\").unwrap_or(&rendered))
+}
+
+#[cfg(not(windows))]
+fn native_dependency_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
 fn build_identity(invocation: &Invocation) -> Result<Identity> {
     let workspace = env::var_os("BELLOWS_WORKSPACE")
         .map(PathBuf::from)
@@ -1143,7 +1154,7 @@ fn validate_candidate(
 ) -> std::result::Result<(), String> {
     validate_candidate_manifest(candidate).map_err(|error| error.to_string())?;
     for input in &candidate.files {
-        let localized = identity.normalizer.localize(&input.path);
+        let localized = identity.normalizer.localize_path(&input.path);
         let path = absolute_path(Path::new(&localized), &identity.workspace);
         let actual =
             digest_file(&path).map_err(|_| format!("input disappeared: {}", input.path))?;
@@ -1499,18 +1510,21 @@ fn capture_outputs(
     file_paths.dedup();
     let mut files = Vec::new();
     for path in file_paths {
+        let path = native_dependency_path(&path);
         let absolute = absolute_path(&path, &identity.workspace);
-        if !absolute.is_file() {
-            bail!(
+        let absolute = absolute.canonicalize().with_context(|| {
+            format!(
                 "rustc dependency disappeared before capture: {}",
                 absolute.display()
             )
+        })?;
+        if !absolute.is_file() {
+            bail!("rustc dependency is not a file: {}", absolute.display())
         }
-        let absolute = absolute
-            .canonicalize()
-            .with_context(|| format!("canonicalize rustc dependency {}", absolute.display()))?;
         files.push(FileInput {
-            path: identity.normalizer.normalize(&absolute.to_string_lossy()),
+            path: identity
+                .normalizer
+                .normalize_path(&absolute.to_string_lossy()),
             digest: digest_file(&absolute)?,
         });
     }

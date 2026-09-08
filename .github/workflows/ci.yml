@@ -24,6 +24,18 @@ jobs:
       - run: scripts/five-phase-demo.sh
       - run: scripts/hardening.sh
 
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
   container:
     runs-on: ubuntu-latest
     steps:
@@ -33,12 +45,16 @@ jobs:
         run: |
           set -euo pipefail
           wait_healthy() {
-            for attempt in $(seq 1 30); do
+            # Docker's health interval is 30 seconds, so a 30-second polling
+            # deadline races the very first probe on a newly created container.
+            for attempt in $(seq 1 60); do
               status="$(docker inspect --format '{{.State.Health.Status}}' bellows-test)"
               [ "$status" = healthy ] && return 0
               [ "$status" = unhealthy ] && return 1
               sleep 1
             done
+            docker inspect bellows-test
+            docker logs bellows-test
             return 1
           }
           docker volume create bellows-test-data >/dev/null

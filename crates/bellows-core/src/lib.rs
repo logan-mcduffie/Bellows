@@ -1,9 +1,12 @@
+pub mod execution;
+
 use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
+#[cfg(unix)]
 use std::fs::File;
 use std::io::Write;
 use std::path::Component;
@@ -13,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const CONTENT_KEY_LEN: usize = 64;
 pub const MAX_CANDIDATE_FILES: usize = 100_000;
 pub const MAX_CANDIDATE_ENV: usize = 4_096;
@@ -140,14 +143,14 @@ pub fn validate_normalized_input_path(value: &str) -> Result<()> {
         value == **root
             || value
                 .strip_prefix(**root)
-                .is_some_and(|suffix| suffix.starts_with('/'))
+                .is_some_and(|suffix| suffix.starts_with(['/', '\\']))
     }) else {
         bail!("normalized input path has no recognized root: {value}")
     };
     let suffix = value
         .strip_prefix(root)
         .unwrap_or_default()
-        .trim_start_matches('/');
+        .trim_start_matches(['/', '\\']);
     if suffix.is_empty()
         || suffix
             .split(['/', '\\'])
@@ -295,7 +298,7 @@ impl PlatformIdentity {
             cargo: command_version("cargo")?,
             os: std::env::consts::OS.into(),
             arch: std::env::consts::ARCH.into(),
-            path_digest: digest_bytes(std::env::var("PATH").unwrap_or_default().as_bytes()),
+            path_digest: execution::platform_path_digest(),
             rustup_home_digest: digest_bytes(rustup_home().to_string_lossy().as_bytes()),
             rustup_toolchain: std::env::var("RUSTUP_TOOLCHAIN")
                 .ok()
@@ -337,8 +340,16 @@ fn active_rustup_toolchain() -> Option<String> {
 pub fn rustup_home() -> PathBuf {
     std::env::var_os("RUSTUP_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".rustup")))
+        .or_else(|| user_home().map(|home| home.join(".rustup")))
         .unwrap_or_else(|| PathBuf::from(".rustup"))
+}
+
+pub fn user_home() -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Some(home) = std::env::var_os("USERPROFILE") {
+        return Some(home.into());
+    }
+    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 fn command_version(command: &str) -> Result<String> {
@@ -380,7 +391,32 @@ pub struct ArchiveManifest {
     pub files: Vec<Artifact>,
 }
 
+/// Output replacement must never delete a declared source input.
+pub fn validate_output_roots(inputs: &[Artifact], outputs: &[String]) -> Result<()> {
+    for output in outputs {
+        let output = validate_relative_path(output)?;
+        if output.starts_with(".bellows") {
+            bail!(
+                "declared output overlaps Bellows state: {}",
+                output.display()
+            );
+        }
+        for input in inputs {
+            let input = validate_relative_path(&input.file_name)?;
+            if input.starts_with(&output) || output.starts_with(&input) {
+                bail!(
+                    "declared input/output overlap: {} and {}",
+                    input.display(),
+                    output.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_declared_record(record: &DeclaredActionRecord) -> Result<()> {
+    validate_output_roots(&record.inputs, &record.output_paths)?;
     if record.protocol != PROTOCOL_VERSION {
         bail!("unsupported declared record protocol {}", record.protocol)
     }
@@ -412,13 +448,10 @@ pub fn validate_declared_record(record: &DeclaredActionRecord) -> Result<()> {
         }
     }
     for output in &record.outputs {
-        let covered = record.output_paths.iter().any(|declaration| {
-            output.file_name == *declaration
-                || output
-                    .file_name
-                    .strip_prefix(declaration)
-                    .is_some_and(|suffix| suffix.starts_with('/'))
-        });
+        let covered = record
+            .output_paths
+            .iter()
+            .any(|declaration| relative_path_is_within(&output.file_name, declaration));
         if !covered {
             bail!(
                 "record output {} is outside declared roots",
@@ -523,6 +556,14 @@ pub struct Event {
     pub static_key: Option<String>,
     pub action_key: Option<String>,
     pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -532,14 +573,28 @@ pub struct Store {
 
 impl Store {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
-        let root = root.into();
+        Self::open_inner(root.into(), true)
+    }
+
+    /// Open a store from a latency-sensitive child process.
+    ///
+    /// Callers must arrange periodic maintenance through [`Store::open`] in a
+    /// parent or service process. Rustc wrappers use this entry point so a
+    /// large durable local cache is not recursively scanned once per crate.
+    pub fn open_for_access(root: impl Into<PathBuf>) -> Result<Self> {
+        Self::open_inner(root.into(), false)
+    }
+
+    fn open_inner(root: PathBuf, cleanup_temps: bool) -> Result<Self> {
         ensure_directory(&root)?;
         ensure_directory(&root.join("blobs"))?;
         ensure_directory(&root.join("actions"))?;
         ensure_directory(&root.join("declared"))?;
         ensure_directory(&root.join("archives"))?;
         ensure_directory(&root.join("quarantine"))?;
-        cleanup_orphan_temps(&root, Duration::from_secs(60 * 60))?;
+        if cleanup_temps {
+            cleanup_orphan_temps(&root, Duration::from_secs(60 * 60))?;
+        }
         Ok(Self { root })
     }
 
@@ -684,6 +739,18 @@ impl Store {
     pub fn put_declared(&self, record: &DeclaredActionRecord) -> Result<bool> {
         validate_declared_record(record)?;
         self.with_mutation_lock(|| self.put_declared_unlocked(record))
+    }
+
+    pub fn remove_declared(&self, key: &str) -> Result<bool> {
+        let path = self.declared_path(key)?;
+        self.with_mutation_lock(|| {
+            if !path.exists() {
+                return Ok(false);
+            }
+            fs::remove_file(&path).with_context(|| format!("remove declared action {key}"))?;
+            sync_parent(&path)?;
+            Ok(true)
+        })
     }
 
     fn put_declared_unlocked(&self, record: &DeclaredActionRecord) -> Result<bool> {
@@ -1048,6 +1115,14 @@ pub fn validate_relative_path(value: &str) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+// Callers validate both relative paths before checking component containment.
+// Records may come from Windows even when the content store runs on Linux.
+pub fn relative_path_is_within(path: &str, root: &str) -> bool {
+    let mut components = path.split(['/', '\\']);
+    root.split(['/', '\\'])
+        .all(|part| components.next() == Some(part))
+}
+
 pub fn validate_archive_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name.len() > 128
@@ -1079,8 +1154,16 @@ pub fn declared_action_key(
     let mut outputs = outputs.to_vec();
     outputs.sort();
     digest_bytes(
-        &serde_json::to_vec(&(name, platform, command, environment, inputs, outputs))
-            .unwrap_or_default(),
+        &serde_json::to_vec(&(
+            PROTOCOL_VERSION,
+            name,
+            platform,
+            command,
+            environment,
+            inputs,
+            outputs,
+        ))
+        .unwrap_or_default(),
     )
 }
 
@@ -1105,6 +1188,7 @@ pub fn validate_declared_command(command: &[String]) -> Result<()> {
         let windows_absolute =
             payload.as_bytes().get(1) == Some(&b':') || payload.starts_with("\\\\");
         if Path::new(payload).is_absolute()
+            || payload.starts_with(['/', '\\'])
             || windows_absolute
             || payload.split(['/', '\\']).any(|segment| segment == "..")
         {
@@ -1169,7 +1253,20 @@ impl PathNormalizer {
         for (token, path) in bases.drain(..) {
             let value = path.to_string_lossy().trim_end_matches('/').to_owned();
             if !value.is_empty() && !rendered.iter().any(|(_, p)| p == &value) {
-                rendered.push((token, value));
+                rendered.push((token.clone(), value.clone()));
+                // canonicalize() adds a verbatim prefix on Windows, while
+                // Cargo's arguments and environment use ordinary drive paths.
+                // Recognize both spellings without changing literal arguments.
+                #[cfg(windows)]
+                if let Some(ordinary) = value.strip_prefix(r"\\?\") {
+                    let ordinary = if let Some(unc) = ordinary.strip_prefix(r"UNC\") {
+                        format!(r"\\{unc}")
+                    } else {
+                        ordinary.to_owned()
+                    };
+                    rendered.push((token.clone(), ordinary.replace('\\', "/")));
+                    rendered.push((token, ordinary));
+                }
             }
         }
         rendered.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
@@ -1238,7 +1335,7 @@ fn replace_bytes(input: &[u8], replacements: &[(&[u8], &[u8])]) -> Vec<u8> {
 pub fn parse_dep_info(text: &str) -> (Vec<String>, Vec<(String, Option<String>)>) {
     let mut files = BTreeSet::new();
     let mut env = BTreeSet::new();
-    let logical = text.replace("\\\n", "");
+    let logical = text.replace("\\\r\n", "").replace("\\\n", "");
     for line in logical.lines() {
         if let Some(rest) = line.strip_prefix("# env-dep:") {
             let (name, value) = rest
@@ -1259,16 +1356,50 @@ pub fn parse_dep_info(text: &str) -> (Vec<String>, Vec<(String, Option<String>)>
     (files.into_iter().collect(), env.into_iter().collect())
 }
 
+/// Rewrite filenames without losing rustc's Make space escapes or changing
+/// environment dependency comments (whose values require exact equality).
+pub fn rewrite_dep_info(text: &str, rewrite: impl Fn(&str) -> String) -> String {
+    let logical = text.replace("\\\r\n", "").replace("\\\n", "");
+    let mut result = String::new();
+    for line in logical.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\r', '\n']);
+        let rewrite_words = |words: &str| {
+            split_makefile_words(words)
+                .iter()
+                .map(|word| rewrite(word).replace(' ', "\\ "))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        if body.starts_with('#') {
+            result.push_str(body);
+        } else if let Some((targets, dependencies)) = body.split_once(": ") {
+            result.push_str(&rewrite_words(targets));
+            result.push_str(": ");
+            result.push_str(&rewrite_words(dependencies));
+        } else if let Some(target) = body.strip_suffix(':') {
+            result.push_str(&rewrite_words(target));
+            result.push(':');
+        } else {
+            result.push_str(body);
+        }
+        if line.ends_with("\r\n") {
+            result.push_str("\r\n");
+        } else if line.ends_with('\n') {
+            result.push('\n');
+        }
+    }
+    result
+}
+
 fn split_makefile_words(value: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
-    let mut escaped = false;
-    for ch in value.chars() {
-        if escaped {
-            current.push(ch);
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        // rustc's escape_dep_filename escapes only spaces. Other backslashes
+        // are literal, including Windows drive paths and UNC prefixes.
+        if ch == '\\' && chars.peek() == Some(&' ') {
+            current.push(chars.next().unwrap());
         } else if ch.is_whitespace() {
             if !current.is_empty() {
                 words.push(std::mem::take(&mut current));
@@ -1276,9 +1407,6 @@ fn split_makefile_words(value: &str) -> Vec<String> {
         } else {
             current.push(ch);
         }
-    }
-    if escaped {
-        current.push('\\');
     }
     if !current.is_empty() {
         words.push(current);
@@ -1350,6 +1478,24 @@ mod tests {
     }
 
     #[test]
+    fn dep_info_preserves_windows_backslashes_and_escaped_spaces() {
+        let dep = concat!(
+            "C:\\build\\foo.rlib: C:\\repo\\src\\lib.rs C:\\my\\ project\\a.rs \\\r\n",
+            " \\\\server\\share\\source.rs \\\\?\\C:\\long\\source.rs\r\n",
+        );
+        let (files, _) = parse_dep_info(dep);
+        assert_eq!(
+            files,
+            vec![
+                r"C:\my project\a.rs",
+                r"C:\repo\src\lib.rs",
+                r"\\?\C:\long\source.rs",
+                r"\\server\share\source.rs",
+            ]
+        );
+    }
+
+    #[test]
     fn store_rejects_corrupt_blob() {
         let root = std::env::temp_dir().join(format!("bellows-core-test-{}", now_ms()));
         let store = Store::open(&root).unwrap();
@@ -1372,6 +1518,29 @@ mod tests {
         assert!(validate_relative_path("../escape").is_err());
         assert!(validate_relative_path("/absolute").is_err());
         assert!(validate_relative_path("a/./b").is_err());
+    }
+
+    #[test]
+    fn normalized_windows_paths_keep_the_same_traversal_boundary() {
+        assert!(validate_normalized_input_path(r"$WORKSPACE\src\lib.rs").is_ok());
+        assert!(validate_normalized_input_path(r"$WORKSPACE\..\escape.rs").is_err());
+        assert!(validate_normalized_input_path(r"C:\outside\lib.rs").is_err());
+        assert!(validate_normalized_input_path(r"\\server\share\lib.rs").is_err());
+    }
+
+    #[test]
+    fn declared_root_coverage_uses_components_across_path_separators() {
+        assert!(relative_path_is_within(
+            r"output\release\app.exe",
+            "output/release"
+        ));
+        assert!(relative_path_is_within(
+            "output/release/app.exe",
+            r"output\release"
+        ));
+        assert!(relative_path_is_within("output", "output"));
+        assert!(!relative_path_is_within("output-other/app.exe", "output"));
+        assert!(!relative_path_is_within("other/output/app.exe", "output"));
     }
 
     #[test]
@@ -1495,6 +1664,8 @@ mod tests {
                 "--manifest-path=../../Cargo.toml".into(),
             ],
             vec!["rustc".into(), "/tmp/ambient.rs".into()],
+            vec!["rustc".into(), r"\rooted\ambient.rs".into()],
+            vec!["rustc".into(), r"C:ambient.rs".into()],
             vec!["/tmp/cargo".into(), "--locked".into(), "--offline".into()],
         ] {
             assert!(validate_declared_command(&command).is_err());

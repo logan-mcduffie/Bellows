@@ -100,7 +100,7 @@ port=$((28000 + RANDOM % 10000))
 server_pid=$!
 wait_for_live "http://127.0.0.1:$port"
 run_fixture "$tmp/target-prime" BELLOWS_L1=1 BELLOWS_SERVER="http://127.0.0.1:$port"
-index="$(find "$tmp/state/l1/actions" -name '*.json' -print -quit)"
+index="$(find "$tmp/state/l1-v5/actions" -name '*.json' -print -quit)"
 test -n "$index"
 printf '{not-json' >"$index"
 kill -TERM "$server_pid"

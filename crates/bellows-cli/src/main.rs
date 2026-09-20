@@ -9,7 +9,6 @@ use bellows_core::{
     validate_relative_path,
 };
 use clap::{Args, Parser, Subcommand};
-use fs2::FileExt;
 use reqwest::StatusCode;
 use reqwest::Url;
 use reqwest::blocking::{Client, RequestBuilder};
@@ -24,6 +23,8 @@ use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod diagnostics;
+mod restore;
 mod terminal;
 
 #[derive(Parser, Debug)]
@@ -35,12 +36,25 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Run Cargo through the daemonless local cache.
+    Cargo {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        arguments: Vec<OsString>,
+    },
     /// Run an ordinary command with Bellows installed as Cargo's rustc wrapper.
     Run {
         #[arg(long, env = "BELLOWS_SERVER", default_value = "http://127.0.0.1:7878")]
         server: String,
         #[arg(long, env = "BELLOWS_AUTH_TOKEN")]
         token: Option<String>,
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<OsString>,
+    },
+    /// Run Cargo-compatible work against a daemonless, durable local cache.
+    Local {
+        /// Persistent cache directory (defaults to the platform user cache).
+        #[arg(long, env = "BELLOWS_STATE_DIR")]
+        cache_dir: Option<PathBuf>,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
     },
@@ -59,6 +73,8 @@ enum Commands {
         token: Option<String>,
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        selection: diagnostics::Selection,
     },
     /// Explain recent misses, bypasses, fallbacks, and integrity failures.
     Explain {
@@ -66,6 +82,11 @@ enum Commands {
         limit: usize,
         #[arg(long)]
         json: bool,
+        /// Group decisions by reason, with affected crates and examples.
+        #[arg(long)]
+        summary: bool,
+        #[command(flatten)]
+        selection: diagnostics::Selection,
     },
     /// Publish and restore immutable compile-once/test-many trees.
     Archive {
@@ -91,6 +112,11 @@ enum Commands {
     Gc {
         #[arg(long)]
         max_mb: u64,
+        /// Collect the daemonless local cache instead of a server.
+        #[arg(long)]
+        local: bool,
+        #[arg(long, requires = "local")]
+        cache_dir: Option<PathBuf>,
         #[command(flatten)]
         connection: ConnectionArgs,
     },
@@ -145,6 +171,11 @@ struct ConnectionArgs {
 
 #[derive(Args, Debug)]
 struct DeclaredRunArgs {
+    /// Use the daemonless local cache instead of bellowsd.
+    #[arg(long)]
+    local: bool,
+    #[arg(long, requires = "local")]
+    cache_dir: Option<PathBuf>,
     #[arg(long)]
     name: String,
     #[arg(long = "input", required = true)]
@@ -161,7 +192,9 @@ struct DeclaredRunArgs {
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = env::args_os().collect();
-    let result = if is_wrapper_invocation(&args) {
+    let result = if env::var_os(bellows_core::execution::REMAP_ENV).is_some() {
+        bellows_core::execution::remap_compiler(&args[1..]).map(|status| status.code().unwrap_or(1))
+    } else if is_wrapper_invocation(&args) {
         rustc_wrapper(&args[1..]).map(|status| status.code().unwrap_or(1))
     } else {
         run_cli()
@@ -193,11 +226,18 @@ fn is_wrapper_invocation(args: &[OsString]) -> bool {
 
 fn run_cli() -> Result<i32> {
     match Cli::parse().command {
+        Commands::Cargo { arguments } => {
+            let command = std::iter::once(OsString::from("cargo"))
+                .chain(arguments)
+                .collect();
+            run_local_command(None, command)
+        }
         Commands::Run {
             server,
             token,
             command,
         } => run_command(server, token, command),
+        Commands::Local { cache_dir, command } => run_local_command(cache_dir, command),
         Commands::Doctor { server, token } => {
             doctor(&server, token.as_deref())?;
             Ok(0)
@@ -206,12 +246,22 @@ fn run_cli() -> Result<i32> {
             server,
             token,
             json,
+            selection,
         } => {
-            show_stats(&server, token.as_deref(), json)?;
+            if selection.local {
+                show_local_stats(&selection, json)?;
+            } else {
+                show_stats(&server, token.as_deref(), &selection, json)?;
+            }
             Ok(0)
         }
-        Commands::Explain { limit, json } => {
-            explain(limit, json)?;
+        Commands::Explain {
+            limit,
+            json,
+            summary,
+            selection,
+        } => {
+            explain(&selection, limit, json, summary)?;
             Ok(0)
         }
         Commands::Archive { command } => {
@@ -226,7 +276,12 @@ fn run_cli() -> Result<i32> {
         }
         Commands::Remote { command } => {
             match command {
-                RemoteCommands::Run(args) => run_declared_action(args, true)?,
+                RemoteCommands::Run(args) => {
+                    if args.local {
+                        bail!("bellows remote run cannot be combined with --local")
+                    }
+                    run_declared_action(args, true)?
+                }
             }
             Ok(0)
         }
@@ -234,9 +289,18 @@ fn run_cli() -> Result<i32> {
             run_analysis(command)?;
             Ok(0)
         }
-        Commands::Gc { max_mb, connection } => {
-            let report = Remote::new(&connection.server, connection.token)?
-                .gc(max_mb.saturating_mul(1024 * 1024))?;
+        Commands::Gc {
+            max_mb,
+            local,
+            cache_dir,
+            connection,
+        } => {
+            let report = if local {
+                local_store(cache_dir.as_deref(), true)?.gc(max_mb.saturating_mul(1024 * 1024))?
+            } else {
+                Remote::new(&connection.server, connection.token)?
+                    .gc(max_mb.saturating_mul(1024 * 1024))?
+            };
             println!(
                 "{}",
                 terminal::status(
@@ -262,13 +326,16 @@ fn run_command(server: String, token: Option<String>, command: Vec<OsString>) ->
     let (program, arguments) = command.split_first().context("missing command")?;
     let workspace = env::current_dir()?.canonicalize()?;
     let state_dir = state_dir(&workspace);
-    fs::create_dir_all(&state_dir)?;
+    if let Err(error) = fs::create_dir_all(&state_dir) {
+        return run_without_cache(program, arguments, &error.into());
+    }
     let wrapper = env::current_exe()?.canonicalize()?;
     let mut child = Command::new(program);
     child
         .args(arguments)
         .env("RUSTC_WRAPPER", &wrapper)
         .env("BELLOWS_SERVER", server)
+        .env_remove("BELLOWS_LOCAL_ONLY")
         .env("BELLOWS_WORKSPACE", &workspace)
         .env("BELLOWS_STATE_DIR", &state_dir)
         .env("CARGO_INCREMENTAL", "0");
@@ -284,8 +351,108 @@ fn run_command(server: String, token: Option<String>, command: Vec<OsString>) ->
             &display_command(program, arguments),
         )
     );
-    let status = child.status().context("start wrapped command")?;
-    Ok(status.code().unwrap_or(1))
+    let session = diagnostics::BuildSession::start(&state_dir, &workspace);
+    session.configure(&mut child);
+    let result = child.status().context("start wrapped command");
+    session.finish(result.as_ref().ok().and_then(ExitStatus::code).unwrap_or(1));
+    Ok(result?.code().unwrap_or(1))
+}
+
+fn run_local_command(cache_dir: Option<PathBuf>, command: Vec<OsString>) -> Result<i32> {
+    let (program, arguments) = command.split_first().context("missing command")?;
+    let workspace = env::current_dir()?.canonicalize()?;
+    let state_dir = match local_state_dir(cache_dir.as_deref()).and_then(|state| {
+        local_store(Some(&state), true)?.check_writable()?;
+        Ok(state)
+    }) {
+        Ok(state) => state,
+        Err(error) => return run_without_cache(program, arguments, &error),
+    };
+    let wrapper = env::current_exe()?.canonicalize()?;
+    eprintln!(
+        "{}",
+        terminal::status(
+            terminal::stderr_color(),
+            "running",
+            "local",
+            &display_command(program, arguments),
+        )
+    );
+    let mut child = Command::new(program);
+    child
+        .args(arguments)
+        .env("RUSTC_WRAPPER", &wrapper)
+        .env("BELLOWS_LOCAL_ONLY", "1")
+        .env("BELLOWS_WORKSPACE", &workspace)
+        .env("BELLOWS_STATE_DIR", &state_dir)
+        .env_remove("BELLOWS_SERVER")
+        .env_remove("BELLOWS_AUTH_TOKEN");
+    let session = diagnostics::BuildSession::start(&state_dir, &workspace);
+    session.configure(&mut child);
+    let result = child.status().context("start locally wrapped command");
+    session.finish(result.as_ref().ok().and_then(ExitStatus::code).unwrap_or(1));
+    Ok(result?.code().unwrap_or(1))
+}
+
+fn run_without_cache(
+    program: &OsStr,
+    arguments: &[OsString],
+    error: &anyhow::Error,
+) -> Result<i32> {
+    eprintln!(
+        "{}",
+        terminal::warning(
+            terminal::stderr_color(),
+            "cache disabled",
+            &format!("cache initialization failed; running command normally: {error:#}")
+        )
+    );
+    let mut child = Command::new(program);
+    child.args(arguments);
+    // Preserve an unrelated caller-supplied wrapper, but don't re-enter Bellows.
+    if env::var_os("RUSTC_WRAPPER").is_some_and(|path| {
+        Path::new(&path).canonicalize().ok()
+            == env::current_exe().ok().and_then(|p| p.canonicalize().ok())
+    }) {
+        child.env_remove("RUSTC_WRAPPER");
+    }
+    Ok(child
+        .status()
+        .context("start command without cache")?
+        .code()
+        .unwrap_or(1))
+}
+
+fn local_state_dir(configured: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = configured {
+        return Ok(if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            env::current_dir()?.join(path)
+        });
+    }
+    if let Some(path) = env::var_os("BELLOWS_STATE_DIR") {
+        return Ok(absolute_path(Path::new(&path), &env::current_dir()?));
+    }
+    if let Some(root) = env::var_os("XDG_CACHE_HOME") {
+        return Ok(PathBuf::from(root).join("bellows"));
+    }
+    if let Some(root) = env::var_os("LOCALAPPDATA") {
+        return Ok(PathBuf::from(root).join("Bellows"));
+    }
+    if let Some(home) = env::var_os("HOME") {
+        return Ok(PathBuf::from(home).join(".cache/bellows"));
+    }
+    bail!("cannot locate a user cache directory; pass --cache-dir")
+}
+
+fn local_store(cache_dir: Option<&Path>, maintenance: bool) -> Result<Store> {
+    let root = local_state_dir(cache_dir)?.join(format!("store-v{PROTOCOL_VERSION}"));
+    if maintenance {
+        Store::open(root)
+    } else {
+        Store::open_for_access(root)
+    }
 }
 
 fn display_command(program: &OsStr, args: &[OsString]) -> String {
@@ -566,6 +733,30 @@ impl Invocation {
         if args.iter().any(|arg| arg.starts_with('@')) {
             return Err("rustc response files are not modeled".into());
         }
+        if args.iter().any(|arg| arg == "--test") {
+            return Err("test harness outputs are not modeled".into());
+        }
+        if option_value(&args, "--sysroot").is_some() {
+            return Err("custom sysroot contents are not modeled".into());
+        }
+        if option_value(&args, "--target")
+            .is_some_and(|target| target.ends_with(".json") || Path::new(&target).is_file())
+        {
+            return Err("custom target specification contents are not modeled".into());
+        }
+        if codegen_value(&args, "target-cpu").as_deref() == Some("native") {
+            return Err("host-native CPU features are not modeled in the cache key".into());
+        }
+        if args.iter().enumerate().any(|(i, arg)| {
+            let value = if arg == "-C" {
+                args.get(i + 1).map(String::as_str)
+            } else {
+                arg.strip_prefix("-C")
+            };
+            value.is_some_and(|value| value == "save-temps" || value.starts_with("save-temps="))
+        }) {
+            return Err("compiler temporary outputs are not modeled".into());
+        }
         if args.iter().any(|arg| arg == "-Z" || arg.starts_with("-Z")) {
             return Err("unstable compiler flags are not modeled".into());
         }
@@ -604,11 +795,13 @@ impl Invocation {
         let mut explicit_inputs = vec![source.clone()];
         let mut proc_macro = false;
         for value in multi_option_values(&args, "--extern") {
-            let path = value
-                .split_once('=')
-                .map(|(_, path)| path)
-                .unwrap_or(&value);
+            let Some((_, path)) = value.split_once('=') else {
+                return Err("extern dependency has no explicit artifact path".into());
+            };
             let path = PathBuf::from(path);
+            if !path.is_file() {
+                return Err("extern dependency artifact is missing".into());
+            }
             if path.exists() {
                 let ext = path.extension().and_then(OsStr::to_str).unwrap_or_default();
                 if matches!(ext, "so" | "dylib" | "dll") {
@@ -621,7 +814,16 @@ impl Invocation {
             return Err("invocation loads a procedural macro or dynamic compiler plugin".into());
         }
 
-        let emit = option_value(&args, "--emit").unwrap_or_default();
+        let emits = multi_option_values(&args, "--emit");
+        if emits.len() != 1
+            || emits[0]
+                .split(',')
+                .any(|kind| !matches!(kind, "dep-info" | "metadata" | "link"))
+            || args.iter().any(|arg| arg.starts_with("-o"))
+        {
+            return Err("unsupported emit set or custom output destination; running rustc to produce every requested output".into());
+        }
+        let emit = &emits[0];
         let mut expected_names = BTreeSet::new();
         if emit
             .split(',')
@@ -658,12 +860,12 @@ fn has_native_or_external_codegen_inputs(args: &[String]) -> bool {
             return true;
         }
         if arg == "-L" {
-            return args.get(index + 1).is_some_and(|value| {
-                value.starts_with("native=") || value.starts_with("framework=")
-            });
+            return args
+                .get(index + 1)
+                .is_none_or(|value| !value.starts_with("dependency="));
         }
-        if arg.starts_with("-Lnative=") || arg.starts_with("-Lframework=") {
-            return true;
+        if let Some(value) = arg.strip_prefix("-L") {
+            return !value.starts_with("dependency=");
         }
         let codegen = if arg == "-C" {
             args.get(index + 1).map(String::as_str)
@@ -724,10 +926,13 @@ struct Identity {
     static_key: String,
     normalizer: PathNormalizer,
     workspace: PathBuf,
+    fingerprint: diagnostics::Fingerprint,
+    diagnostic_group: String,
 }
 
 fn rustc_wrapper(raw: &[OsString]) -> Result<ExitStatus> {
-    match cache_or_compile(raw) {
+    let started = Instant::now();
+    let result = match cache_or_compile(raw) {
         Ok(status) => Ok(status),
         Err(error) => {
             let crate_name = wrapper_crate_name(raw);
@@ -740,7 +945,16 @@ fn rustc_wrapper(raw: &[OsString]) -> Result<ExitStatus> {
             );
             passthrough(raw)
         }
-    }
+    };
+    record_event_duration(
+        "compiler_timing",
+        wrapper_crate_name(raw),
+        None,
+        None,
+        "compiler wrapper elapsed time",
+        Some(started.elapsed().as_millis() as u64),
+    );
+    result
 }
 
 fn wrapper_crate_name(raw: &[OsString]) -> &str {
@@ -751,6 +965,7 @@ fn wrapper_crate_name(raw: &[OsString]) -> &str {
 }
 
 fn cache_or_compile(raw: &[OsString]) -> Result<ExitStatus> {
+    let local_only = env::var("BELLOWS_LOCAL_ONLY").as_deref() == Ok("1");
     let invocation = match Invocation::analyze(raw) {
         Ok(invocation) => invocation,
         Err(reason) => {
@@ -771,24 +986,35 @@ fn cache_or_compile(raw: &[OsString]) -> Result<ExitStatus> {
             return passthrough(raw);
         }
     };
-    let server = env::var("BELLOWS_SERVER").unwrap_or_else(|_| "http://127.0.0.1:7878".into());
-    let remote = match Remote::new(&server, env::var("BELLOWS_AUTH_TOKEN").ok()) {
-        Ok(remote) => remote,
-        Err(error) => {
-            record_event(
-                "fallback",
-                &invocation.crate_name,
-                Some(&identity.static_key),
-                None,
-                &format!("invalid remote configuration: {error}"),
-            );
-            return passthrough(raw);
+    let remote = if local_only {
+        None
+    } else {
+        let server = env::var("BELLOWS_SERVER").unwrap_or_else(|_| "http://127.0.0.1:7878".into());
+        match Remote::new(&server, env::var("BELLOWS_AUTH_TOKEN").ok()) {
+            Ok(remote) => Some(remote),
+            Err(error) => {
+                record_event(
+                    "fallback",
+                    &invocation.crate_name,
+                    Some(&identity.static_key),
+                    None,
+                    &format!("invalid remote configuration: {error}"),
+                );
+                return passthrough(raw);
+            }
         }
     };
     let l1 = if env::var("BELLOWS_L1").as_deref() == Ok("0") {
         None
     } else {
-        match Store::open(state_dir(&identity.workspace).join("l1")) {
+        let store = if local_only {
+            local_store(Some(&state_dir(&identity.workspace)), false)
+        } else {
+            Store::open_for_access(
+                state_dir(&identity.workspace).join(format!("l1-v{PROTOCOL_VERSION}")),
+            )
+        };
+        match store {
             Ok(store) => Some(store),
             Err(error) => {
                 record_event(
@@ -802,19 +1028,31 @@ fn cache_or_compile(raw: &[OsString]) -> Result<ExitStatus> {
             }
         }
     };
+    let identity_hint = diagnostics::remember_identity(
+        &state_dir(&identity.workspace),
+        &identity.diagnostic_group,
+        &identity.fingerprint,
+    )
+    .unwrap_or_else(|error| {
+        format!("no usable candidate; diagnostic identity history unavailable: {error:#}")
+    });
+    let mut local_index = CandidateIndex::default();
     if let Some(store) = &l1 {
         match store.read_candidates(&identity.static_key) {
-            Ok(index) => match try_l1_candidates(store, &invocation, &identity, &index) {
-                Ok(Some(status)) => return Ok(status),
-                Ok(None) => {}
-                Err(error) => record_event(
-                    "fallback",
-                    &invocation.crate_name,
-                    Some(&identity.static_key),
-                    None,
-                    &format!("L1 restore failed: {error:#}"),
-                ),
-            },
+            Ok(index) => {
+                local_index = index;
+                match try_l1_candidates(store, &invocation, &identity, &local_index) {
+                    Ok(Some(status)) => return Ok(status),
+                    Ok(None) => {}
+                    Err(error) => record_event(
+                        "fallback",
+                        &invocation.crate_name,
+                        Some(&identity.static_key),
+                        None,
+                        &format!("L1 restore failed: {error:#}"),
+                    ),
+                }
+            }
             Err(error) => record_event(
                 "fallback",
                 &invocation.crate_name,
@@ -825,24 +1063,51 @@ fn cache_or_compile(raw: &[OsString]) -> Result<ExitStatus> {
         }
     }
 
-    let (index, remote_available) = match remote.candidates(&identity.static_key) {
-        Ok(index) => (index, true),
-        Err(error) => {
-            record_event(
-                "fallback",
-                &invocation.crate_name,
-                Some(&identity.static_key),
-                None,
-                &format!("remote unavailable: {error}"),
-            );
-            (CandidateIndex::default(), false)
-        }
+    let (index, remote_available) = match &remote {
+        Some(remote) => match remote.candidates(&identity.static_key) {
+            Ok(index) => (index, true),
+            Err(error) => {
+                record_event(
+                    "fallback",
+                    &invocation.crate_name,
+                    Some(&identity.static_key),
+                    None,
+                    &format!("remote unavailable: {error}"),
+                );
+                (CandidateIndex::default(), false)
+            }
+        },
+        None => (CandidateIndex::default(), false),
     };
-    if let Some(status) = try_candidates(&remote, l1.as_ref(), &invocation, &identity, &index)? {
+    if let Some(remote) = &remote
+        && let Some(status) = try_candidates(remote, l1.as_ref(), &invocation, &identity, &index)?
+    {
         return Ok(status);
     }
 
-    let miss_detail = explain_candidates(&identity, &index);
+    let mut reasons = Vec::new();
+    if !local_index.candidates.is_empty() {
+        reasons.push(format!(
+            "local cache: {}",
+            explain_candidates(&identity, &local_index)
+        ));
+    }
+    if !index.candidates.is_empty() {
+        reasons.push(format!(
+            "remote cache: {}",
+            explain_candidates(&identity, &index)
+        ));
+    }
+    if remote.is_some() && !remote_available {
+        reasons.push("remote unavailable (see fallback event for request error)".into());
+    }
+    if l1.is_none() {
+        reasons.push("local cache disabled or unavailable".into());
+    }
+    if local_index.candidates.is_empty() && index.candidates.is_empty() {
+        reasons.push(identity_hint);
+    }
+    let miss_detail = reasons.join("; ");
     record_event(
         "miss",
         &invocation.crate_name,
@@ -853,7 +1118,9 @@ fn cache_or_compile(raw: &[OsString]) -> Result<ExitStatus> {
 
     let client_id = format!("{}-{}", std::process::id(), now_ms());
     let mut owned_token = None;
-    if remote_available {
+    if let Some(remote) = &remote
+        && remote_available
+    {
         match remote.acquire(&identity.static_key, &client_id) {
             Ok(LeaseResponse::Owned { token, .. }) => owned_token = Some(token),
             Ok(LeaseResponse::Wait {
@@ -887,29 +1154,70 @@ fn cache_or_compile(raw: &[OsString]) -> Result<ExitStatus> {
                     }
                 };
                 let deadline = Instant::now() + max_wait;
+                let mut checked_candidates = index
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.action_key.clone())
+                    .collect::<BTreeSet<_>>();
+                let mut lease_failed = false;
                 while Instant::now() < deadline && now_ms() < expires_ms {
                     thread::sleep(Duration::from_millis(retry_after_ms.clamp(50, 1_000)));
-                    if let Ok(index) = remote.candidates(&identity.static_key)
-                        && let Some(status) =
-                            try_candidates(&remote, l1.as_ref(), &invocation, &identity, &index)?
-                    {
-                        record_event(
-                            "single_flight",
-                            &invocation.crate_name,
-                            Some(&identity.static_key),
-                            None,
-                            "restored result published by lease owner",
-                        );
-                        return Ok(status);
+                    if let Ok(mut index) = remote.candidates(&identity.static_key) {
+                        index.candidates.retain(|candidate| {
+                            checked_candidates.insert(candidate.action_key.clone())
+                        });
+                        if let Some(status) =
+                            try_candidates(remote, l1.as_ref(), &invocation, &identity, &index)?
+                        {
+                            record_event(
+                                "single_flight",
+                                &invocation.crate_name,
+                                Some(&identity.static_key),
+                                None,
+                                "restored result published by lease owner",
+                            );
+                            return Ok(status);
+                        }
+                    }
+                    // A static key can have several valid candidates (for example,
+                    // different exact OUT_DIR dependencies). Once the owner releases
+                    // its lease, compile our variant instead of waiting for an
+                    // incompatible result until the original lease expires.
+                    match remote.acquire(&identity.static_key, &client_id) {
+                        Ok(LeaseResponse::Owned { token, .. }) => {
+                            owned_token = Some(token);
+                            record_event(
+                                "lease_acquired",
+                                &invocation.crate_name,
+                                Some(&identity.static_key),
+                                None,
+                                "acquired released lease; no published candidate matches this invocation",
+                            );
+                            break;
+                        }
+                        Ok(LeaseResponse::Wait { .. }) => {}
+                        Err(error) => {
+                            record_event(
+                                "fallback",
+                                &invocation.crate_name,
+                                Some(&identity.static_key),
+                                None,
+                                &format!("lease unavailable while waiting: {error}"),
+                            );
+                            lease_failed = true;
+                            break;
+                        }
                     }
                 }
-                record_event(
-                    "fallback",
-                    &invocation.crate_name,
-                    Some(&identity.static_key),
-                    None,
-                    "single-flight wait timed out; compiling locally",
-                );
+                if owned_token.is_none() && !lease_failed {
+                    record_event(
+                        "fallback",
+                        &invocation.crate_name,
+                        Some(&identity.static_key),
+                        None,
+                        "single-flight wait timed out; compiling locally",
+                    );
+                }
             }
             Err(error) => record_event(
                 "fallback",
@@ -925,14 +1233,18 @@ fn cache_or_compile(raw: &[OsString]) -> Result<ExitStatus> {
     let (status, captured) = match outcome {
         Ok(value) => value,
         Err(error) => {
-            if let Some(token) = &owned_token {
+            if let Some(token) = &owned_token
+                && let Some(remote) = &remote
+            {
                 remote.release(&identity.static_key, token);
             }
             return Err(error);
         }
     };
     if !status.success() {
-        if let Some(token) = &owned_token {
+        if let Some(token) = &owned_token
+            && let Some(remote) = &remote
+        {
             remote.release(&identity.static_key, token);
         }
         return Ok(status);
@@ -949,8 +1261,10 @@ fn cache_or_compile(raw: &[OsString]) -> Result<ExitStatus> {
                 &format!("L1 publication failed: {error:#}"),
             );
         }
-        if remote_available {
-            match publish(&remote, captured) {
+        if let Some(remote) = &remote
+            && remote_available
+        {
+            match publish(remote, captured) {
                 Ok(action_key) => record_event(
                     "store",
                     &invocation.crate_name,
@@ -968,7 +1282,9 @@ fn cache_or_compile(raw: &[OsString]) -> Result<ExitStatus> {
             }
         }
     }
-    if let Some(token) = &owned_token {
+    if let Some(token) = &owned_token
+        && let Some(remote) = &remote
+    {
         remote.release(&identity.static_key, token);
     }
     Ok(status)
@@ -982,10 +1298,26 @@ fn passthrough(raw: &[OsString]) -> Result<ExitStatus> {
 fn normalizer(workspace: &Path, out_dir: &Path) -> PathNormalizer {
     let target = target_root(workspace, out_dir);
     let mut bases = vec![("$WORKSPACE".into(), workspace.to_path_buf())];
-    if let Some(target) = target {
-        bases.push(("$TARGET".into(), canonical_base(target)));
+    // Cargo's manifest directory may retain an 8.3 spelling even when the
+    // process working directory has already been expanded by Windows.
+    for alias in [
+        env::current_dir().ok(),
+        env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if alias.canonicalize().ok().as_deref() == workspace.canonicalize().ok().as_deref() {
+            bases.push(("$WORKSPACE".into(), alias));
+        }
     }
-    let home = env::var_os("HOME").map(PathBuf::from);
+    if let Some(target) = target {
+        bases.push(("$TARGET".into(), canonical_base(target.clone())));
+        // Retain the caller's spelling too: Windows temp directories may use
+        // 8.3 names that canonicalize() expands to a different path string.
+        bases.push(("$TARGET".into(), target));
+    }
+    let home = bellows_core::user_home();
     if let Some(cargo_home) = env::var_os("CARGO_HOME")
         .map(PathBuf::from)
         .or_else(|| home.as_ref().map(|home| home.join(".cargo")))
@@ -1015,6 +1347,16 @@ fn infer_target_root(out_dir: &Path) -> Option<PathBuf> {
         .ancestors()
         .find(|p| p.file_name().is_some_and(|n| n == "target"))
         .map(Path::to_path_buf)
+        .or_else(|| {
+            // Cargo's --target-dir flag is not exported to rustc as
+            // CARGO_TARGET_DIR. Compiler products still have the stable
+            // <root>/<profile>/deps shape (or <root>/<triple>/<profile>/deps
+            // for cross compilation), so normalize the nearest complete
+            // target subtree even when its directory has a custom name.
+            (out_dir.file_name().is_some_and(|name| name == "deps"))
+                .then(|| out_dir.parent()?.parent().map(Path::to_path_buf))
+                .flatten()
+        })
 }
 
 fn absolute_path(path: &Path, workspace: &Path) -> PathBuf {
@@ -1025,16 +1367,77 @@ fn absolute_path(path: &Path, workspace: &Path) -> PathBuf {
     }
 }
 
+// Canonicalizing a symlink loses the dependency on its resolution. Until the
+// manifest models that resolution, do not cache any input reached through one.
+fn canonical_compiler_input(path: &Path) -> Result<PathBuf> {
+    for ancestor in path.ancestors() {
+        if fs::symlink_metadata(ancestor)?.file_type().is_symlink() {
+            bail!(
+                "symlinked compiler input is not cacheable: {}",
+                ancestor.display()
+            );
+        }
+    }
+    Ok(path.canonicalize()?)
+}
+
+fn normalized_compiler_arguments(
+    invocation: &Invocation,
+    normalizer: &PathNormalizer,
+) -> Vec<String> {
+    let source = invocation
+        .explicit_inputs
+        .first()
+        .map(|path| path.to_string_lossy());
+    let mut normalized = Vec::with_capacity(invocation.args.len());
+    let mut path_value = false;
+    for arg in &invocation.args {
+        let is_path = path_value
+            || source.as_deref() == Some(arg.as_str())
+            || arg.starts_with("--out-dir=")
+            || arg.starts_with("--extern=")
+            || arg.starts_with("-Ldependency=");
+        normalized.push(if is_path {
+            normalizer.normalize(arg)
+        } else {
+            arg.clone()
+        });
+        path_value = matches!(arg.as_str(), "--out-dir" | "--extern" | "-L");
+    }
+    normalized
+}
+
 fn build_identity(invocation: &Invocation) -> Result<Identity> {
-    let workspace = env::var_os("BELLOWS_WORKSPACE")
-        .map(PathBuf::from)
-        .unwrap_or(env::current_dir()?)
-        .canonicalize()?;
+    // Cargo can change directory for a manifest or a nested build. Relative
+    // rustc arguments and dep-info belong to that invocation's working dir,
+    // not the parent Bellows session's launch directory.
+    let workspace = env::current_dir()?.canonicalize()?;
     let normalizer = normalizer(&workspace, &invocation.out_dir);
     let compiler = Command::new(&invocation.rustc).arg("-vV").output()?;
     if !compiler.status.success() {
         bail!("rustc -vV failed")
     }
+    let normalized_args = normalized_compiler_arguments(invocation, &normalizer);
+    let mut components = diagnostics::argument_components(&normalized_args, str::to_owned);
+    components.insert(
+        "argument order".into(),
+        digest_bytes(&serde_json::to_vec(&normalized_args)?),
+    );
+    components.insert(
+        "compiler version changed".into(),
+        digest_bytes(&compiler.stdout),
+    );
+    components.insert(
+        "protocol changed".into(),
+        digest_bytes(PROTOCOL_VERSION.to_string().as_bytes()),
+    );
+    // Earlier captures treated every backslash as a Make escape and could
+    // omit the real dependency. Never reuse those compiler manifests.
+    let dep_info_format = b"rustc-space-escape-v5-structured-dep-info";
+    components.insert(
+        "dependency parser changed".into(),
+        digest_bytes(dep_info_format),
+    );
     let mut hasher = blake3::Hasher::new();
     hash_field(
         &mut hasher,
@@ -1042,31 +1445,54 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
         PROTOCOL_VERSION.to_string().as_bytes(),
     );
     hash_field(&mut hasher, "compiler", &compiler.stdout);
-    for arg in &invocation.args {
-        hash_field(&mut hasher, "arg", normalizer.normalize(arg).as_bytes());
+    hash_field(&mut hasher, "dep-info-format", dep_info_format);
+    for arg in &normalized_args {
+        hash_field(&mut hasher, "arg", arg.as_bytes());
     }
     hash_field(&mut hasher, "remap", b"$WORKSPACE=/bellows/workspace");
     for (name, value) in relevant_environment(&normalizer) {
         hash_field(&mut hasher, &format!("env:{name}"), value.as_bytes());
+        components.insert(
+            format!("environment changed: {name}"),
+            digest_bytes(value.as_bytes()),
+        );
     }
     let mut inputs = invocation.explicit_inputs.clone();
     inputs.sort();
     inputs.dedup();
     for path in inputs {
-        let absolute = absolute_path(&path, &workspace)
-            .canonicalize()
+        let absolute = canonical_compiler_input(&absolute_path(&path, &workspace))
             .with_context(|| format!("canonicalize compiler input {}", path.display()))?;
+        let input_digest = digest_file(&absolute)?;
+        components.insert(
+            format!(
+                "explicit input changed: {}",
+                normalizer.normalize(&absolute.to_string_lossy())
+            ),
+            input_digest.clone(),
+        );
         hash_field(
             &mut hasher,
             &format!(
                 "input:{}",
                 normalizer.normalize(&absolute.to_string_lossy())
             ),
-            digest_file(&absolute)?.as_bytes(),
+            input_digest.as_bytes(),
         );
     }
+    let static_key = hasher.finalize().to_hex().to_string();
+    let source = invocation
+        .explicit_inputs
+        .first()
+        .map(|p| normalizer.normalize(&absolute_path(p, &workspace).to_string_lossy()))
+        .unwrap_or_default();
     Ok(Identity {
-        static_key: hasher.finalize().to_hex().to_string(),
+        fingerprint: diagnostics::Fingerprint {
+            key: static_key.clone(),
+            components,
+        },
+        diagnostic_group: format!("{}:{source}", invocation.crate_name),
+        static_key,
         normalizer,
         workspace,
     })
@@ -1121,6 +1547,7 @@ fn is_relevant_environment_name(name: &str) -> bool {
         "BELLOWS_AUTH_TOKEN",
         "BELLOWS_DEMO_COMPILE_DELAY_MS",
         "BELLOWS_EVENT_LOG",
+        "BELLOWS_LOCAL_ONLY",
         "BELLOWS_MAX_WAIT_MS",
         "BELLOWS_SERVER",
         "BELLOWS_STATE_DIR",
@@ -1152,9 +1579,7 @@ fn validate_candidate(
         }
     }
     for input in &candidate.env {
-        let value = env::var(&input.name)
-            .ok()
-            .map(|value| identity.normalizer.normalize(&value));
+        let value = env::var(&input.name).ok();
         let actual = EnvInput::capture(&input.name, value.as_deref());
         if actual.value_digest != input.value_digest {
             return Err(format!("environment changed: {}", input.name));
@@ -1165,14 +1590,14 @@ fn validate_candidate(
 
 fn explain_candidates(identity: &Identity, index: &CandidateIndex) -> String {
     if index.candidates.is_empty() {
-        return "no remote candidate has this compiler/command/input identity".into();
+        return "no candidate for this static identity".into();
     }
     index
         .candidates
         .iter()
         .filter_map(|candidate| validate_candidate(candidate, identity).err())
         .next()
-        .unwrap_or_else(|| "candidate artifacts were unavailable or corrupt".into())
+        .unwrap_or_else(|| "candidate artifacts unavailable or restore failed; see corrupt event for the blob/path error".into())
 }
 
 fn try_candidates(
@@ -1226,7 +1651,14 @@ fn try_l1_candidates(
     index: &CandidateIndex,
 ) -> Result<Option<ExitStatus>> {
     for candidate in &index.candidates {
-        if validate_candidate(candidate, identity).is_err() {
+        if let Err(reason) = validate_candidate(candidate, identity) {
+            record_event(
+                "candidate_rejected",
+                &invocation.crate_name,
+                Some(&identity.static_key),
+                Some(&candidate.action_key),
+                &format!("local cache: {reason}"),
+            );
             continue;
         }
         match restore_l1(store, invocation, identity, candidate) {
@@ -1307,7 +1739,7 @@ fn restore(
             let _ = store.put_blob(&artifact.digest, &stored);
         }
         let bytes = if artifact.file_name.ends_with(".d") {
-            identity.normalizer.localize_bytes(&stored)
+            transform_dep_info(&stored, &identity.normalizer, true)
         } else {
             stored
         };
@@ -1325,8 +1757,8 @@ fn restore(
         let _ = store.put_blob(&candidate.stdout.digest, &stdout_blob);
         let _ = store.put_blob(&candidate.stderr.digest, &stderr_blob);
     }
-    let stdout = identity.normalizer.localize_bytes(&stdout_blob);
-    let stderr = identity.normalizer.localize_bytes(&stderr_blob);
+    let stdout = transform_compiler_stream(&stdout_blob, &identity.normalizer, true);
+    let stderr = transform_compiler_stream(&stderr_blob, &identity.normalizer, true);
     std::io::stdout().write_all(&stdout)?;
     std::io::stderr().write_all(&stderr)?;
     Ok(())
@@ -1374,14 +1806,14 @@ fn restore_l1(
     }
     for (artifact, stored) in downloaded {
         let bytes = if artifact.file_name.ends_with(".d") {
-            identity.normalizer.localize_bytes(&stored)
+            transform_dep_info(&stored, &identity.normalizer, true)
         } else {
             stored
         };
         atomic_write(&invocation.out_dir.join(&artifact.file_name), &bytes)?;
     }
-    let stdout = identity.normalizer.localize_bytes(&stdout_blob);
-    let stderr = identity.normalizer.localize_bytes(&stderr_blob);
+    let stdout = transform_compiler_stream(&stdout_blob, &identity.normalizer, true);
+    let stderr = transform_compiler_stream(&stderr_blob, &identity.normalizer, true);
     std::io::stdout().write_all(&stdout)?;
     std::io::stderr().write_all(&stderr)?;
     Ok(())
@@ -1449,6 +1881,66 @@ fn compile_and_capture(
     Ok((status, captured))
 }
 
+// rustc's JSON diagnostics/artifact notifications contain escaped strings.
+// Replacing raw bytes can inject unescaped Windows backslashes into JSON.
+fn transform_compiler_stream(bytes: &[u8], normalizer: &PathNormalizer, localize: bool) -> Vec<u8> {
+    fn visit(value: &mut serde_json::Value, normalizer: &PathNormalizer, localize: bool) {
+        match value {
+            serde_json::Value::String(text) => {
+                *text = if localize {
+                    normalizer.localize(text)
+                } else {
+                    normalizer.normalize(text)
+                };
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    visit(value, normalizer, localize);
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for value in values.values_mut() {
+                    visit(value, normalizer, localize);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut result = Vec::new();
+    for line in bytes.split_inclusive(|b| *b == b'\n') {
+        if let Ok(mut value @ serde_json::Value::Object(_)) = serde_json::from_slice(line) {
+            visit(&mut value, normalizer, localize);
+            result.extend(serde_json::to_vec(&value).expect("serialize compiler JSON"));
+            if line.ends_with(b"\r\n") {
+                result.extend_from_slice(b"\r\n");
+            } else if line.ends_with(b"\n") {
+                result.push(b'\n');
+            }
+        } else {
+            result.extend(if localize {
+                normalizer.localize_bytes(line)
+            } else {
+                normalizer.normalize_bytes(line)
+            });
+        }
+    }
+    result
+}
+
+fn transform_dep_info(bytes: &[u8], normalizer: &PathNormalizer, localize: bool) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return bytes.to_vec();
+    };
+    bellows_core::rewrite_dep_info(text, |path| {
+        if localize {
+            normalizer.localize(path)
+        } else {
+            normalizer.normalize(path)
+        }
+    })
+    .into_bytes()
+}
+
 fn capture_outputs(
     invocation: &Invocation,
     identity: &Identity,
@@ -1476,7 +1968,7 @@ fn capture_outputs(
         }
         let raw = fs::read(&path)?;
         let stored = if name.ends_with(".d") {
-            let normalized = identity.normalizer.normalize_bytes(&raw);
+            let normalized = transform_dep_info(&raw, &identity.normalizer, false);
             dep_text = Some(String::from_utf8(raw).context("dep-info is not UTF-8")?);
             normalized
         } else {
@@ -1506,8 +1998,7 @@ fn capture_outputs(
                 absolute.display()
             )
         }
-        let absolute = absolute
-            .canonicalize()
+        let absolute = canonical_compiler_input(&absolute)
             .with_context(|| format!("canonicalize rustc dependency {}", absolute.display()))?;
         files.push(FileInput {
             path: identity.normalizer.normalize(&absolute.to_string_lossy()),
@@ -1519,16 +2010,14 @@ fn capture_outputs(
     let mut env_inputs = dep_env
         .into_iter()
         .map(|(name, _)| {
-            let value = env::var(&name)
-                .ok()
-                .map(|value| identity.normalizer.normalize(&value));
+            let value = env::var(&name).ok();
             EnvInput::capture(&name, value.as_deref())
         })
         .collect::<Vec<_>>();
     env_inputs.sort_by(|a, b| a.name.cmp(&b.name));
     env_inputs.dedup_by(|a, b| a.name == b.name);
-    let normalized_stdout = identity.normalizer.normalize_bytes(&stdout);
-    let normalized_stderr = identity.normalizer.normalize_bytes(&stderr);
+    let normalized_stdout = transform_compiler_stream(&stdout, &identity.normalizer, false);
+    let normalized_stderr = transform_compiler_stream(&stderr, &identity.normalizer, false);
     let stdout_digest = digest_bytes(&normalized_stdout);
     let stderr_digest = digest_bytes(&normalized_stderr);
     let stdout_len = normalized_stdout.len() as u64;
@@ -1627,6 +2116,17 @@ fn record_event(
     action_key: Option<&str>,
     detail: &str,
 ) {
+    record_event_duration(kind, crate_name, static_key, action_key, detail, None);
+}
+
+fn record_event_duration(
+    kind: &str,
+    crate_name: &str,
+    static_key: Option<&str>,
+    action_key: Option<&str>,
+    detail: &str,
+    duration_ms: Option<u64>,
+) {
     let event = Event {
         timestamp_ms: now_ms(),
         kind: kind.into(),
@@ -1634,17 +2134,13 @@ fn record_event(
         static_key: static_key.map(str::to_owned),
         action_key: action_key.map(str::to_owned),
         detail: detail.into(),
+        reason: Some(diagnostics::reason_code(kind, detail).into()),
+        session_id: env::var("BELLOWS_SESSION_ID").ok(),
+        workspace: env::var("BELLOWS_WORKSPACE").ok(),
+        duration_ms,
     };
-    let path = event_log_path();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path)
-        && let Ok(line) = serde_json::to_string(&event)
-    {
-        let _ = file.lock_exclusive();
-        let _ = file.write_all(format!("{line}\n").as_bytes());
-        let _ = file.unlock();
+    if let Err(error) = diagnostics::append(&event_log_path(), &event) {
+        eprintln!("Bellows diagnostics unavailable: {error:#}");
     }
     if matches!(
         kind,
@@ -1655,37 +2151,6 @@ fn record_event(
             terminal::status(terminal::stderr_color(), kind, crate_name, detail)
         );
     }
-}
-
-fn read_events() -> Result<Vec<Event>> {
-    let path = event_log_path();
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let mut file = fs::OpenOptions::new().read(true).open(path)?;
-    file.lock_shared()?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)?;
-    file.unlock()?;
-    let mut events = Vec::new();
-    let mut corrupt = 0usize;
-    for line in contents.lines().filter(|line| !line.trim().is_empty()) {
-        match serde_json::from_str(line) {
-            Ok(event) => events.push(event),
-            Err(_) => corrupt += 1,
-        }
-    }
-    if corrupt > 0 {
-        eprintln!(
-            "{}",
-            terminal::warning(
-                terminal::stderr_color(),
-                "event log",
-                &format!("ignored {corrupt} malformed line(s)"),
-            )
-        );
-    }
-    Ok(events)
 }
 
 fn doctor(server: &str, token: Option<&str>) -> Result<()> {
@@ -1740,18 +2205,26 @@ fn validate_protocol(server_protocol: u32) -> Result<()> {
 struct CombinedStats {
     remote: ServerStats,
     events: BTreeMap<String, u64>,
+    diagnostics: diagnostics::Summary,
 }
 
-fn show_stats(server: &str, token: Option<&str>, json: bool) -> Result<()> {
+fn show_stats(
+    server: &str,
+    token: Option<&str>,
+    selection: &diagnostics::Selection,
+    json: bool,
+) -> Result<()> {
     let remote = Remote::new(server, token.map(str::to_owned))?.stats()?;
-    let mut events = BTreeMap::new();
-    for event in read_events()? {
-        *events.entry(event.kind).or_insert(0) += 1;
-    }
+    let diagnostics = diagnostics::summarize(&diagnostics::read_selected(selection)?);
+    let events = diagnostics.decisions.clone();
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&CombinedStats { remote, events })?
+            serde_json::to_string_pretty(&CombinedStats {
+                remote,
+                events,
+                diagnostics
+            })?
         );
     } else {
         let color = terminal::stdout_color();
@@ -1785,12 +2258,132 @@ fn show_stats(server: &str, token: Option<&str>, json: bool) -> Result<()> {
                 terminal::key_value(color, &kind.replace('_', " "), count)
             );
         }
+        diagnostics::print_summary(&diagnostics, 6);
     }
     Ok(())
 }
 
-fn explain(limit: usize, json: bool) -> Result<()> {
-    let selected = read_events()?
+fn show_local_stats(selection: &diagnostics::Selection, json: bool) -> Result<()> {
+    let state = local_state_dir(selection.cache_dir.as_deref())?;
+    let store = local_store(Some(&state), true)?;
+    let remote = collect_local_stats(&store)?;
+    let diagnostics = diagnostics::summarize(&diagnostics::read_selected(selection)?);
+    let events = diagnostics.decisions.clone();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&CombinedStats {
+                remote,
+                events,
+                diagnostics
+            })?
+        );
+        return Ok(());
+    }
+    let color = terminal::stdout_color();
+    println!("{}", terminal::heading(color, "Bellows · Local cache"));
+    println!(
+        "{}",
+        terminal::key_value(color, "path", store.root().display())
+    );
+    println!(
+        "{}",
+        terminal::key_value(color, "compiler actions", remote.candidates)
+    );
+    println!(
+        "{}",
+        terminal::key_value(color, "declared actions", remote.declared_actions)
+    );
+    println!("{}", terminal::key_value(color, "blobs", remote.blobs));
+    println!(
+        "{}",
+        terminal::key_value(color, "stored", human_bytes(remote.blob_bytes))
+    );
+    println!(
+        "{}",
+        terminal::section(color, "Selected decisions (retained log)")
+    );
+    for (kind, count) in events {
+        println!(
+            "{}",
+            terminal::key_value(color, &kind.replace('_', " "), count)
+        );
+    }
+    diagnostics::print_summary(&diagnostics, 6);
+    Ok(())
+}
+
+fn collect_local_stats(store: &Store) -> Result<ServerStats> {
+    let (blobs, blob_bytes) = count_store_files(&store.root().join("blobs"), false)?;
+    let (action_indexes, _) = count_store_files(&store.root().join("actions"), true)?;
+    let (declared_actions, _) = count_store_files(&store.root().join("declared"), true)?;
+    let (archives, _) = count_store_files(&store.root().join("archives"), true)?;
+    let mut candidates = 0;
+    visit_store_files(&store.root().join("actions"), &mut |path| {
+        let index: CandidateIndex = serde_json::from_slice(&fs::read(path)?)?;
+        candidates += index.candidates.len() as u64;
+        Ok(())
+    })?;
+    Ok(ServerStats {
+        blobs,
+        blob_bytes,
+        action_indexes,
+        candidates,
+        active_leases: 0,
+        declared_actions,
+        archives,
+    })
+}
+
+fn count_store_files(root: &Path, only_json: bool) -> Result<(u64, u64)> {
+    let mut count = 0;
+    let mut bytes = 0;
+    visit_store_files(root, &mut |path| {
+        if !only_json
+            || path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+        {
+            count += 1;
+            bytes += fs::metadata(path)?.len();
+        }
+        Ok(())
+    })?;
+    Ok((count, bytes))
+}
+
+fn visit_store_files(root: &Path, visitor: &mut impl FnMut(&Path) -> Result<()>) -> Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            visit_store_files(&path, visitor)?;
+        } else {
+            visitor(&path)?;
+        }
+    }
+    Ok(())
+}
+
+fn explain(
+    selection: &diagnostics::Selection,
+    limit: usize,
+    json: bool,
+    summary: bool,
+) -> Result<()> {
+    let events = diagnostics::read_selected(selection)?;
+    if summary {
+        let summary = diagnostics::summarize(&events);
+        if json {
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        } else {
+            diagnostics::print_summary(&summary, limit);
+        }
+        return Ok(());
+    }
+    let selected = events
         .into_iter()
         .rev()
         .filter(|event| {
@@ -1809,7 +2402,7 @@ fn explain(limit: usize, json: bool) -> Result<()> {
             terminal::success(
                 terminal::stdout_color(),
                 "clean",
-                "no recent misses, bypasses, or integrity failures",
+                "no matching cache decisions in the retained log (use --local, --session, or --latest to select a build)",
             )
         );
     } else {
@@ -1949,6 +2542,7 @@ fn run_declared_action(args: DeclaredRunArgs, remote_execution: bool) -> Result<
         .iter()
         .map(|path| normalize_declared_path(&workspace, path))
         .collect::<Result<Vec<_>>>()?;
+    bellows_core::validate_output_roots(&inputs, &outputs)?;
     let environment = declared_environment(&args.environment)?;
     let key = declared_action_key(
         &args.name,
@@ -1958,6 +2552,23 @@ fn run_declared_action(args: DeclaredRunArgs, remote_execution: bool) -> Result<
         &inputs,
         &outputs,
     );
+    let request = ExecuteRequest {
+        key: key.clone(),
+        name: args.name.clone(),
+        platform: platform.clone(),
+        command: args.command.clone(),
+        environment: environment.clone(),
+        inputs: inputs.clone(),
+        outputs: outputs.clone(),
+    };
+    if args.local {
+        return run_local_declared_action(
+            &workspace,
+            args.cache_dir.as_deref(),
+            request,
+            &inputs_with_bytes,
+        );
+    }
     let remote = Remote::new(&args.connection.server, args.connection.token)?;
     if let Some(record) = remote.declared(&key)? {
         restore_declared_record(&remote, &workspace, &record)?;
@@ -1971,15 +2582,6 @@ fn run_declared_action(args: DeclaredRunArgs, remote_execution: bool) -> Result<
     for (artifact, bytes) in &inputs_with_bytes {
         remote.put_blob(&artifact.digest, bytes.clone())?;
     }
-    let request = ExecuteRequest {
-        key: key.clone(),
-        name: args.name.clone(),
-        platform: platform.clone(),
-        command: args.command.clone(),
-        environment: environment.clone(),
-        inputs: inputs.clone(),
-        outputs: outputs.clone(),
-    };
     let record = if remote_execution {
         let response = remote.execute(&request)?;
         println!(
@@ -2009,6 +2611,66 @@ fn run_declared_action(args: DeclaredRunArgs, remote_execution: bool) -> Result<
         record
     };
     restore_declared_record(&remote, &workspace, &record)?;
+    Ok(())
+}
+
+fn run_local_declared_action(
+    workspace: &Path,
+    cache_dir: Option<&Path>,
+    request: ExecuteRequest,
+    inputs: &[(Artifact, Vec<u8>)],
+) -> Result<()> {
+    let store = local_store(cache_dir, true)?;
+    if let Some(record) = store.read_declared(&request.key)? {
+        match load_declared_record_local(&store, &record) {
+            Ok(loaded) => {
+                materialize_declared_record(workspace, &record, loaded)?;
+                println!(
+                    "{}",
+                    terminal::status(
+                        terminal::stdout_color(),
+                        "hit",
+                        &request.name,
+                        &request.key[..12],
+                    )
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!(
+                    "{}",
+                    terminal::warning(
+                        terminal::stderr_color(),
+                        "local action",
+                        &format!("stale cached result will be rebuilt: {error:#}"),
+                    )
+                );
+                store.remove_declared(&request.key)?;
+            }
+        }
+    }
+
+    let name = request.name.clone();
+    let key = request.key.clone();
+    let (record, blobs) = execute_local_declared(workspace, request, inputs)?;
+    for (digest, bytes) in blobs {
+        store.put_blob(&digest, &bytes)?;
+    }
+    if let Err(error) = store.put_declared(&record) {
+        eprintln!(
+            "{}",
+            terminal::warning(
+                terminal::stderr_color(),
+                "local action",
+                &format!("result was produced but its record raced publication: {error:#}"),
+            )
+        );
+    }
+    restore_declared_record_local(&store, workspace, &record)?;
+    println!(
+        "{}",
+        terminal::status(terminal::stdout_color(), "miss", &name, &key[..12],)
+    );
     Ok(())
 }
 
@@ -2185,6 +2847,7 @@ fn run_sandbox_command(workspace: &Path, request: &ExecuteRequest) -> Result<std
         .env("HOME", "/homeless-shelter")
         .env("CARGO_HOME", ".bellows-cargo-home")
         .env("CARGO_NET_OFFLINE", "true")
+        .envs(bellows_core::execution::platform_environment())
         .envs(&request.environment);
     command.env("RUSTUP_HOME", rustup_home());
     if let Some(value) = &request.platform.rustup_toolchain {
@@ -2195,13 +2858,11 @@ fn run_sandbox_command(workspace: &Path, request: &ExecuteRequest) -> Result<std
         .and_then(OsStr::to_str)
         .unwrap_or_default();
     if program == "cargo" {
-        command.env(
-            "CARGO_ENCODED_RUSTFLAGS",
-            format!(
-                "--remap-path-prefix\u{1f}{}=/bellows/action",
-                workspace.display()
-            ),
-        );
+        bellows_core::execution::configure_cargo_remapping(
+            &mut command,
+            workspace,
+            &request.environment,
+        )?;
     } else if program == "rustc" {
         command
             .arg("--remap-path-prefix")
@@ -2218,23 +2879,70 @@ fn restore_declared_record(
     validate_declared_record(record)?;
     let mut staged = Vec::with_capacity(record.outputs.len());
     for artifact in &record.outputs {
-        let relative = validate_relative_path(&artifact.file_name)?;
         let bytes = remote.blob(&artifact.digest)?;
-        staged.push((artifact, relative, bytes));
+        staged.push((artifact, bytes));
     }
     let stdout = remote.blob(&record.stdout.digest)?;
     let stderr = remote.blob(&record.stderr.digest)?;
     if stdout.len() as u64 != record.stdout.len || stderr.len() as u64 != record.stderr.len {
         bail!("declared stream length does not match manifest")
     }
-    for (artifact, relative, bytes) in staged {
-        let destination = safe_destination(workspace, &relative)?;
-        atomic_write(&destination, &bytes)?;
-        set_file_executable(&destination, artifact.executable)?;
-    }
+    restore::declared_outputs(workspace, record, &staged)?;
     std::io::stdout().write_all(&stdout)?;
     std::io::stderr().write_all(&stderr)?;
     Ok(())
+}
+
+struct LoadedDeclared<'a> {
+    artifacts: Vec<(&'a Artifact, Vec<u8>)>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn load_declared_record_local<'a>(
+    store: &Store,
+    record: &'a DeclaredActionRecord,
+) -> Result<LoadedDeclared<'a>> {
+    validate_declared_record(record)?;
+    let mut artifacts = Vec::with_capacity(record.outputs.len());
+    for artifact in &record.outputs {
+        artifacts.push((artifact, store.read_blob(&artifact.digest)?));
+    }
+    let stdout = store.read_blob(&record.stdout.digest)?;
+    let stderr = store.read_blob(&record.stderr.digest)?;
+    if stdout.len() as u64 != record.stdout.len || stderr.len() as u64 != record.stderr.len {
+        bail!("declared stream length does not match manifest")
+    }
+    Ok(LoadedDeclared {
+        artifacts,
+        stdout,
+        stderr,
+    })
+}
+
+fn materialize_declared_record(
+    workspace: &Path,
+    record: &DeclaredActionRecord,
+    loaded: LoadedDeclared<'_>,
+) -> Result<()> {
+    // Destination failures aren't corrupt cache entries: keep the record and
+    // report the real filesystem error instead of deleting it and recompiling.
+    restore::declared_outputs(workspace, record, &loaded.artifacts)?;
+    std::io::stdout().write_all(&loaded.stdout)?;
+    std::io::stderr().write_all(&loaded.stderr)?;
+    Ok(())
+}
+
+fn restore_declared_record_local(
+    store: &Store,
+    workspace: &Path,
+    record: &DeclaredActionRecord,
+) -> Result<()> {
+    materialize_declared_record(
+        workspace,
+        record,
+        load_declared_record_local(store, record)?,
+    )
 }
 
 fn safe_destination(root: &Path, relative: &Path) -> Result<PathBuf> {
@@ -2665,10 +3373,26 @@ mod tests {
     }
 
     #[test]
+    fn infers_custom_cargo_target_roots_from_deps_outputs() {
+        assert_eq!(
+            infer_target_root(Path::new("/tmp/runner-a/release/deps")),
+            Some(PathBuf::from("/tmp/runner-a"))
+        );
+        assert_eq!(
+            infer_target_root(Path::new(
+                "/tmp/runner-b/wasm32-unknown-unknown/release/deps"
+            )),
+            Some(PathBuf::from("/tmp/runner-b/wasm32-unknown-unknown"))
+        );
+    }
+
+    #[test]
     fn prior_protocol_candidates_are_cleanly_rejected() {
         let workspace = std::env::temp_dir().join(format!("bellows-protocol-test-{}", now_ms()));
         let identity = Identity {
             static_key: digest_bytes(b"identity"),
+            fingerprint: diagnostics::Fingerprint::default(),
+            diagnostic_group: String::new(),
             normalizer: PathNormalizer::new(vec![("$WORKSPACE".into(), workspace.clone())]),
             workspace,
         };
@@ -2714,7 +3438,10 @@ mod tests {
         fs::write(out_dir.join(rmeta_name), b"metadata").unwrap();
         fs::write(
             out_dir.join(dep_name),
-            format!("{rmeta_name}: {}/src/../src/lib.rs\n", workspace.display()),
+            format!(
+                "{rmeta_name}: {}\n",
+                source.to_string_lossy().replace(' ', "\\ ")
+            ),
         )
         .unwrap();
         let invocation = Invocation {
@@ -2727,6 +3454,8 @@ mod tests {
         };
         let identity = Identity {
             static_key: digest_bytes(b"identity"),
+            fingerprint: diagnostics::Fingerprint::default(),
+            diagnostic_group: String::new(),
             normalizer: PathNormalizer::new(vec![("$WORKSPACE".into(), workspace.clone())]),
             workspace: workspace.clone(),
         };
@@ -2734,7 +3463,10 @@ mod tests {
         let stderr = format!("warning in {}", workspace.display()).into_bytes();
         let captured =
             capture_outputs(&invocation, &identity, stdout.clone(), stderr.clone()).unwrap();
-        assert_eq!(captured.candidate.files[0].path, "$WORKSPACE/src/lib.rs");
+        assert_eq!(
+            captured.candidate.files[0].path,
+            format!("$WORKSPACE{0}src{0}lib.rs", std::path::MAIN_SEPARATOR)
+        );
         assert_eq!(
             captured.candidate.stdout.len,
             identity.normalizer.normalize_bytes(&stdout).len() as u64
@@ -2762,6 +3494,19 @@ mod tests {
     }
 
     #[test]
+    fn cargo_shorthand_accepts_ordinary_cargo_flags() {
+        let cli = Cli::try_parse_from(["bellows", "cargo", "run", "--release", "-p", "flagship"])
+            .unwrap();
+        let Commands::Cargo { arguments } = cli.command else {
+            panic!("cargo shorthand parsed as the wrong command");
+        };
+        assert_eq!(
+            arguments,
+            ["run", "--release", "-p", "flagship"].map(OsString::from)
+        );
+    }
+
+    #[test]
     fn parses_cacheable_library_invocation() {
         let dir = std::env::temp_dir().join(format!("bellows-cli-test-{}", now_ms()));
         fs::create_dir_all(dir.join("out")).unwrap();
@@ -2783,6 +3528,37 @@ mod tests {
         assert!(invocation.expected_names.contains("demo-abc.d"));
         assert!(invocation.expected_names.contains("libdemo-abc.rlib"));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rejects_all_unmodeled_emit_and_custom_output_forms() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("lib.rs");
+        fs::write(&source, "pub fn value() {}").unwrap();
+        for extra in [
+            vec!["--emit=dep-info,metadata,asm"],
+            vec!["--emit=dep-info,metadata=custom.rmeta"],
+            vec!["--emit=dep-info,metadata", "-ocustom"],
+            vec!["--emit=dep-info,metadata", "-o", "custom"],
+            vec!["--emit=dep-info,metadata", "--emit=link"],
+        ] {
+            let mut raw = [
+                "rustc",
+                "--crate-name=fixture",
+                "--crate-type=rlib",
+                "-Cextra-filename=-fixture",
+                "--out-dir=out",
+            ]
+            .map(OsString::from)
+            .to_vec();
+            raw.push(source.clone().into_os_string());
+            raw.extend(extra.iter().map(OsString::from));
+            assert!(
+                Invocation::analyze(&raw)
+                    .unwrap_err()
+                    .contains("unsupported emit")
+            );
+        }
     }
 
     #[test]
@@ -2884,6 +3660,41 @@ mod tests {
     }
 
     #[test]
+    fn bypasses_host_dependent_and_unmodeled_toolchain_inputs() {
+        for extra in [
+            vec!["-Ctarget-cpu=native"],
+            vec!["-C", "target-cpu=native"],
+            vec!["--sysroot", "/custom/toolchain"],
+            vec!["--target=custom.json"],
+            vec!["-Csave-temps"],
+            vec!["--test"],
+        ] {
+            let mut raw = vec![OsString::from("rustc")];
+            raw.extend(extra.into_iter().map(OsString::from));
+            let reason = Invocation::analyze(&raw).unwrap_err();
+            assert!(reason.contains("not modeled"), "{reason}");
+        }
+        for search in [
+            "/native",
+            "all=/native",
+            "crate=/native",
+            "framework=/native",
+            "native=/native",
+        ] {
+            assert!(has_native_or_external_codegen_inputs(&[
+                "-L".into(),
+                search.into()
+            ]));
+            assert!(has_native_or_external_codegen_inputs(&[format!(
+                "-L{search}"
+            )]));
+        }
+        assert!(!has_native_or_external_codegen_inputs(&[
+            "-Ldependency=/rust-deps".into()
+        ]));
+    }
+
+    #[test]
     fn identifies_unmodeled_native_inputs() {
         assert!(has_native_or_external_codegen_inputs(&[
             "-L".into(),
@@ -2959,4 +3770,26 @@ mod tests {
         assert!(is_relevant_environment_name("CLIPPY_ARGS"));
         assert!(is_relevant_environment_name("CLIPPY_CONF_DIR"));
     }
+}
+#[test]
+fn compiler_json_streams_escape_localized_windows_paths() {
+    let normalizer = PathNormalizer::new(vec![(
+        "$TARGET".into(),
+        PathBuf::from(r"C:\cache with spaces"),
+    )]);
+    let message = serde_json::json!({
+        "$message_type": "artifact",
+        "artifact": r"C:\cache with spaces\libfixture.rlib",
+        "nested": [{"rendered": "a quoted \"message\"\nsecond line"}]
+    });
+    let mut original = serde_json::to_vec(&message).unwrap();
+    original.extend_from_slice(b"\r\n");
+    let stored = transform_compiler_stream(&original, &normalizer, false);
+    assert!(String::from_utf8_lossy(&stored).contains("$TARGET"));
+    let restored = transform_compiler_stream(&stored, &normalizer, true);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&restored).unwrap(),
+        message
+    );
+    assert!(restored.ends_with(b"\r\n"));
 }

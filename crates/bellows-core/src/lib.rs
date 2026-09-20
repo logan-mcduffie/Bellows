@@ -1253,7 +1253,20 @@ impl PathNormalizer {
         for (token, path) in bases.drain(..) {
             let value = path.to_string_lossy().trim_end_matches('/').to_owned();
             if !value.is_empty() && !rendered.iter().any(|(_, p)| p == &value) {
-                rendered.push((token, value));
+                rendered.push((token.clone(), value.clone()));
+                // canonicalize() adds a verbatim prefix on Windows, while
+                // Cargo's arguments and environment use ordinary drive paths.
+                // Recognize both spellings without changing literal arguments.
+                #[cfg(windows)]
+                if let Some(ordinary) = value.strip_prefix(r"\\?\") {
+                    let ordinary = if let Some(unc) = ordinary.strip_prefix(r"UNC\") {
+                        format!(r"\\{unc}")
+                    } else {
+                        ordinary.to_owned()
+                    };
+                    rendered.push((token.clone(), ordinary.replace('\\', "/")));
+                    rendered.push((token, ordinary));
+                }
             }
         }
         rendered.sort_by(|a, b| b.1.len().cmp(&a.1.len()));

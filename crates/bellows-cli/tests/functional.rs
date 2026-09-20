@@ -131,6 +131,39 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+#[test]
+fn explicit_target_directories_share_verified_library_outputs() {
+    let f = Fixture::new(
+        "pub fn value() -> u32 { 42 }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    let first = f.temp.path().join("first target");
+    let second = f.temp.path().join("second target");
+    checked(
+        f.local()
+            .args(["cargo", "build", "--release", "--offline"])
+            .env("CARGO_TARGET_DIR", &first),
+    );
+    let restored = checked(
+        f.local()
+            .args(["cargo", "build", "--release", "--offline"])
+            .env("CARGO_TARGET_DIR", &second),
+    );
+    assert!(
+        stderr(&restored).contains("LOCAL HIT"),
+        "{}",
+        stderr(&restored)
+    );
+    let output = checked(
+        &mut f.command(
+            second
+                .join("release")
+                .join(format!("fixture{}", std::env::consts::EXE_SUFFIX)),
+        ),
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
+}
+
 #[cfg(any(unix, windows))]
 fn link_directory(f: &Fixture, source: &std::path::Path, destination: &std::path::Path) {
     #[cfg(unix)]

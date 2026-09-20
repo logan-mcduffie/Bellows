@@ -161,7 +161,7 @@ try{
     RemoveTest $target;Call $b @('cargo','build','--release','--offline') | Out-Null
     $toolchain=$env:RUSTUP_TOOLCHAIN
     try{
-      $env:RUSTUP_TOOLCHAIN='nightly-2026-01-15-x86_64-pc-windows-msvc';RemoveTest $target
+      $env:RUSTUP_TOOLCHAIN='nightly-2026-01-15';RemoveTest $target
       $text=Call $b @('cargo','build','--release','--offline')
       Assert ($text -match 'compiler version changed') 'Compiler identity change not explained'
       Assert ((Call $exe @()) -match '42') 'Changed compiler output wrong'
@@ -305,4 +305,5 @@ try{
   foreach($name in $original.Keys){[Environment]::SetEnvironmentVariable($name,$original[$name],'Process')}
 }
 if(@($results | Where-Object status -eq 'failed').Count){exit 1}
+
 

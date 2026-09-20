@@ -21,6 +21,8 @@ jobs:
         run: rustup toolchain install nightly-2026-01-15 --profile minimal
       - name: Extended native Windows acceptance
         run: ./scripts/windows-extended.ps1 -ReportDirectory "$env:RUNNER_TEMP/bellows-windows-report/extended"
+      - name: Teammate installation and first build
+        run: ./scripts/install-check.ps1 -ReportDirectory "$env:RUNNER_TEMP/bellows-windows-report/install"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -49,6 +51,9 @@ jobs:
       - name: Cross-platform extended acceptance
         shell: pwsh
         run: ./scripts/windows-extended.ps1 -ReportDirectory "$env:RUNNER_TEMP/bellows-extended"
+      - name: Teammate installation and first build
+        shell: pwsh
+        run: ./scripts/install-check.ps1 -ReportDirectory "$env:RUNNER_TEMP/bellows-extended/install"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

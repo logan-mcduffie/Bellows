@@ -1420,7 +1420,7 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
     );
     // Earlier captures treated every backslash as a Make escape and could
     // omit the real dependency. Never reuse those compiler manifests.
-    let dep_info_format = b"rustc-space-escape-v3-json-streams";
+    let dep_info_format = b"rustc-space-escape-v5-structured-dep-info";
     components.insert(
         "dependency parser changed".into(),
         digest_bytes(dep_info_format),
@@ -1726,7 +1726,7 @@ fn restore(
             let _ = store.put_blob(&artifact.digest, &stored);
         }
         let bytes = if artifact.file_name.ends_with(".d") {
-            identity.normalizer.localize_bytes(&stored)
+            transform_dep_info(&stored, &identity.normalizer, true)
         } else {
             stored
         };
@@ -1793,7 +1793,7 @@ fn restore_l1(
     }
     for (artifact, stored) in downloaded {
         let bytes = if artifact.file_name.ends_with(".d") {
-            identity.normalizer.localize_bytes(&stored)
+            transform_dep_info(&stored, &identity.normalizer, true)
         } else {
             stored
         };
@@ -1914,6 +1914,20 @@ fn transform_compiler_stream(bytes: &[u8], normalizer: &PathNormalizer, localize
     result
 }
 
+fn transform_dep_info(bytes: &[u8], normalizer: &PathNormalizer, localize: bool) -> Vec<u8> {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return bytes.to_vec();
+    };
+    bellows_core::rewrite_dep_info(text, |path| {
+        if localize {
+            normalizer.localize(path)
+        } else {
+            normalizer.normalize(path)
+        }
+    })
+    .into_bytes()
+}
+
 fn capture_outputs(
     invocation: &Invocation,
     identity: &Identity,
@@ -1941,7 +1955,7 @@ fn capture_outputs(
         }
         let raw = fs::read(&path)?;
         let stored = if name.ends_with(".d") {
-            let normalized = identity.normalizer.normalize_bytes(&raw);
+            let normalized = transform_dep_info(&raw, &identity.normalizer, false);
             dep_text = Some(String::from_utf8(raw).context("dep-info is not UTF-8")?);
             normalized
         } else {

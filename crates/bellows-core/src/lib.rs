@@ -1356,6 +1356,41 @@ pub fn parse_dep_info(text: &str) -> (Vec<String>, Vec<(String, Option<String>)>
     (files.into_iter().collect(), env.into_iter().collect())
 }
 
+/// Rewrite filenames without losing rustc's Make space escapes or changing
+/// environment dependency comments (whose values require exact equality).
+pub fn rewrite_dep_info(text: &str, rewrite: impl Fn(&str) -> String) -> String {
+    let logical = text.replace("\\\r\n", "").replace("\\\n", "");
+    let mut result = String::new();
+    for line in logical.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\r', '\n']);
+        let rewrite_words = |words: &str| {
+            split_makefile_words(words)
+                .iter()
+                .map(|word| rewrite(word).replace(' ', "\\ "))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        if body.starts_with('#') {
+            result.push_str(body);
+        } else if let Some((targets, dependencies)) = body.split_once(": ") {
+            result.push_str(&rewrite_words(targets));
+            result.push_str(": ");
+            result.push_str(&rewrite_words(dependencies));
+        } else if let Some(target) = body.strip_suffix(':') {
+            result.push_str(&rewrite_words(target));
+            result.push(':');
+        } else {
+            result.push_str(body);
+        }
+        if line.ends_with("\r\n") {
+            result.push_str("\r\n");
+        } else if line.ends_with('\n') {
+            result.push('\n');
+        }
+    }
+    result
+}
+
 fn split_makefile_words(value: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();

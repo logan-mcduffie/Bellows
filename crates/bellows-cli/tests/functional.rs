@@ -230,6 +230,61 @@ fn restored_cargo_json_artifact_messages_remain_valid() {
     }
 }
 
+#[test]
+fn restored_dep_info_preserves_forward_slash_environment_paths() {
+    let f = Fixture::new(
+        "pub fn value() -> &'static str { env!(\"FORWARD_BUILD_PATH\") }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    let value = f.workspace.to_string_lossy().replace('\\', "/");
+    for warm in [false, true] {
+        let output = checked(f.local().env("FORWARD_BUILD_PATH", &value).args([
+            "cargo",
+            "build",
+            "--release",
+            "--offline",
+        ]));
+        if warm {
+            assert!(stderr(&output).contains("LOCAL HIT"), "{}", stderr(&output));
+        }
+        assert_eq!(f.value("target"), value);
+        f.clean();
+    }
+}
+
+#[test]
+fn relocated_dep_info_tracks_transitive_inputs_with_spaces() {
+    let lib = "#[path=\"value part.rs\"] mod value; pub fn value() -> u32 { value::value() }";
+    let main = "fn main() { println!(\"{}\", fixture::value()); }";
+    let first = Fixture::new(lib, main);
+    let mut second = Fixture::new(lib, main);
+    second.cache = first.cache.clone();
+    for fixture in [&first, &second] {
+        fs::write(
+            fixture.workspace.join("src/value part.rs"),
+            "pub fn value() -> u32 { 42 }",
+        )
+        .unwrap();
+    }
+    first.build();
+    let restored = second.build();
+    assert!(
+        stderr(&restored).contains("LOCAL HIT"),
+        "{}",
+        stderr(&restored)
+    );
+    assert_eq!(second.value("target"), "42");
+    // Keep Cargo output intact: Cargo must now track the receiving workspace's
+    // transitive path, not the original producer's path in the restored .d file.
+    fs::write(
+        second.workspace.join("src/value part.rs"),
+        "pub fn value() -> u32 { 43 }",
+    )
+    .unwrap();
+    second.build();
+    assert_eq!(second.value("target"), "43");
+}
+
 #[cfg(any(unix, windows))]
 fn link_directory(f: &Fixture, source: &std::path::Path, destination: &std::path::Path) {
     #[cfg(unix)]

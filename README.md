@@ -48,7 +48,7 @@ Nothing from the demo is retained outside its temporary directory.
 
 ## Manual use
 
-For native Windows, use the [PowerShell qualification instructions](docs/windows.md).
+For native Windows, use the [setup and qualification instructions](docs/windows.md).
 The Windows CI job runs the same `scripts/windows-check.ps1` checks.
 
 ### Local builds

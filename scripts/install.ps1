@@ -18,7 +18,8 @@ if ($IsWindows) {
     }
 }
 $InstallRoot = [IO.Path]::GetFullPath($InstallRoot)
-& rustup toolchain install 1.92.0 --profile minimal
+$toolchain = if ($IsWindows) { '1.92.0-x86_64-pc-windows-msvc' } else { '1.92.0' }
+& rustup toolchain install $toolchain --profile minimal
 if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain installation failed.' }
 $saved = @{}
 foreach ($name in @('RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER')) {
@@ -29,7 +30,7 @@ try {
     $packages = @('bellows-cli')
     if ($IncludeServer) { $packages += 'bellows-server' }
     foreach ($package in $packages) {
-        & cargo +1.92.0 install --locked --path (Join-Path $repo "crates/$package") --root $InstallRoot --force
+        & cargo "+$toolchain" install --locked --path (Join-Path $repo "crates/$package") --root $InstallRoot --force
         if ($LASTEXITCODE -ne 0) { throw "Installation failed for $package. The compiler output above identifies missing prerequisites." }
     }
     $suffix = if ($IsWindows) { '.exe' } else { '' }

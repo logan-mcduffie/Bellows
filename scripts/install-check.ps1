@@ -9,9 +9,10 @@ $saved=@{};Get-ChildItem Env: | ForEach-Object {$saved[$_.Name]=$_.Value}
 $location=Get-Location
 try {
     Get-ChildItem Env: | Where-Object Name -Match '^(BELLOWS_|CARGO_TARGET_|RUSTC_WRAPPER$|RUSTC_WORKSPACE_WRAPPER$)' | ForEach-Object {Remove-Item "Env:$($_.Name)"}
-    & "$PSScriptRoot/install.ps1" -InstallRoot "$report/install" *> "$report/install.log"
+    $install=Join-Path $report 'install café with spaces'
+    & "$PSScriptRoot/install.ps1" -InstallRoot $install *> "$report/install.log"
     $suffix=if($IsWindows){'.exe'}else{''}
-    $b="$report/install/bin/bellows$suffix"
+    $b="$install/bin/bellows$suffix"
     Copy-Item "$repo/demo" "$report/project with spaces" -Recurse
     Set-Location "$report/project with spaces"
     $env:BELLOWS_STATE_DIR="$report/cache";$env:BELLOWS_COLOR='never'

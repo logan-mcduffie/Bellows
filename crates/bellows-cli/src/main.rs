@@ -1298,6 +1298,19 @@ fn passthrough(raw: &[OsString]) -> Result<ExitStatus> {
 fn normalizer(workspace: &Path, out_dir: &Path) -> PathNormalizer {
     let target = target_root(workspace, out_dir);
     let mut bases = vec![("$WORKSPACE".into(), workspace.to_path_buf())];
+    // Cargo's manifest directory may retain an 8.3 spelling even when the
+    // process working directory has already been expanded by Windows.
+    for alias in [
+        env::current_dir().ok(),
+        env::var_os("CARGO_MANIFEST_DIR").map(PathBuf::from),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if alias.canonicalize().ok().as_deref() == workspace.canonicalize().ok().as_deref() {
+            bases.push(("$WORKSPACE".into(), alias));
+        }
+    }
     if let Some(target) = target {
         bases.push(("$TARGET".into(), canonical_base(target.clone())));
         // Retain the caller's spelling too: Windows temp directories may use

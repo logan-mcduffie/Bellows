@@ -131,6 +131,211 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+#[test]
+fn explicit_target_directories_share_verified_library_outputs() {
+    let f = Fixture::new(
+        "pub fn value() -> u32 { 42 }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    let first = f.temp.path().join("first target");
+    let second = f.temp.path().join("second target");
+    checked(
+        f.local()
+            .args(["cargo", "build", "--release", "--offline"])
+            .env("CARGO_TARGET_DIR", &first),
+    );
+    let restored = checked(
+        f.local()
+            .args(["cargo", "build", "--release", "--offline"])
+            .env("CARGO_TARGET_DIR", &second),
+    );
+    assert!(
+        stderr(&restored).contains("LOCAL HIT"),
+        "{}",
+        stderr(&restored)
+    );
+    let output = checked(
+        &mut f.command(
+            second
+                .join("release")
+                .join(format!("fixture{}", std::env::consts::EXE_SUFFIX)),
+        ),
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
+}
+
+#[test]
+fn cargo_from_a_subdirectory_resolves_compiler_inputs_in_cargos_working_directory() {
+    let f = Fixture::new("pub fn value() -> u32 { 42 }", "fn main() {}");
+    let subdir = f.workspace.join("launcher");
+    fs::create_dir(&subdir).unwrap();
+    for warm in [false, true] {
+        let output = checked(f.local().current_dir(&subdir).args([
+            "cargo",
+            "build",
+            "--release",
+            "--offline",
+            "--manifest-path",
+            "../Cargo.toml",
+        ]));
+        assert!(!stderr(&output).contains("FALLBACK"), "{}", stderr(&output));
+        if warm {
+            assert!(stderr(&output).contains("LOCAL HIT"), "{}", stderr(&output));
+        }
+        f.clean();
+    }
+}
+
+#[test]
+fn restored_cargo_json_artifact_messages_remain_valid() {
+    let f = Fixture::new("pub fn value() -> u32 { 42 }", "fn main() {}");
+    let target = f.temp.path().join("json target");
+    for warm in [false, true] {
+        let output = checked(
+            f.local()
+                .env(
+                    "CARGO_TARGET_DIR",
+                    target.to_string_lossy().replace('\\', "/"),
+                )
+                .args([
+                    "cargo",
+                    "build",
+                    "--release",
+                    "--offline",
+                    "--message-format=json",
+                ]),
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let messages: Vec<Value> = stdout
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|v| v["reason"] == "build-finished" && v["success"] == true)
+        );
+        for message in messages
+            .iter()
+            .filter(|v| v["reason"] == "compiler-artifact")
+        {
+            for path in message["filenames"].as_array().unwrap() {
+                assert!(std::path::Path::new(path.as_str().unwrap()).is_file());
+            }
+        }
+        if warm {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("LOCAL HIT"));
+        }
+        fs::remove_dir_all(&target).unwrap();
+    }
+}
+
+#[test]
+fn restored_dep_info_preserves_forward_slash_environment_paths() {
+    let f = Fixture::new(
+        "pub fn value() -> &'static str { env!(\"FORWARD_BUILD_PATH\") }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    let value = f.workspace.to_string_lossy().replace('\\', "/");
+    for warm in [false, true] {
+        let output = checked(f.local().env("FORWARD_BUILD_PATH", &value).args([
+            "cargo",
+            "build",
+            "--release",
+            "--offline",
+        ]));
+        if warm {
+            assert!(stderr(&output).contains("LOCAL HIT"), "{}", stderr(&output));
+        }
+        assert_eq!(f.value("target"), value);
+        f.clean();
+    }
+}
+
+#[test]
+fn long_unicode_source_paths_restore_and_track_edits() {
+    let f = Fixture::new("", "fn main() { println!(\"{}\", fixture::value()); }");
+    let mut parent = f.workspace.join("src/長い workspace café");
+    while parent.as_os_str().len() < 280 {
+        parent = parent.join("a-long-source-directory-component");
+    }
+    fs::create_dir_all(&parent).unwrap();
+    let source = parent.join("café value.rs");
+    let relative = source
+        .strip_prefix(f.workspace.join("src"))
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/");
+    fs::write(
+        f.workspace.join("src/lib.rs"),
+        format!("#[path={relative:?}] mod value; pub fn value() -> u32 {{ value::value() }}"),
+    )
+    .unwrap();
+    fs::write(&source, "pub fn value() -> u32 { 42 }").unwrap();
+    // Keep linker output short: this verifies long source paths without
+    // silently depending on every native tool supporting long output paths.
+    let target = f.temp.path().join("target");
+    let build = || {
+        checked(f.local().env("CARGO_TARGET_DIR", &target).args([
+            "cargo",
+            "build",
+            "--release",
+            "--offline",
+        ]))
+    };
+    build();
+    fs::remove_dir_all(&target).unwrap();
+    let restored = build();
+    assert!(
+        stderr(&restored).contains("LOCAL HIT"),
+        "{}",
+        stderr(&restored)
+    );
+    fs::write(&source, "pub fn value() -> u32 { 43 }").unwrap();
+    build();
+    let output = checked(
+        &mut f.command(
+            target
+                .join("release")
+                .join(format!("fixture{}", std::env::consts::EXE_SUFFIX)),
+        ),
+    );
+    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "43");
+}
+
+#[test]
+fn relocated_dep_info_tracks_transitive_inputs_with_spaces() {
+    let lib = "#[path=\"value part.rs\"] mod value; pub fn value() -> u32 { value::value() }";
+    let main = "fn main() { println!(\"{}\", fixture::value()); }";
+    let first = Fixture::new(lib, main);
+    let mut second = Fixture::new(lib, main);
+    second.cache = first.cache.clone();
+    for fixture in [&first, &second] {
+        fs::write(
+            fixture.workspace.join("src/value part.rs"),
+            "pub fn value() -> u32 { 42 }",
+        )
+        .unwrap();
+    }
+    first.build();
+    let restored = second.build();
+    assert!(
+        stderr(&restored).contains("LOCAL HIT"),
+        "{}",
+        stderr(&restored)
+    );
+    assert_eq!(second.value("target"), "42");
+    // Keep Cargo output intact: Cargo must now track the receiving workspace's
+    // transitive path, not the original producer's path in the restored .d file.
+    fs::write(
+        second.workspace.join("src/value part.rs"),
+        "pub fn value() -> u32 { 43 }",
+    )
+    .unwrap();
+    second.build();
+    assert_eq!(second.value("target"), "43");
+}
+
 #[cfg(any(unix, windows))]
 fn link_directory(f: &Fixture, source: &std::path::Path, destination: &std::path::Path) {
     #[cfg(unix)]
@@ -587,7 +792,6 @@ fn cfg_literals_containing_checkout_paths_are_hashed_exactly() {
     assert!(stderr(&result).contains("argument --cfg"));
 }
 
-#[cfg(unix)]
 #[test]
 fn native_archives_on_unqualified_and_all_search_paths_never_hit() {
     let f = Fixture::new(
@@ -602,14 +806,52 @@ fn native_archives_on_unqualified_and_all_search_paths_never_hit() {
                 format!("int native_value(void) {{ return {value}; }}"),
             )
             .unwrap();
-            checked(
-                f.command("cc")
-                    .args(["-c", "native/value.c", "-o", "native/value.o"]),
-            );
-            checked(
-                f.command("ar")
-                    .args(["rcs", "native/libaudit_native.a", "native/value.o"]),
-            );
+            #[cfg(unix)]
+            {
+                checked(
+                    f.command("cc")
+                        .args(["-c", "native/value.c", "-o", "native/value.o"]),
+                );
+                checked(f.command("ar").args([
+                    "rcs",
+                    "native/libaudit_native.a",
+                    "native/value.o",
+                ]));
+            }
+            #[cfg(windows)]
+            {
+                let finder = PathBuf::from(std::env::var_os("ProgramFiles(x86)").unwrap())
+                    .join("Microsoft Visual Studio/Installer/vswhere.exe");
+                let found = checked(f.command(finder).args([
+                    "-latest",
+                    "-products",
+                    "*",
+                    "-requires",
+                    "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                    "-property",
+                    "installationPath",
+                ]));
+                let installation = PathBuf::from(String::from_utf8(found.stdout).unwrap().trim());
+                let version = fs::read_to_string(
+                    installation.join("VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt"),
+                )
+                .unwrap();
+                let tools = installation
+                    .join("VC/Tools/MSVC")
+                    .join(version.trim())
+                    .join("bin/Hostx64/x64");
+                checked(f.command(tools.join("cl.exe")).args([
+                    "/nologo",
+                    "/c",
+                    "native/value.c",
+                    "/Fonative/value.obj",
+                ]));
+                checked(f.command(tools.join("lib.exe")).args([
+                    "/nologo",
+                    "/OUT:native/audit_native.lib",
+                    "native/value.obj",
+                ]));
+            }
             fs::create_dir_all(f.workspace.join("out")).unwrap();
             let result = checked(f.local().arg(BELLOWS).args([
                 "rustc",
@@ -631,9 +873,14 @@ fn native_archives_on_unqualified_and_all_search_paths_never_hit() {
                 "--extern",
                 "fixture=out/libfixture-audit.rlib",
                 "-o",
-                "app",
+                if cfg!(windows) { "app.exe" } else { "app" },
             ]));
-            let result = checked(&mut f.command(f.workspace.join("app")));
+            let result = checked(
+                &mut f.command(
+                    f.workspace
+                        .join(format!("app{}", std::env::consts::EXE_SUFFIX)),
+                ),
+            );
             assert_eq!(
                 String::from_utf8(result.stdout).unwrap().trim(),
                 value.to_string()

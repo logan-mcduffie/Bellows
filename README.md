@@ -48,7 +48,7 @@ Nothing from the demo is retained outside its temporary directory.
 
 ## Manual use
 
-For native Windows, use the [PowerShell qualification instructions](docs/windows.md).
+For native Windows, use the [setup and qualification instructions](docs/windows.md).
 The Windows CI job runs the same `scripts/windows-check.ps1` checks.
 
 ### Local builds
@@ -262,8 +262,9 @@ expanded beyond the Rust/Cargo/linker toolchain.
 Phase 5 computes a syntactic public-surface heuristic. Its JSON embeds the
 generic/inline/default-method/macro caveat, and it never authorizes a cache hit;
 stable downstream skipping still requires compiler-produced metadata.
-The current acceptance suite and Manifold integration target Linux runners;
-Windows dep-info and artifact behavior have not yet been qualified.
+Linux and native Windows x64 MSVC have acceptance lanes. See the
+[Windows qualification scope](docs/windows.md); passing these fixtures does not
+establish parity for every downstream workflow or Windows configuration.
 
 The wire and on-disk formats are versioned but not yet stable. Review the
 [protocol policy](docs/protocol.md) before upgrading a running service.

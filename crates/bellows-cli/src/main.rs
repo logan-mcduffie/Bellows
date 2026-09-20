@@ -1395,10 +1395,10 @@ fn normalized_compiler_arguments(
 }
 
 fn build_identity(invocation: &Invocation) -> Result<Identity> {
-    let workspace = env::var_os("BELLOWS_WORKSPACE")
-        .map(PathBuf::from)
-        .unwrap_or(env::current_dir()?)
-        .canonicalize()?;
+    // Cargo can change directory for a manifest or a nested build. Relative
+    // rustc arguments and dep-info belong to that invocation's working dir,
+    // not the parent Bellows session's launch directory.
+    let workspace = env::current_dir()?.canonicalize()?;
     let normalizer = normalizer(&workspace, &invocation.out_dir);
     let compiler = Command::new(&invocation.rustc).arg("-vV").output()?;
     if !compiler.status.success() {
@@ -1420,7 +1420,7 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
     );
     // Earlier captures treated every backslash as a Make escape and could
     // omit the real dependency. Never reuse those compiler manifests.
-    let dep_info_format = b"rustc-space-escape-v2";
+    let dep_info_format = b"rustc-space-escape-v3-json-streams";
     components.insert(
         "dependency parser changed".into(),
         digest_bytes(dep_info_format),
@@ -1744,8 +1744,8 @@ fn restore(
         let _ = store.put_blob(&candidate.stdout.digest, &stdout_blob);
         let _ = store.put_blob(&candidate.stderr.digest, &stderr_blob);
     }
-    let stdout = identity.normalizer.localize_bytes(&stdout_blob);
-    let stderr = identity.normalizer.localize_bytes(&stderr_blob);
+    let stdout = transform_compiler_stream(&stdout_blob, &identity.normalizer, true);
+    let stderr = transform_compiler_stream(&stderr_blob, &identity.normalizer, true);
     std::io::stdout().write_all(&stdout)?;
     std::io::stderr().write_all(&stderr)?;
     Ok(())
@@ -1799,8 +1799,8 @@ fn restore_l1(
         };
         atomic_write(&invocation.out_dir.join(&artifact.file_name), &bytes)?;
     }
-    let stdout = identity.normalizer.localize_bytes(&stdout_blob);
-    let stderr = identity.normalizer.localize_bytes(&stderr_blob);
+    let stdout = transform_compiler_stream(&stdout_blob, &identity.normalizer, true);
+    let stderr = transform_compiler_stream(&stderr_blob, &identity.normalizer, true);
     std::io::stdout().write_all(&stdout)?;
     std::io::stderr().write_all(&stderr)?;
     Ok(())
@@ -1866,6 +1866,52 @@ fn compile_and_capture(
         }
     };
     Ok((status, captured))
+}
+
+// rustc's JSON diagnostics/artifact notifications contain escaped strings.
+// Replacing raw bytes can inject unescaped Windows backslashes into JSON.
+fn transform_compiler_stream(bytes: &[u8], normalizer: &PathNormalizer, localize: bool) -> Vec<u8> {
+    fn visit(value: &mut serde_json::Value, normalizer: &PathNormalizer, localize: bool) {
+        match value {
+            serde_json::Value::String(text) => {
+                *text = if localize {
+                    normalizer.localize(text)
+                } else {
+                    normalizer.normalize(text)
+                };
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    visit(value, normalizer, localize);
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for value in values.values_mut() {
+                    visit(value, normalizer, localize);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut result = Vec::new();
+    for line in bytes.split_inclusive(|b| *b == b'\n') {
+        if let Ok(mut value @ serde_json::Value::Object(_)) = serde_json::from_slice(line) {
+            visit(&mut value, normalizer, localize);
+            result.extend(serde_json::to_vec(&value).expect("serialize compiler JSON"));
+            if line.ends_with(b"\r\n") {
+                result.extend_from_slice(b"\r\n");
+            } else if line.ends_with(b"\n") {
+                result.push(b'\n');
+            }
+        } else {
+            result.extend(if localize {
+                normalizer.localize_bytes(line)
+            } else {
+                normalizer.normalize_bytes(line)
+            });
+        }
+    }
+    result
 }
 
 fn capture_outputs(
@@ -1943,8 +1989,8 @@ fn capture_outputs(
         .collect::<Vec<_>>();
     env_inputs.sort_by(|a, b| a.name.cmp(&b.name));
     env_inputs.dedup_by(|a, b| a.name == b.name);
-    let normalized_stdout = identity.normalizer.normalize_bytes(&stdout);
-    let normalized_stderr = identity.normalizer.normalize_bytes(&stderr);
+    let normalized_stdout = transform_compiler_stream(&stdout, &identity.normalizer, false);
+    let normalized_stderr = transform_compiler_stream(&stderr, &identity.normalizer, false);
     let stdout_digest = digest_bytes(&normalized_stdout);
     let stderr_digest = digest_bytes(&normalized_stderr);
     let stdout_len = normalized_stdout.len() as u64;
@@ -3697,4 +3743,26 @@ mod tests {
         assert!(is_relevant_environment_name("CLIPPY_ARGS"));
         assert!(is_relevant_environment_name("CLIPPY_CONF_DIR"));
     }
+}
+#[test]
+fn compiler_json_streams_escape_localized_windows_paths() {
+    let normalizer = PathNormalizer::new(vec![(
+        "$TARGET".into(),
+        PathBuf::from(r"C:\cache with spaces"),
+    )]);
+    let message = serde_json::json!({
+        "$message_type": "artifact",
+        "artifact": r"C:\cache with spaces\libfixture.rlib",
+        "nested": [{"rendered": "a quoted \"message\"\nsecond line"}]
+    });
+    let mut original = serde_json::to_vec(&message).unwrap();
+    original.extend_from_slice(b"\r\n");
+    let stored = transform_compiler_stream(&original, &normalizer, false);
+    assert!(String::from_utf8_lossy(&stored).contains("$TARGET"));
+    let restored = transform_compiler_stream(&stored, &normalizer, true);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&restored).unwrap(),
+        message
+    );
+    assert!(restored.ends_with(b"\r\n"));
 }

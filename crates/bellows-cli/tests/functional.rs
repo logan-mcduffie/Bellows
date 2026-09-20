@@ -164,6 +164,72 @@ fn explicit_target_directories_share_verified_library_outputs() {
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
 }
 
+#[test]
+fn cargo_from_a_subdirectory_resolves_compiler_inputs_in_cargos_working_directory() {
+    let f = Fixture::new("pub fn value() -> u32 { 42 }", "fn main() {}");
+    let subdir = f.workspace.join("launcher");
+    fs::create_dir(&subdir).unwrap();
+    for warm in [false, true] {
+        let output = checked(f.local().current_dir(&subdir).args([
+            "cargo",
+            "build",
+            "--release",
+            "--offline",
+            "--manifest-path",
+            "../Cargo.toml",
+        ]));
+        assert!(!stderr(&output).contains("FALLBACK"), "{}", stderr(&output));
+        if warm {
+            assert!(stderr(&output).contains("LOCAL HIT"), "{}", stderr(&output));
+        }
+        f.clean();
+    }
+}
+
+#[test]
+fn restored_cargo_json_artifact_messages_remain_valid() {
+    let f = Fixture::new("pub fn value() -> u32 { 42 }", "fn main() {}");
+    let target = f.temp.path().join("json target");
+    for warm in [false, true] {
+        let output = checked(
+            f.local()
+                .env(
+                    "CARGO_TARGET_DIR",
+                    target.to_string_lossy().replace('\\', "/"),
+                )
+                .args([
+                    "cargo",
+                    "build",
+                    "--release",
+                    "--offline",
+                    "--message-format=json",
+                ]),
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let messages: Vec<Value> = stdout
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            messages
+                .iter()
+                .any(|v| v["reason"] == "build-finished" && v["success"] == true)
+        );
+        for message in messages
+            .iter()
+            .filter(|v| v["reason"] == "compiler-artifact")
+        {
+            for path in message["filenames"].as_array().unwrap() {
+                assert!(std::path::Path::new(path.as_str().unwrap()).is_file());
+            }
+        }
+        if warm {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("LOCAL HIT"));
+        }
+        fs::remove_dir_all(&target).unwrap();
+    }
+}
+
 #[cfg(any(unix, windows))]
 fn link_directory(f: &Fixture, source: &std::path::Path, destination: &std::path::Path) {
     #[cfg(unix)]

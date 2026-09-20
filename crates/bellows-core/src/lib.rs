@@ -448,13 +448,10 @@ pub fn validate_declared_record(record: &DeclaredActionRecord) -> Result<()> {
         }
     }
     for output in &record.outputs {
-        let covered = record.output_paths.iter().any(|declaration| {
-            output.file_name == *declaration
-                || output
-                    .file_name
-                    .strip_prefix(declaration)
-                    .is_some_and(|suffix| suffix.starts_with('/'))
-        });
+        let covered = record
+            .output_paths
+            .iter()
+            .any(|declaration| relative_path_is_within(&output.file_name, declaration));
         if !covered {
             bail!(
                 "record output {} is outside declared roots",
@@ -1118,6 +1115,14 @@ pub fn validate_relative_path(value: &str) -> Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+// Callers validate both relative paths before checking component containment.
+// Records may come from Windows even when the content store runs on Linux.
+pub fn relative_path_is_within(path: &str, root: &str) -> bool {
+    let mut components = path.split(['/', '\\']);
+    root.split(['/', '\\'])
+        .all(|part| components.next() == Some(part))
+}
+
 pub fn validate_archive_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name.len() > 128
@@ -1473,6 +1478,21 @@ mod tests {
         assert!(validate_normalized_input_path(r"$WORKSPACE\..\escape.rs").is_err());
         assert!(validate_normalized_input_path(r"C:\outside\lib.rs").is_err());
         assert!(validate_normalized_input_path(r"\\server\share\lib.rs").is_err());
+    }
+
+    #[test]
+    fn declared_root_coverage_uses_components_across_path_separators() {
+        assert!(relative_path_is_within(
+            r"output\release\app.exe",
+            "output/release"
+        ));
+        assert!(relative_path_is_within(
+            "output/release/app.exe",
+            r"output\release"
+        ));
+        assert!(relative_path_is_within("output", "output"));
+        assert!(!relative_path_is_within("output-other/app.exe", "output"));
+        assert!(!relative_path_is_within("other/output/app.exe", "output"));
     }
 
     #[test]

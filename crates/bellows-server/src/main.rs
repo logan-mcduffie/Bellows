@@ -581,11 +581,7 @@ fn verify_declared_record(store: &Store, record: &DeclaredActionRecord) -> ApiRe
     }
     for output in &record.outputs {
         let covered = record.output_paths.iter().any(|declaration| {
-            output.file_name == *declaration
-                || output
-                    .file_name
-                    .strip_prefix(declaration)
-                    .is_some_and(|suffix| suffix.starts_with('/'))
+            bellows_core::relative_path_is_within(&output.file_name, declaration)
         });
         if !covered {
             return Err(ApiError(

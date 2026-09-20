@@ -17,6 +17,10 @@ jobs:
           toolchain: 1.92.0
           components: rustfmt, clippy
       - run: ./scripts/windows-check.ps1 -ReportDirectory "$env:RUNNER_TEMP/bellows-windows-report"
+      - name: Install comparison compiler
+        run: rustup toolchain install nightly-2026-01-15 --profile minimal
+      - name: Extended native Windows acceptance
+        run: ./scripts/windows-extended.ps1 -ReportDirectory "$env:RUNNER_TEMP/bellows-windows-report/extended"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -59,18 +63,20 @@ jobs:
             return 1
           }
           docker volume create bellows-test-data >/dev/null
-          docker run --detach --rm --name bellows-test \
+          docker run --detach --name bellows-test \
             --env BELLOWS_AUTH_TOKEN=ci-secret \
             --volume bellows-test-data:/var/lib/bellows \
             bellows:test
           wait_healthy
           docker stop --time 10 bellows-test
-          docker run --detach --rm --name bellows-test \
+          docker rm bellows-test
+          docker run --detach --name bellows-test \
             --env BELLOWS_AUTH_TOKEN=ci-secret \
             --volume bellows-test-data:/var/lib/bellows \
             bellows:test
           wait_healthy
           docker stop --time 10 bellows-test
+          docker rm bellows-test
           docker volume rm bellows-test-data >/dev/null
 
   security-audit:

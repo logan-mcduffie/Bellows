@@ -34,6 +34,16 @@ To choose a report location, pass `-ReportDirectory C:\bellows-report`; use a
 new directory for each run. CI uploads the same evidence as an artifact.
 A failing native command stops qualification and returns failure.
 
+The additional `scripts/windows-extended.ps1 -ReportDirectory <new-directory>`
+suite exercises native archives, declared local/nested actions, authenticated
+remote execution in a separate disposable service, compiler and execution
+single-flight, bounded lease waits, corrupt-cache recovery, advisory analysis,
+and non-ASCII paths. It requires the release binaries from `windows-check.ps1`
+and `nightly-2026-01-15` for a real compiler-version invalidation comparison.
+CI runs both suites and retains their command logs and machine-readable results.
+Its remote executor is temporary; this does not enable execution on daily-use
+services or qualify arbitrary host tools.
+
 ## Exercise Manifold on the actual machine
 
 After this check passes, point your usual Manifold workflow at the built

@@ -14,7 +14,7 @@ struct Fixture {
 impl Fixture {
     fn new(lib: &str, main: &str) -> Self {
         let temp = tempfile::tempdir().unwrap();
-        let workspace = temp.path().join("workspace");
+        let workspace = temp.path().join("workspace with spaces");
         fs::create_dir_all(workspace.join("src")).unwrap();
         fs::write(
             workspace.join("Cargo.toml"),
@@ -72,7 +72,14 @@ impl Fixture {
         fs::remove_dir_all(self.workspace.join("target")).unwrap();
     }
     fn value(&self, root: &str) -> String {
-        let output = checked(&mut self.command(self.workspace.join(root).join("release/fixture")));
+        let output = checked(
+            &mut self.command(
+                self.workspace
+                    .join(root)
+                    .join("release")
+                    .join(format!("fixture{}", std::env::consts::EXE_SUFFIX)),
+            ),
+        );
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
     fn explain(&self, flags: &[&str]) -> Value {
@@ -271,7 +278,12 @@ fn declared_roots_replace_stale_files_and_allow_nested_declarations() {
     assert!(String::from_utf8_lossy(&build().stdout).contains("CACHE HIT"));
     assert!(!f.workspace.join("output/stale").exists());
     assert!(f.workspace.join("unrelated").exists());
-    assert!(f.workspace.join("output/release/fixture").is_file());
+    assert!(
+        f.workspace
+            .join("output/release")
+            .join(format!("fixture{}", std::env::consts::EXE_SUFFIX))
+            .is_file()
+    );
     let rejected = f
         .declared()
         .args([
@@ -483,8 +495,8 @@ fn cfg_literals_containing_checkout_paths_are_hashed_exactly() {
     fs::write(
         first.join("src/lib.rs"),
         format!(
-            "pub fn value() -> bool {{ cfg!(audit_path=\"{}\") }}",
-            first.display()
+            "pub fn value() -> bool {{ cfg!(audit_path={:?}) }}",
+            first.to_string_lossy()
         ),
     )
     .unwrap();
@@ -492,8 +504,8 @@ fn cfg_literals_containing_checkout_paths_are_hashed_exactly() {
         f.local()
             .args(["cargo", "build", "--release", "--offline"])
             .env(
-                "RUSTFLAGS",
-                format!("--cfg=audit_path=\"{}\"", first.display()),
+                "CARGO_ENCODED_RUSTFLAGS",
+                format!("--cfg\u{1f}audit_path={:?}", first.to_string_lossy()),
             ),
     );
     assert_eq!(f.value("target"), "true");
@@ -507,8 +519,8 @@ fn cfg_literals_containing_checkout_paths_are_hashed_exactly() {
         f.local()
             .args(["cargo", "build", "--release", "--offline"])
             .env(
-                "RUSTFLAGS",
-                format!("--cfg=audit_path=\"{}\"", f.workspace.display()),
+                "CARGO_ENCODED_RUSTFLAGS",
+                format!("--cfg\u{1f}audit_path={:?}", f.workspace.to_string_lossy()),
             ),
     );
     assert!(!stderr(&result).contains("LOCAL HIT"));

@@ -1301,7 +1301,7 @@ fn normalizer(workspace: &Path, out_dir: &Path) -> PathNormalizer {
     if let Some(target) = target {
         bases.push(("$TARGET".into(), canonical_base(target)));
     }
-    let home = env::var_os("HOME").map(PathBuf::from);
+    let home = bellows_core::user_home();
     if let Some(cargo_home) = env::var_os("CARGO_HOME")
         .map(PathBuf::from)
         .or_else(|| home.as_ref().map(|home| home.join(".cargo")))

@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
+#[cfg(unix)]
 use std::fs::File;
 use std::io::Write;
 use std::path::Component;
@@ -339,8 +340,16 @@ fn active_rustup_toolchain() -> Option<String> {
 pub fn rustup_home() -> PathBuf {
     std::env::var_os("RUSTUP_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".rustup")))
+        .or_else(|| user_home().map(|home| home.join(".rustup")))
         .unwrap_or_else(|| PathBuf::from(".rustup"))
+}
+
+pub fn user_home() -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Some(home) = std::env::var_os("USERPROFILE") {
+        return Some(home.into());
+    }
+    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 fn command_version(command: &str) -> Result<String> {
@@ -1307,7 +1316,7 @@ fn replace_bytes(input: &[u8], replacements: &[(&[u8], &[u8])]) -> Vec<u8> {
 pub fn parse_dep_info(text: &str) -> (Vec<String>, Vec<(String, Option<String>)>) {
     let mut files = BTreeSet::new();
     let mut env = BTreeSet::new();
-    let logical = text.replace("\\\n", "");
+    let logical = text.replace("\\\r\n", "").replace("\\\n", "");
     for line in logical.lines() {
         if let Some(rest) = line.strip_prefix("# env-dep:") {
             let (name, value) = rest
@@ -1331,13 +1340,12 @@ pub fn parse_dep_info(text: &str) -> (Vec<String>, Vec<(String, Option<String>)>
 fn split_makefile_words(value: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
-    let mut escaped = false;
-    for ch in value.chars() {
-        if escaped {
-            current.push(ch);
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        // rustc's escape_dep_filename escapes only spaces. Other backslashes
+        // are literal, including Windows drive paths and UNC prefixes.
+        if ch == '\\' && chars.peek() == Some(&' ') {
+            current.push(chars.next().unwrap());
         } else if ch.is_whitespace() {
             if !current.is_empty() {
                 words.push(std::mem::take(&mut current));
@@ -1345,9 +1353,6 @@ fn split_makefile_words(value: &str) -> Vec<String> {
         } else {
             current.push(ch);
         }
-    }
-    if escaped {
-        current.push('\\');
     }
     if !current.is_empty() {
         words.push(current);
@@ -1414,6 +1419,24 @@ mod tests {
             vec![
                 ("MODE".into(), Some("fast".into())),
                 ("OPTIONAL".into(), None)
+            ]
+        );
+    }
+
+    #[test]
+    fn dep_info_preserves_windows_backslashes_and_escaped_spaces() {
+        let dep = concat!(
+            "C:\\build\\foo.rlib: C:\\repo\\src\\lib.rs C:\\my\\ project\\a.rs \\\r\n",
+            " \\\\server\\share\\source.rs \\\\?\\C:\\long\\source.rs\r\n",
+        );
+        let (files, _) = parse_dep_info(dep);
+        assert_eq!(
+            files,
+            vec![
+                r"C:\my project\a.rs",
+                r"C:\repo\src\lib.rs",
+                r"\\?\C:\long\source.rs",
+                r"\\server\share\source.rs",
             ]
         );
     }

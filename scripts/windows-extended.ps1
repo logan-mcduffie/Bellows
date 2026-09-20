@@ -6,8 +6,9 @@ $repo=Split-Path $PSScriptRoot -Parent
 $report=[IO.Path]::GetFullPath($ReportDirectory)
 if(Test-Path $report){throw 'A new report directory is required'}
 New-Item -ItemType Directory $report | Out-Null
-$b=Join-Path $repo 'target/release/bellows.exe'
-$d=Join-Path $repo 'target/release/bellowsd.exe'
+$suffix=if($IsWindows){'.exe'}else{''}
+$b=Join-Path $repo "target/release/bellows$suffix"
+$d=Join-Path $repo "target/release/bellowsd$suffix"
 $original=@{}; Get-ChildItem Env: | ForEach-Object {$original[$_.Name]=$_.Value}
 $location=Get-Location
 $results=[Collections.Generic.List[object]]::new()
@@ -57,7 +58,8 @@ function StartServer($name,[switch]$Execution){
   $store=Join-Path $report $name
   $args=@('--listen',"127.0.0.1:$port",'--data-dir',('"'+$store+'"'))
   if($Execution){$args+='--enable-execution'}
-  $proc=Start-Process -FilePath $d -ArgumentList $args -WindowStyle Hidden -PassThru -RedirectStandardOutput "$store.stdout.log" -RedirectStandardError "$store.stderr.log"
+  $windowOptions=if($IsWindows){@{WindowStyle='Hidden'}}else{@{}}
+  $proc=Start-Process -FilePath $d -ArgumentList $args @windowOptions -PassThru -RedirectStandardOutput "$store.stdout.log" -RedirectStandardError "$store.stderr.log"
   $processes.Add($proc)
   for($i=0;$i -lt 100;$i++){
     try{Invoke-RestMethod "http://127.0.0.1:$port/live" | Out-Null;return @{url="http://127.0.0.1:$port";process=$proc;store=$store}}catch{Start-Sleep -Milliseconds 100}
@@ -65,13 +67,13 @@ function StartServer($name,[switch]$Execution){
 }
 try{
   Get-ChildItem Env: | Where-Object Name -Match '^(BELLOWS_|CARGO_TARGET_|CARGO_PROFILE_|RUSTFLAGS$|RUSTC_WRAPPER$|RUSTC_WORKSPACE_WRAPPER$|CARGO_ENCODED_RUSTFLAGS$)' | ForEach-Object {Remove-Item "Env:$($_.Name)"}
-  $env:RUSTUP_TOOLCHAIN='1.92.0-x86_64-pc-windows-msvc';$env:CARGO_INCREMENTAL='0';$env:BELLOWS_COLOR='never'
+  $env:RUSTUP_TOOLCHAIN='1.92.0';$env:CARGO_INCREMENTAL='0';$env:BELLOWS_COLOR='never'
   $env:BELLOWS_STATE_DIR=Join-Path $report 'state';$env:BELLOWS_AUTH_TOKEN=[guid]::NewGuid().ToString('N')
   $env:BELLOWS_CONNECT_TIMEOUT_MS='250';$env:BELLOWS_REQUEST_TIMEOUT_MS='1000'
   $workspace=Join-Path $report 'workspace café with spaces'
   Copy-Item -LiteralPath (Join-Path $repo 'demo') -Destination $workspace -Recurse
   Set-Location $workspace
-  $target=Join-Path $workspace 'target';$exe=Join-Path $target 'release/forge-cli.exe'
+  $target=Join-Path $workspace 'target';$exe=Join-Path $target "release/forge-cli$suffix"
   $server=StartServer 'cache-service';$env:BELLOWS_SERVER=$server.url
   Case 'doctor-auth-and-ownership' {
     Call $b @('doctor') | Out-Null
@@ -101,11 +103,11 @@ try{
   }
   Case 'concurrent-local-and-remote-single-flight' {
     $clients=@();foreach($name in @('local-a','local-b')){$clients+=BeginClient $name @('cargo','build','--release','--offline') (Join-Path $report $name)}
-    foreach($client in $clients){EndClient $client | Out-Null;Assert ((Call "$report/$($client.name)/release/forge-cli.exe" @()) -match '42') 'Concurrent local output wrong'}
+    foreach($client in $clients){EndClient $client | Out-Null;Assert ((Call "$report/$($client.name)/release/forge-cli$suffix" @()) -match '42') 'Concurrent local output wrong'}
     $env:BELLOWS_L1='0';$env:BELLOWS_DEMO_COMPILE_DELAY_MS='2000'
     try{
       $clients=@();foreach($name in @('remote-a','remote-b')){$clients+=BeginClient $name @('run','--','cargo','build','--release','--offline') (Join-Path $report $name)}
-      $combined='';foreach($client in $clients){$combined+=EndClient $client;Assert ((Call "$report/$($client.name)/release/forge-cli.exe" @()) -match '42') 'Concurrent remote output wrong'}
+      $combined='';foreach($client in $clients){$combined+=EndClient $client;Assert ((Call "$report/$($client.name)/release/forge-cli$suffix" @()) -match '42') 'Concurrent remote output wrong'}
       Assert ($combined -match 'SHARED HIT') 'No shared single-flight hit'
       $events=Get-Content "$env:BELLOWS_STATE_DIR/events.jsonl" | ForEach-Object {$_ | ConvertFrom-Json}
       Assert (@($events | Where-Object {$_.kind -eq 'store' -and $_.crate_name -eq 'forge_core'}).Count -eq 1) 'Identical library published more than once'
@@ -126,15 +128,15 @@ try{
   }
   Case 'archive-two-executors-and-publish-once' {
     $archive=Join-Path $report 'archive';New-Item -ItemType Directory $archive | Out-Null
-    Call rustc @('--edition','2024','--test','crates/forge-core/src/lib.rs','-o',"$archive/tests.exe") | Out-Null
-    Call "$archive/tests.exe" @() | Out-Null
+    Call rustc @('--edition','2024','--test','crates/forge-core/src/lib.rs','-o',"$archive/tests$suffix") | Out-Null
+    Call "$archive/tests$suffix" @() | Out-Null
     Call $b @('archive','publish','tests-v1',$archive) | Out-Null
     foreach($destination in @('executor-a','executor-b')){
       Call $b @('archive','restore','tests-v1',"$report/$destination") | Out-Null
-      Call "$report/$destination/tests.exe" @() | Out-Null
-      Assert ((Get-FileHash "$archive/tests.exe").Hash -eq (Get-FileHash "$report/$destination/tests.exe").Hash) 'Archive hash mismatch'
+      Call "$report/$destination/tests$suffix" @() | Out-Null
+      Assert ((Get-FileHash "$archive/tests$suffix").Hash -eq (Get-FileHash "$report/$destination/tests$suffix").Hash) 'Archive hash mismatch'
     }
-    WriteFile "$archive/tests.exe" 'different';Call $b @('archive','publish','tests-v1',$archive) 1 | Out-Null
+    WriteFile "$archive/tests$suffix" 'different';Call $b @('archive','publish','tests-v1',$archive) 1 | Out-Null
   }
   Case 'bounded-lease-timeout-and-release' {
     $env:BELLOWS_L1='0';RemoveTest $target
@@ -194,10 +196,10 @@ try{
     try{
       $nested=@('action','run','--local','--name','nested','--input','Cargo.toml','--input','Cargo.lock','--input','build.rs','--input','src','--input','generator','--output','target','--','cargo','build','--locked','--offline')
       Call $b $nested | Out-Null
-      Assert ((Call './target/debug/phase3-fixture.exe' @()) -match 'nested Cargo') 'Generated content wrong'
+      Assert ((Call "./target/debug/phase3-fixture$suffix" @()) -match 'nested Cargo') 'Generated content wrong'
       RemoveTest (Join-Path (Get-Location) 'target')
       Assert ((Call $b $nested) -match 'HIT') 'Nested output did not restore'
-      Assert ((Call './target/debug/phase3-fixture.exe' @()) -match 'nested Cargo') 'Restored generated content wrong'
+      Assert ((Call "./target/debug/phase3-fixture$suffix" @()) -match 'nested Cargo') 'Restored generated content wrong'
     }finally{Pop-Location}
   }
   Case 'advisory-private-public-analysis' {
@@ -224,7 +226,7 @@ try{
     $disabled=$remote.Clone();$disabled[3]=$server.url;Call $b $disabled 1 | Out-Null
     $oldToolchain=$env:RUSTUP_TOOLCHAIN
     try{
-      $env:RUSTUP_TOOLCHAIN='1.92.0'
+      $env:RUSTUP_TOOLCHAIN='nightly-2026-01-15'
       $text=Call $b $remote 1;Assert ($text -match '412 Precondition Failed') 'Toolchain mismatch did not return 412'
     }finally{$env:RUSTUP_TOOLCHAIN=$oldToolchain}
     $record=Get-ChildItem "$($executor.store)/declared" -Recurse -Filter '*.json' | Select-Object -First 1 | Get-Content -Raw | ConvertFrom-Json
@@ -247,9 +249,9 @@ try{
         if($kind -eq 'config'){WriteFile "$flags/.cargo/config.toml" "[build]`nrustflags=['--cfg','audit_flag']";$args+=@('--input','.cargo')}
         else{[Environment]::SetEnvironmentVariable($kind,($(if($kind -eq 'RUSTFLAGS'){'--cfg audit_flag'}else{"--cfg$([char]31)audit_flag"})),'Process');$args+=@('--env',$kind)}
         $args+=@('--','cargo','build','--release','--locked','--offline','--target-dir','output')
-        Call $b $args | Out-Null;Call './output/release/flag-fixture.exe' @() | Out-Null
+        Call $b $args | Out-Null;Call "./output/release/flag-fixture$suffix" @() | Out-Null
         WriteFile "$flags/output/stale" 'stale';Assert ((Call $b $args) -match 'HIT') 'Remote flag action missed'
-        Assert (-not(Test-Path "$flags/output/stale")) 'Remote obsolete output survived';Call './output/release/flag-fixture.exe' @() | Out-Null
+        Assert (-not(Test-Path "$flags/output/stale")) 'Remote obsolete output survived';Call "./output/release/flag-fixture$suffix" @() | Out-Null
         if($kind -ne 'config'){[Environment]::SetEnvironmentVariable($kind,$null,'Process')}
       }
     }finally{$env:RUSTFLAGS=$null;$env:CARGO_ENCODED_RUSTFLAGS=$null;$env:AUDIT_VALUE=$null;Pop-Location}
@@ -264,7 +266,7 @@ try{
         $args=@('remote','run','--server',$executor.url,'--name','remote-race','--input','Cargo.toml','--input','Cargo.lock','--input','crates','--output','target','--env','BELLOWS_ACTION_DELAY_MS','--','cargo','build','--release','--locked','--offline','-p','forge-cli')
         $clients+=BeginClient $name $args $null $destination
       }
-      $combined='';foreach($client in $clients){$combined+=EndClient $client;Assert ((Call "$report/$($client.name)/target/release/forge-cli.exe" @()) -match '42') 'Remote concurrent output wrong'}
+      $combined='';foreach($client in $clients){$combined+=EndClient $client;Assert ((Call "$report/$($client.name)/target/release/forge-cli$suffix" @()) -match '42') 'Remote concurrent output wrong'}
       Assert (([regex]::Matches($combined,'EXECUTED remote-race')).Count -eq 1 -and $combined -match 'CACHE HIT') 'Remote execution did not single-flight'
     }finally{$env:BELLOWS_ACTION_DELAY_MS=$null}
   }
@@ -303,3 +305,4 @@ try{
   foreach($name in $original.Keys){[Environment]::SetEnvironmentVariable($name,$original[$name],'Process')}
 }
 if(@($results | Where-Object status -eq 'failed').Count){exit 1}
+

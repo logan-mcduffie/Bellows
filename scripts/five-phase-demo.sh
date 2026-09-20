@@ -64,7 +64,7 @@ grep -q 'CACHE MISS.*forge_core' "$scratch/p1-cold.log"
 ) 2>&1 | tee "$scratch/p1-l1.log"
 grep -q 'LOCAL HIT.*forge_core' "$scratch/p1-l1.log"
 
-rm -rf "$scratch/client-state/l1"
+rm -rf "$scratch/client-state/l1-v5"
 (
   cd "$scratch/workspace"
   CARGO_TARGET_DIR="$scratch/p1-remote" "$bellows" run -- cargo build
@@ -185,6 +185,47 @@ grep -Eq 'CACHE HIT|EXECUTED' "$scratch/remote-a.log" "$scratch/remote-b.log"
 "$scratch/remote-a/target/debug/forge-cli" | grep -q '44°'
 "$scratch/remote-b/target/debug/forge-cli" | grep -q '44°'
 unset BELLOWS_ACTION_DELAY_MS
+
+section "Regression — remote Cargo preserves flags and exact output trees"
+mkdir -p "$scratch/flag-action/src" "$scratch/flag-action/.cargo"
+cat > "$scratch/flag-action/Cargo.toml" <<'TOML'
+[package]
+name = "flag-fixture"
+version = "0.1.0"
+edition = "2024"
+[workspace]
+TOML
+cat > "$scratch/flag-action/src/main.rs" <<'RUST'
+fn main() { assert!(cfg!(audit_flag), "declared rustflags were discarded"); }
+RUST
+(
+  cd "$scratch/flag-action"
+  cargo generate-lockfile --offline
+  for flag_kind in RUSTFLAGS CARGO_ENCODED_RUSTFLAGS; do
+    if [ "$flag_kind" = RUSTFLAGS ]; then
+      flag_value='--cfg audit_flag'
+    else
+      flag_value=$'--cfg\x1faudit_flag'
+    fi
+    env "$flag_kind=$flag_value" "$bellows" remote run --name "remote-flags-$flag_kind" \
+      --input Cargo.toml --input Cargo.lock --input src --output output \
+      --env "$flag_kind" --server "$server" -- \
+      cargo build --release --locked --offline --target-dir output
+    ./output/release/flag-fixture
+    printf 'obsolete' > output/stale
+    env "$flag_kind=$flag_value" "$bellows" remote run --name "remote-flags-$flag_kind" \
+      --input Cargo.toml --input Cargo.lock --input src --output output \
+      --env "$flag_kind" --server "$server" -- \
+      cargo build --release --locked --offline --target-dir output
+    test ! -e output/stale
+    ./output/release/flag-fixture
+  done
+  printf '[build]\nrustflags = ["--cfg", "audit_flag"]\n' > .cargo/config.toml
+  "$bellows" remote run --name remote-config-flags \
+    --input Cargo.toml --input Cargo.lock --input src --input .cargo --output output \
+    --server "$server" -- cargo build --release --locked --offline --target-dir output
+  ./output/release/flag-fixture
+)
 
 section "Phase 5 — advisory compiler-aware downstream impact"
 cp -a "$root/demo" "$scratch/analysis"

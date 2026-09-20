@@ -116,8 +116,17 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
     }
 }
 
+fn main() -> Result<()> {
+    if std::env::var_os(bellows_core::execution::REMAP_ENV).is_some() {
+        let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+        let status = bellows_core::execution::remap_compiler(&args)?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    serve()
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn serve() -> Result<()> {
     let args = Args::parse();
     if args.max_candidates == 0 {
         bail!("--max-candidates must be greater than zero")
@@ -606,6 +615,8 @@ fn verify_declared_record(store: &Store, record: &DeclaredActionRecord) -> ApiRe
 }
 
 fn validate_execution_request(request: &ExecuteRequest) -> ApiResult<()> {
+    bellows_core::validate_output_roots(&request.inputs, &request.outputs)
+        .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
     validate_declared_command(&request.command)
         .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
     for artifact in &request.inputs {
@@ -678,13 +689,11 @@ fn execute_declared(
         .and_then(|name| name.to_str())
         .unwrap_or_default();
     if program == "cargo" {
-        command.env(
-            "CARGO_ENCODED_RUSTFLAGS",
-            format!(
-                "--remap-path-prefix\u{1f}{}=/bellows/action",
-                workspace.display()
-            ),
-        );
+        bellows_core::execution::configure_cargo_remapping(
+            &mut command,
+            &workspace,
+            &request.environment,
+        )?;
     } else if program == "rustc" {
         command
             .arg("--remap-path-prefix")

@@ -1,3 +1,5 @@
+pub mod execution;
+
 use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -13,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 5;
 pub const CONTENT_KEY_LEN: usize = 64;
 pub const MAX_CANDIDATE_FILES: usize = 100_000;
 pub const MAX_CANDIDATE_ENV: usize = 4_096;
@@ -380,7 +382,32 @@ pub struct ArchiveManifest {
     pub files: Vec<Artifact>,
 }
 
+/// Output replacement must never delete a declared source input.
+pub fn validate_output_roots(inputs: &[Artifact], outputs: &[String]) -> Result<()> {
+    for output in outputs {
+        let output = validate_relative_path(output)?;
+        if output.starts_with(".bellows") {
+            bail!(
+                "declared output overlaps Bellows state: {}",
+                output.display()
+            );
+        }
+        for input in inputs {
+            let input = validate_relative_path(&input.file_name)?;
+            if input.starts_with(&output) || output.starts_with(&input) {
+                bail!(
+                    "declared input/output overlap: {} and {}",
+                    input.display(),
+                    output.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_declared_record(record: &DeclaredActionRecord) -> Result<()> {
+    validate_output_roots(&record.inputs, &record.output_paths)?;
     if record.protocol != PROTOCOL_VERSION {
         bail!("unsupported declared record protocol {}", record.protocol)
     }
@@ -523,6 +550,14 @@ pub struct Event {
     pub static_key: Option<String>,
     pub action_key: Option<String>,
     pub detail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -532,14 +567,28 @@ pub struct Store {
 
 impl Store {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
-        let root = root.into();
+        Self::open_inner(root.into(), true)
+    }
+
+    /// Open a store from a latency-sensitive child process.
+    ///
+    /// Callers must arrange periodic maintenance through [`Store::open`] in a
+    /// parent or service process. Rustc wrappers use this entry point so a
+    /// large durable local cache is not recursively scanned once per crate.
+    pub fn open_for_access(root: impl Into<PathBuf>) -> Result<Self> {
+        Self::open_inner(root.into(), false)
+    }
+
+    fn open_inner(root: PathBuf, cleanup_temps: bool) -> Result<Self> {
         ensure_directory(&root)?;
         ensure_directory(&root.join("blobs"))?;
         ensure_directory(&root.join("actions"))?;
         ensure_directory(&root.join("declared"))?;
         ensure_directory(&root.join("archives"))?;
         ensure_directory(&root.join("quarantine"))?;
-        cleanup_orphan_temps(&root, Duration::from_secs(60 * 60))?;
+        if cleanup_temps {
+            cleanup_orphan_temps(&root, Duration::from_secs(60 * 60))?;
+        }
         Ok(Self { root })
     }
 
@@ -684,6 +733,18 @@ impl Store {
     pub fn put_declared(&self, record: &DeclaredActionRecord) -> Result<bool> {
         validate_declared_record(record)?;
         self.with_mutation_lock(|| self.put_declared_unlocked(record))
+    }
+
+    pub fn remove_declared(&self, key: &str) -> Result<bool> {
+        let path = self.declared_path(key)?;
+        self.with_mutation_lock(|| {
+            if !path.exists() {
+                return Ok(false);
+            }
+            fs::remove_file(&path).with_context(|| format!("remove declared action {key}"))?;
+            sync_parent(&path)?;
+            Ok(true)
+        })
     }
 
     fn put_declared_unlocked(&self, record: &DeclaredActionRecord) -> Result<bool> {
@@ -1079,8 +1140,16 @@ pub fn declared_action_key(
     let mut outputs = outputs.to_vec();
     outputs.sort();
     digest_bytes(
-        &serde_json::to_vec(&(name, platform, command, environment, inputs, outputs))
-            .unwrap_or_default(),
+        &serde_json::to_vec(&(
+            PROTOCOL_VERSION,
+            name,
+            platform,
+            command,
+            environment,
+            inputs,
+            outputs,
+        ))
+        .unwrap_or_default(),
     )
 }
 

@@ -48,6 +48,63 @@ Nothing from the demo is retained outside its temporary directory.
 
 ## Manual use
 
+### Local builds
+
+No daemon is required for a persistent local cache:
+
+```bash
+bellows cargo run --release -p flagship
+```
+
+`bellows cargo …` is shorthand for `bellows local -- cargo …`. Use the
+longer form only when wrapping a non-Cargo command or selecting `--cache-dir`
+explicitly.
+
+Local mode stores verified compiler artifacts in the platform user cache
+(`$XDG_CACHE_HOME/bellows`, `~/.cache/bellows`, or the Windows local app-data
+directory). Override it with `--cache-dir` or `BELLOWS_STATE_DIR`. It never
+constructs a network client, does not require `bellowsd`, and preserves Cargo's
+incremental setting. Release builds are cacheable by default; incremental
+dev-profile rustc actions safely bypass while Cargo continues using its own
+incremental state.
+
+```bash
+bellows stats --local
+bellows gc --local --max-mb 20000
+```
+
+Each wrapped build prints its build ID, elapsed time, hit/miss/bypass counts,
+and the most common reasons. Inspect that build without lifetime-log noise:
+
+```bash
+bellows explain --local --latest --summary
+bellows explain --local --latest --crate manifold_render
+bellows stats --local --latest --json
+```
+
+Misses identify changed source/dependency paths, environment variable names,
+compiler versions, or flag groups. Identity comparisons store hashes rather
+than environment or argument values. See [diagnosing builds](docs/diagnostics.md)
+for session selection, JSON fields, and log retention.
+
+Use a local declared action for deterministic whole outputs such as a final
+link or nested Cargo product:
+
+```bash
+bellows action run --local --name generated-component-v1 \
+  --input Cargo.toml --input Cargo.lock --input src \
+  --output target/generated \
+  -- cargo build --release --locked --offline --target-dir target/generated
+```
+
+The local store is shared across target directories, branches, and worktrees.
+Cargo remains the first-level build graph: an intact `target/` is still the
+fastest no-op build, while Bellows restores eligible work when Cargo needs an
+artifact again. See [local build acceleration](docs/local-builds.md) for the
+correctness boundary and the Flagship workflow.
+
+### Shared service
+
 Build and start the server:
 
 ```bash
@@ -82,7 +139,7 @@ The MVP caches compiler-produced Rust libraries and metadata when it can prove
 an unambiguous action identity. Its key covers:
 
 - exact `rustc -vV` identity;
-- normalized compiler arguments and relevant environment;
+- normalized file-location arguments, exact literal flags, and relevant environment;
 - primary sources and explicitly supplied `--extern` artifacts;
 - all transitive files learned from rustc dep-info;
 - all `env!` and `option_env!` values reported as dep-info env dependencies;
@@ -96,6 +153,15 @@ the candidate manifest.
 
 A static command identity retains several dependency manifests, allowing old
 branches to become hits again. Every candidate is revalidated before restore.
+Values actually consumed by `env!` and `option_env!` are compared literally:
+an embedded checkout path cannot safely be reused in a different checkout.
+Inputs reached through symlinks conservatively bypass publication until their
+resolution can be modeled. Unmodeled emit kinds and custom output destinations
+also bypass, so a successful hit always supplies the requested output set.
+Native-capable search paths (including bare `-L` and `-Lall`), custom sysroots
+and target JSON files, and `target-cpu=native` bypass. Only Cargo's explicit
+dependency search paths are eligible. Literal flag values such as `--cfg`
+strings are never path-normalized.
 Every downloaded blob is rehashed. Dep-info and compiler streams are normalized
 against workspace, target, Cargo, Rustup, and home roots, then localized on the
 receiving runner.
@@ -119,15 +185,17 @@ still use consistent checkout layouts for the best hit rate.
 
 | Command | Purpose |
 |---|---|
+| `bellows cargo <args>` | Run Cargo through the daemonless local cache |
 | `bellows run -- <command>` | Run Cargo-compatible work with the wrapper installed |
+| `bellows local -- <command>` | Run with a daemonless, durable user-level cache |
 | `bellows doctor` | Verify protocol, server, compiler, and fallback |
-| `bellows stats` | Show CAS size, actions, leases, hits, misses, and bypasses |
+| `bellows stats [--local]` | Show remote or local CAS size, actions, hits, misses, and bypasses |
 | `bellows explain` | Show recent invalidation and fallback reasons |
 | `bellows archive publish/restore` | Distribute immutable compile-once/test-many trees |
 | `bellows action run` | Cache a declared local Cargo/rustc action and final outputs |
 | `bellows remote run` | Schedule the same declared action on an authenticated executor |
 | `bellows analyze snapshot/compare` | Explain advisory source/API and downstream impact |
-| `bellows gc` | Evict old records and unreferenced blobs to a storage budget |
+| `bellows gc [--local]` | Evict old records and unreferenced blobs to a storage budget |
 | `bellowsd` | Run the durable HTTP CAS/action-cache service |
 
 Configuration is available as flags or `BELLOWS_SERVER`, `BELLOWS_AUTH_TOKEN`,
@@ -179,6 +247,10 @@ default, requires bearer authentication, and provides trusted-single-tenant
 process/workspace isolation—not a hostile multi-tenant security boundary.
 Declared Cargo actions require `--locked --offline`, a synthetic credential-free
 `CARGO_HOME`, and path-only or explicitly vendored dependencies.
+They preserve Cargo's environment/configuration rustflags, adding path remapping
+through a compiler wrapper. Restoring a declared output directory replaces its
+complete tree, including removal of obsolete files. Input/output overlap is
+rejected before execution; overlapping output declarations share one replacement.
 The client and server reject path-qualified cargo/rustc wrappers, absolute
 arguments, and parent traversal. Build scripts invoking additional host tools
 remain a trusted-worker-image boundary until tracing or worker attestation is

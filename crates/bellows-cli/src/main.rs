@@ -1415,6 +1415,13 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
         "protocol changed".into(),
         digest_bytes(PROTOCOL_VERSION.to_string().as_bytes()),
     );
+    // Earlier captures treated every backslash as a Make escape and could
+    // omit the real dependency. Never reuse those compiler manifests.
+    let dep_info_format = b"rustc-space-escape-v2";
+    components.insert(
+        "dependency parser changed".into(),
+        digest_bytes(dep_info_format),
+    );
     let mut hasher = blake3::Hasher::new();
     hash_field(
         &mut hasher,
@@ -1422,6 +1429,7 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
         PROTOCOL_VERSION.to_string().as_bytes(),
     );
     hash_field(&mut hasher, "compiler", &compiler.stdout);
+    hash_field(&mut hasher, "dep-info-format", dep_info_format);
     for arg in &normalized_args {
         hash_field(&mut hasher, "arg", arg.as_bytes());
     }
@@ -2763,6 +2771,7 @@ fn run_sandbox_command(workspace: &Path, request: &ExecuteRequest) -> Result<std
         .env("HOME", "/homeless-shelter")
         .env("CARGO_HOME", ".bellows-cargo-home")
         .env("CARGO_NET_OFFLINE", "true")
+        .envs(bellows_core::execution::platform_environment())
         .envs(&request.environment);
     command.env("RUSTUP_HOME", rustup_home());
     if let Some(value) = &request.platform.rustup_toolchain {
@@ -3378,7 +3387,10 @@ mod tests {
         let stderr = format!("warning in {}", workspace.display()).into_bytes();
         let captured =
             capture_outputs(&invocation, &identity, stdout.clone(), stderr.clone()).unwrap();
-        assert_eq!(captured.candidate.files[0].path, "$WORKSPACE/src/lib.rs");
+        assert_eq!(
+            captured.candidate.files[0].path,
+            format!("$WORKSPACE{0}src{0}lib.rs", std::path::MAIN_SEPARATOR)
+        );
         assert_eq!(
             captured.candidate.stdout.len,
             identity.normalizer.normalize_bytes(&stdout).len() as u64

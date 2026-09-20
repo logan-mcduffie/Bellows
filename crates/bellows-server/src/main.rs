@@ -679,6 +679,7 @@ fn execute_declared(
         .env("HOME", "/homeless-shelter")
         .env("CARGO_HOME", ".bellows-cargo-home")
         .env("CARGO_NET_OFFLINE", "true")
+        .envs(bellows_core::execution::platform_environment())
         .envs(&request.environment);
     command.env("RUSTUP_HOME", rustup_home());
     if let Some(value) = &platform.rustup_toolchain {

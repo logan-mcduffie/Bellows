@@ -131,6 +131,49 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+#[cfg(any(unix, windows))]
+fn link_directory(f: &Fixture, source: &std::path::Path, destination: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        let _ = f;
+        std::os::unix::fs::symlink(source, destination).unwrap();
+    }
+    #[cfg(windows)]
+    {
+        // NTFS junctions need neither administrator rights nor Developer Mode.
+        checked(
+            f.command("cmd")
+                .args(["/D", "/C", "mklink", "/J"])
+                .arg(destination)
+                .arg(source),
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn junction_retargeting_never_restores_old_code() {
+    let f = Fixture::new(
+        "#[path=\"../selected/value.rs\"] mod selected; pub fn value() -> u32 { selected::value() }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    let link = f.workspace.join("selected");
+    for value in [1, 2] {
+        let source = f.temp.path().join(format!("source-{value}"));
+        fs::create_dir(&source).unwrap();
+        fs::write(
+            source.join("value.rs"),
+            format!("pub fn value() -> u32 {{ {value} }}"),
+        )
+        .unwrap();
+        link_directory(&f, &source, &link);
+        assert!(stderr(&f.build()).contains("symlinked compiler input"));
+        assert_eq!(f.value("target"), value.to_string());
+        fs::remove_dir(&link).unwrap();
+        f.clean();
+    }
+}
+
 #[test]
 fn embedded_environment_paths_are_not_reused_between_checkouts() {
     let mut f = Fixture::new(
@@ -452,7 +495,7 @@ fn explain_finds_default_local_log_and_honors_event_log_override() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn restore_refuses_symlink_destinations_without_touching_other_outputs() {
     let f = Fixture::new("pub fn value() {}", "fn main() {}");
@@ -477,7 +520,7 @@ fn restore_refuses_symlink_destinations_without_touching_other_outputs() {
     let elsewhere = f.temp.path().join("elsewhere");
     fs::create_dir(&elsewhere).unwrap();
     fs::write(elsewhere.join("keep"), "untouched").unwrap();
-    std::os::unix::fs::symlink(&elsewhere, f.workspace.join("output")).unwrap();
+    link_directory(&f, &elsewhere, &f.workspace.join("output"));
     let rejected = build();
     assert!(!rejected.status.success());
     assert!(!stderr(&rejected).contains("stale cached result will be rebuilt"));
@@ -613,6 +656,7 @@ fn waiting_build_reacquires_released_lease_without_timing_out() {
                 }
                 Err(error) => panic!("accept: {error}"),
             };
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();

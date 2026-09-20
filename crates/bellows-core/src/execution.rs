@@ -9,6 +9,39 @@ use std::process::{Command, ExitStatus};
 pub const REMAP_ENV: &str = "BELLOWS_DECLARED_REMAP";
 const INNER_WRAPPER_ENV: &str = "BELLOWS_DECLARED_INNER_WRAPPER";
 
+// These are needed for Windows SDK/linker discovery and a writable temp root
+// after env_clear(). They are included in PlatformIdentity's environment digest
+// so declared results cannot cross differing host-tool configurations.
+pub fn platform_environment() -> BTreeMap<String, String> {
+    #[cfg(windows)]
+    {
+        [
+            "SystemRoot",
+            "WINDIR",
+            "ProgramFiles",
+            "ProgramFiles(x86)",
+            "ProgramW6432",
+            "TEMP",
+            "TMP",
+        ]
+        .into_iter()
+        .filter_map(|name| std::env::var(name).ok().map(|value| (name.into(), value)))
+        .collect()
+    }
+    #[cfg(not(windows))]
+    BTreeMap::new()
+}
+
+pub fn platform_path_digest() -> String {
+    let path = std::env::var("PATH").unwrap_or_default();
+    #[cfg(windows)]
+    {
+        crate::digest_bytes(&serde_json::to_vec(&(path, platform_environment())).unwrap())
+    }
+    #[cfg(not(windows))]
+    crate::digest_bytes(path.as_bytes())
+}
+
 pub fn configure_cargo_remapping(
     command: &mut Command,
     workspace: &Path,

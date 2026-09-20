@@ -48,6 +48,9 @@ Nothing from the demo is retained outside its temporary directory.
 
 ## Manual use
 
+For native Windows, use the [PowerShell qualification instructions](docs/windows.md).
+The Windows CI job runs the same `scripts/windows-check.ps1` checks.
+
 ### Local builds
 
 No daemon is required for a persistent local cache:

@@ -143,14 +143,14 @@ pub fn validate_normalized_input_path(value: &str) -> Result<()> {
         value == **root
             || value
                 .strip_prefix(**root)
-                .is_some_and(|suffix| suffix.starts_with('/'))
+                .is_some_and(|suffix| suffix.starts_with(['/', '\\']))
     }) else {
         bail!("normalized input path has no recognized root: {value}")
     };
     let suffix = value
         .strip_prefix(root)
         .unwrap_or_default()
-        .trim_start_matches('/');
+        .trim_start_matches(['/', '\\']);
     if suffix.is_empty()
         || suffix
             .split(['/', '\\'])
@@ -298,7 +298,7 @@ impl PlatformIdentity {
             cargo: command_version("cargo")?,
             os: std::env::consts::OS.into(),
             arch: std::env::consts::ARCH.into(),
-            path_digest: digest_bytes(std::env::var("PATH").unwrap_or_default().as_bytes()),
+            path_digest: execution::platform_path_digest(),
             rustup_home_digest: digest_bytes(rustup_home().to_string_lossy().as_bytes()),
             rustup_toolchain: std::env::var("RUSTUP_TOOLCHAIN")
                 .ok()
@@ -1183,6 +1183,7 @@ pub fn validate_declared_command(command: &[String]) -> Result<()> {
         let windows_absolute =
             payload.as_bytes().get(1) == Some(&b':') || payload.starts_with("\\\\");
         if Path::new(payload).is_absolute()
+            || payload.starts_with(['/', '\\'])
             || windows_absolute
             || payload.split(['/', '\\']).any(|segment| segment == "..")
         {

@@ -1299,7 +1299,10 @@ fn normalizer(workspace: &Path, out_dir: &Path) -> PathNormalizer {
     let target = target_root(workspace, out_dir);
     let mut bases = vec![("$WORKSPACE".into(), workspace.to_path_buf())];
     if let Some(target) = target {
-        bases.push(("$TARGET".into(), canonical_base(target)));
+        bases.push(("$TARGET".into(), canonical_base(target.clone())));
+        // Retain the caller's spelling too: Windows temp directories may use
+        // 8.3 names that canonicalize() expands to a different path string.
+        bases.push(("$TARGET".into(), target));
     }
     let home = bellows_core::user_home();
     if let Some(cargo_home) = env::var_os("CARGO_HOME")

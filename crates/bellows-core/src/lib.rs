@@ -1468,6 +1468,14 @@ mod tests {
     }
 
     #[test]
+    fn normalized_windows_paths_keep_the_same_traversal_boundary() {
+        assert!(validate_normalized_input_path(r"$WORKSPACE\src\lib.rs").is_ok());
+        assert!(validate_normalized_input_path(r"$WORKSPACE\..\escape.rs").is_err());
+        assert!(validate_normalized_input_path(r"C:\outside\lib.rs").is_err());
+        assert!(validate_normalized_input_path(r"\\server\share\lib.rs").is_err());
+    }
+
+    #[test]
     fn archive_names_are_publish_once() {
         let root = std::env::temp_dir().join(format!("bellows-archive-test-{}", now_ms()));
         let store = Store::open(&root).unwrap();
@@ -1588,6 +1596,8 @@ mod tests {
                 "--manifest-path=../../Cargo.toml".into(),
             ],
             vec!["rustc".into(), "/tmp/ambient.rs".into()],
+            vec!["rustc".into(), r"\rooted\ambient.rs".into()],
+            vec!["rustc".into(), r"C:ambient.rs".into()],
             vec!["/tmp/cargo".into(), "--locked".into(), "--offline".into()],
         ] {
             assert!(validate_declared_command(&command).is_err());

@@ -9,6 +9,9 @@ $PSNativeCommandUseErrorActionPreference = $false
 if (-not $IsWindows) { throw 'Run this check on native Windows, not WSL.' }
 $repo = Split-Path $PSScriptRoot -Parent
 $report = [IO.Path]::GetFullPath($ReportDirectory)
+if ((Test-Path $report) -and @(Get-ChildItem -Force $report).Count -ne 0) {
+    throw 'Use a new or empty report directory so cold-cache checks start clean.'
+}
 New-Item -ItemType Directory -Force $report | Out-Null
 $log = Join-Path $report 'checks.log'
 $originalEnvironment = @{}

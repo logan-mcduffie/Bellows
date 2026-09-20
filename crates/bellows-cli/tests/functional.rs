@@ -192,7 +192,8 @@ fn embedded_environment_paths_are_not_reused_between_checkouts() {
     assert_eq!(f.value("target"), f.workspace.to_str().unwrap());
     assert!(stderr(&result).contains("environment changed: CARGO_MANIFEST_DIR"));
     f.clean();
-    assert!(stderr(&f.build()).contains("LOCAL HIT"));
+    let warm = stderr(&f.build());
+    assert!(warm.contains("LOCAL HIT"), "{warm}");
 }
 
 #[cfg(unix)]
@@ -380,7 +381,8 @@ fn diagnostics_distinguish_source_environment_flags_corruption_and_sessions() {
     assert_eq!(first["decisions"]["miss"], 1);
     let first_id = first["session_ids"][0].as_str().unwrap().to_owned();
     f.clean();
-    assert!(stderr(&f.build()).contains("LOCAL HIT"));
+    let warm = stderr(&f.build());
+    assert!(warm.contains("LOCAL HIT"), "{warm}");
     let summary = f.explain(&["--latest", "--summary"]);
     assert_eq!(summary["decisions"]["l1_hit"], 1);
     assert!(summary["decisions"].get("miss").is_none());
@@ -394,7 +396,14 @@ fn diagnostics_distinguish_source_environment_flags_corruption_and_sessions() {
     )
     .unwrap();
     f.clean();
-    assert!(stderr(&f.build()).contains("input changed: $WORKSPACE/src/value.rs"));
+    let edited = stderr(&f.build());
+    assert!(
+        edited.contains(&format!(
+            "input changed: $WORKSPACE{0}src{0}value.rs",
+            std::path::MAIN_SEPARATOR
+        )),
+        "{edited}"
+    );
     let events = f.explain(&["--latest", "--crate", "fixture"]);
     assert!(
         events
@@ -410,7 +419,14 @@ fn diagnostics_distinguish_source_environment_flags_corruption_and_sessions() {
     )
     .unwrap();
     f.clean();
-    assert!(stderr(&f.build()).contains("explicit input changed: $WORKSPACE/src/lib.rs"));
+    let edited = stderr(&f.build());
+    assert!(
+        edited.contains(&format!(
+            "explicit input changed: $WORKSPACE{0}src{0}lib.rs",
+            std::path::MAIN_SEPARATOR
+        )),
+        "{edited}"
+    );
     f.clean();
     let flags = checked(
         f.local()

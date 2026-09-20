@@ -3353,7 +3353,10 @@ mod tests {
         fs::write(out_dir.join(rmeta_name), b"metadata").unwrap();
         fs::write(
             out_dir.join(dep_name),
-            format!("{rmeta_name}: {}/src/../src/lib.rs\n", workspace.display()),
+            format!(
+                "{rmeta_name}: {}\n",
+                source.to_string_lossy().replace(' ', "\\ ")
+            ),
         )
         .unwrap();
         let invocation = Invocation {

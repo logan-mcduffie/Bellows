@@ -192,7 +192,7 @@ still use consistent checkout layouts for the best hit rate.
 | `bellows run -- <command>` | Run Cargo-compatible work with the wrapper installed |
 | `bellows local -- <command>` | Run with a daemonless, durable user-level cache |
 | `bellows doctor` | Verify protocol, server, compiler, and fallback |
-| `bellows stats [--local]` | Show remote or local CAS size, actions, hits, misses, and bypasses |
+| `bellows stats [--local]` | Show CAS size and decisions grouped as reused, rebuilt (with causes), not cacheable by design, and problems |
 | `bellows explain` | Show recent invalidation and fallback reasons |
 | `bellows archive publish/restore` | Distribute immutable compile-once/test-many trees |
 | `bellows action run` | Cache a declared local Cargo/rustc action and final outputs |
@@ -215,6 +215,14 @@ Color is automatic for interactive terminals and supported CI providers,
 including GitHub Actions. Set `BELLOWS_COLOR=always|never|auto` to override
 detection; `NO_COLOR` and `TERM=dumb` disable color in automatic mode. JSON
 output remains free of styling and safe to pipe into other tools.
+
+`BELLOWS_OUTPUT` sets how much of each build's decision stream is printed:
+`events` (default) prints one line per cache decision; `summary` prints only
+problems as they happen (fallbacks and corrupt entries) plus each wrapped
+build's closing summary, which suits CI logs; `quiet` prints errors only. Every
+decision is still recorded for `bellows stats` and `bellows explain`.
+Configuration such as `BELLOWS_L1=0` is reported once by `bellows doctor`, never
+as the reason for an individual miss.
 
 ## Manifold
 

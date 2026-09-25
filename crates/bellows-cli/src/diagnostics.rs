@@ -165,11 +165,21 @@ pub fn read_log(path: &Path) -> Result<Vec<Event>> {
     Ok(events)
 }
 
+// Miss explanations. `reason_code` classifies misses by these phrases, so the
+// wording and the classification change together. Retained logs may still hold
+// the earlier phrasing, which remains recognised.
+const NOT_CACHED_YET: &str = "not cached yet: first build of this crate seen here";
+const BUILD_VARIANT: &str = "not cached: differs from an earlier build of this crate:";
+const ENTRY_GONE: &str = "not cached: built before, but its entry was evicted or never saved";
+const LEGACY_NOT_CACHED_YET: &str = "first observed identity";
+const LEGACY_BUILD_VARIANT: &str = "static identity changed:";
+const LEGACY_ENTRY_GONE: &str = "previously observed identity";
+
 pub fn reason_code(kind: &str, detail: &str) -> &'static str {
-    if detail.contains("static identity changed:") && detail.contains("compiler version changed") {
+    let variant = detail.contains(BUILD_VARIANT) || detail.contains(LEGACY_BUILD_VARIANT);
+    if variant && detail.contains("compiler version changed") {
         "compiler_changed"
-    } else if detail.contains("static identity changed:") && detail.contains("environment changed:")
-    {
+    } else if variant && detail.contains("environment changed:") {
         "environment_changed"
     } else if detail.contains("input disappeared:") {
         "input_missing"
@@ -177,11 +187,11 @@ pub fn reason_code(kind: &str, detail: &str) -> &'static str {
         "input_changed"
     } else if detail.contains("environment changed:") {
         "environment_changed"
-    } else if detail.contains("static identity changed:") {
+    } else if variant {
         "identity_changed"
-    } else if detail.contains("first observed identity") {
+    } else if detail.contains(NOT_CACHED_YET) || detail.contains(LEGACY_NOT_CACHED_YET) {
         "cold_identity"
-    } else if detail.contains("previously observed identity") {
+    } else if detail.contains(ENTRY_GONE) || detail.contains(LEGACY_ENTRY_GONE) {
         "entry_missing"
     } else if detail.contains("remote unavailable") {
         "remote_unavailable"
@@ -298,7 +308,112 @@ pub fn summarize(events: &[Event]) -> Summary {
 }
 
 pub fn print_summary(summary: &Summary, limit: usize) {
-    for reason in summary.reasons.iter().take(limit) {
+    print_reasons(summary.reasons.iter(), limit);
+}
+
+/// Examples for rebuilt work and problems. Bypasses are by design and already
+/// counted by [`print_grouped`].
+pub fn print_details(summary: &Summary, limit: usize) {
+    print_reasons(
+        summary
+            .reasons
+            .iter()
+            .filter(|reason| reason.kind != "bypass"),
+        limit,
+    );
+}
+
+const REUSED: &[&str] = &["hit", "l1_hit", "single_flight"];
+const REBUILT: &[&str] = &["miss"];
+const NOT_CACHEABLE: &[&str] = &["bypass"];
+const PROBLEMS: &[&str] = &["fallback", "corrupt"];
+const STORED: &[&str] = &["store"];
+
+/// Decisions grouped by meaning: reused work, rebuilt work and why, work that
+/// Bellows never caches by design, and actual problems. Intentional
+/// configuration and by-design bypasses must not read like failures.
+pub fn print_grouped(summary: &Summary, color: bool) {
+    let count = |kinds: &[&str]| {
+        kinds
+            .iter()
+            .map(|kind| summary.decisions.get(*kind).copied().unwrap_or(0))
+            .sum::<u64>()
+    };
+    let breakdown = |kinds: &[&str]| {
+        summary
+            .reasons
+            .iter()
+            .filter(|reason| kinds.contains(&reason.kind.as_str()))
+            .map(|reason| format!("{} {}", reason_label(&reason.reason), reason.count))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    };
+    let line = |key: &str, value: u64, detail: String| {
+        let row = crate::terminal::key_value(color, key, value);
+        if detail.is_empty() {
+            println!("{row}");
+        } else {
+            println!("{row}  {detail}");
+        }
+    };
+    line("reused", count(REUSED), String::new());
+    line("rebuilt", count(REBUILT), breakdown(REBUILT));
+    let bypassed = breakdown(NOT_CACHEABLE);
+    line(
+        "not cacheable",
+        count(NOT_CACHEABLE),
+        if bypassed.is_empty() {
+            bypassed
+        } else {
+            format!("by design: {bypassed}")
+        },
+    );
+    let problems = count(PROBLEMS);
+    line(
+        "problems",
+        problems,
+        if problems == 0 {
+            "none".into()
+        } else {
+            breakdown(PROBLEMS)
+        },
+    );
+    if count(STORED) > 0 {
+        line("stored", count(STORED), String::new());
+    }
+    for (kind, value) in &summary.decisions {
+        if ![REUSED, REBUILT, NOT_CACHEABLE, PROBLEMS, STORED]
+            .iter()
+            .any(|group| group.contains(&kind.as_str()))
+        {
+            line(&kind.replace('_', " "), *value, String::new());
+        }
+    }
+}
+
+/// Plain-language names for reason codes in grouped statistics.
+fn reason_label(reason: &str) -> String {
+    match reason {
+        "cold_identity" => "not cached yet",
+        "identity_changed" => "build variant",
+        "environment_changed" => "environment differs",
+        "compiler_changed" => "compiler changed",
+        "input_changed" => "inputs changed",
+        "input_missing" => "input missing",
+        "entry_missing" => "evicted or never saved",
+        "artifact_unavailable" => "artifact unavailable",
+        "proc_macro" => "proc macros",
+        "linked_output" => "linked outputs",
+        "unsupported_outputs" => "unmodeled outputs",
+        "native_inputs" => "native inputs",
+        "compiler_probe" => "compiler probes",
+        other => return other.replace('_', " "),
+    }
+    .into()
+}
+
+fn print_reasons<'a>(reasons: impl Iterator<Item = &'a ReasonSummary>, limit: usize) {
+    for reason in reasons.take(limit) {
         println!(
             "{:>6} {} / {} · {} crate(s): {}{}",
             reason.count,
@@ -372,23 +487,36 @@ impl BuildSession {
             Some(self.started.elapsed().as_millis() as u64),
             &format!("wrapped command exited {code}"),
         );
+        if !crate::terminal::Output::from_env().prints_build_summary() {
+            return;
+        }
         if let Ok(events) = read_log(&self.log) {
             let events = events
                 .into_iter()
                 .filter(|e| e.session_id.as_ref() == Some(&self.id))
                 .collect::<Vec<_>>();
             let summary = summarize(&events);
-            let count = |kind: &str| summary.decisions.get(kind).copied().unwrap_or(0);
+            let count = |kinds: &[&str]| {
+                kinds
+                    .iter()
+                    .map(|kind| summary.decisions.get(*kind).copied().unwrap_or(0))
+                    .sum::<u64>()
+            };
             eprintln!(
-                "Bellows build {} · {:.2}s · {} hits · {} misses · {} bypasses · {} fallbacks",
+                "Bellows build {} · {:.2}s · {} reused · {} rebuilt · {} not cacheable · {} problems",
                 self.id,
                 self.started.elapsed().as_secs_f64(),
-                count("hit") + count("l1_hit"),
-                count("miss"),
-                count("bypass"),
-                count("fallback")
+                count(REUSED),
+                count(REBUILT),
+                count(NOT_CACHEABLE),
+                count(PROBLEMS)
             );
-            for group in summary.reasons.iter().take(6) {
+            for group in summary
+                .reasons
+                .iter()
+                .filter(|group| group.kind != "bypass")
+                .take(6)
+            {
                 eprintln!(
                     "  {} {} / {} · {}",
                     group.count,
@@ -449,21 +577,22 @@ pub fn remember_identity(state: &Path, group: &str, current: &Fingerprint) -> Re
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
         Err(e) => return Err(e.into()),
     };
+    // Only this workspace's own history is compared, so a fresh CI runner calls
+    // every miss "not cached yet" rather than guessing at a cause.
     let explanation = if history.iter().any(|old| old.key == current.key) {
-        "previously observed identity has no usable cache entry; it may have been evicted or never published".into()
+        ENTRY_GONE.into()
     } else if let Some((old, changes)) = history
         .iter()
         .map(|old| (old, fingerprint_changes(old, current)))
         .min_by_key(|(_, changes)| changes.len())
     {
         format!(
-            "static identity changed: {} (compared with {})",
+            "{BUILD_VARIANT} {} (compared with {})",
             changes.join("; "),
             &old.key[..old.key.len().min(12)]
         )
     } else {
-        "first observed identity; no earlier local identity to compare (cold cache or new crate)"
-            .into()
+        NOT_CACHED_YET.into()
     };
     history.retain(|old| old.key != current.key);
     history.insert(0, current.clone());
@@ -624,7 +753,7 @@ mod tests {
         assert!(
             remember_identity(temp.path(), "fixture", &first)
                 .unwrap()
-                .contains("first observed")
+                .contains(NOT_CACHED_YET)
         );
         let next = Fingerprint {
             key: digest_bytes(b"next"),
@@ -635,11 +764,12 @@ mod tests {
         };
         let detail = remember_identity(temp.path(), "fixture", &next).unwrap();
         assert!(detail.contains("environment changed: RUSTFLAGS"));
+        assert_eq!(reason_code("miss", &detail), "environment_changed");
         assert!(!detail.contains("a_secret_value"));
         assert!(
             remember_identity(temp.path(), "fixture", &first)
                 .unwrap()
-                .contains("previously observed")
+                .contains(ENTRY_GONE)
         );
         for i in 0..20 {
             let mut fp = next.clone();
@@ -659,6 +789,42 @@ mod tests {
             8
         );
         assert!(!String::from_utf8(bytes).unwrap().contains("a_new_secret"));
+    }
+
+    #[test]
+    fn miss_explanations_and_their_legacy_phrasing_share_reason_codes() {
+        for (current, legacy, code) in [
+            (
+                NOT_CACHED_YET.to_owned(),
+                "first observed identity; no earlier local identity to compare (cold cache or new crate)",
+                "cold_identity",
+            ),
+            (
+                ENTRY_GONE.to_owned(),
+                "previously observed identity has no usable cache entry; it may have been evicted or never published",
+                "entry_missing",
+            ),
+            (
+                format!("{BUILD_VARIANT} argument --cfg (a1 → b2) (compared with c3)"),
+                "static identity changed: argument --cfg (a1 → b2) (compared with c3)",
+                "identity_changed",
+            ),
+            (
+                format!("{BUILD_VARIANT} compiler version changed (compared with c3)"),
+                "static identity changed: compiler version changed (compared with c3)",
+                "compiler_changed",
+            ),
+        ] {
+            assert_eq!(reason_code("miss", &current), code, "{current}");
+            assert_eq!(reason_code("miss", legacy), code, "{legacy}");
+        }
+        // Explanations describe the miss; none names disabled configuration.
+        for detail in [NOT_CACHED_YET, ENTRY_GONE, BUILD_VARIANT] {
+            assert!(!detail.contains("disabled"));
+        }
+        assert_eq!(reason_label("cold_identity"), "not cached yet");
+        assert_eq!(reason_label("linked_output"), "linked outputs");
+        assert_eq!(reason_label("some_new_reason"), "some new reason");
     }
 
     #[test]

@@ -33,7 +33,42 @@ An ordinary Cargo no-op build correctly reports zero compiler-cache decisions.
 Direct `RUSTC_WRAPPER` use without a Bellows parent produces ungrouped events;
 omit `--latest` to inspect those, or wrap the Cargo command with `bellows run`.
 
+## Reading the output
+
+`bellows stats` groups this workspace's decisions by what they mean:
+
+```text
+This workspace
+  reused             1218
+  rebuilt             206  not cached yet 90 · environment differs 100 · evicted or never saved 16
+  not cacheable       856  by design: linked outputs 249 · proc macros 246 · unmodeled outputs 174
+  problems              0  none
+  stored              206
+```
+
+*Rebuilt* work was compiled because no usable entry existed; its causes use the
+reason codes below. *Not cacheable* work is outside the transparent cache's
+correctness boundary by design (see bypasses below) and never indicates a
+fault. *Problems* are fallbacks and corrupt entries, the only decisions that
+call for action. Examples follow for rebuilt work and problems.
+
+`BELLOWS_OUTPUT` controls the live stream: `events` (default) prints one line per
+decision, `summary` prints only problems plus each wrapped build's closing line,
+and `quiet` prints errors only. All decisions are recorded regardless. CI logs
+are clearest with `summary` followed by `bellows stats`.
+
+Configuration is not a miss cause. `bellows doctor` reports the local cache
+(`off (BELLOWS_L1=0)` or `on`) and the output level once; an individual miss
+names the local cache only when it failed to open, alongside that fallback.
+
 ## What a miss means
+
+A miss explanation starts with `not cached yet:` (no earlier build of this crate
+variant was seen here), `not cached: differs from an earlier build of this
+crate:` followed by what differs, or `not cached: built before, but its entry
+was evicted or never saved`. Logs written before this wording used
+`first observed identity`, `static identity changed:` and `previously observed
+identity`; both forms map to the same reason codes.
 
 | Reason | Evidence and next step |
 |---|---|

@@ -1004,7 +1004,8 @@ fn cache_or_compile(raw: &[OsString]) -> Result<ExitStatus> {
             }
         }
     };
-    let l1 = if env::var("BELLOWS_L1").as_deref() == Ok("0") {
+    let l1_disabled = env::var("BELLOWS_L1").as_deref() == Ok("0");
+    let l1 = if l1_disabled {
         None
     } else {
         let store = if local_only {
@@ -1101,8 +1102,10 @@ fn cache_or_compile(raw: &[OsString]) -> Result<ExitStatus> {
     if remote.is_some() && !remote_available {
         reasons.push("remote unavailable (see fallback event for request error)".into());
     }
-    if l1.is_none() {
-        reasons.push("local cache disabled or unavailable".into());
+    // An L1 turned off with BELLOWS_L1=0 is configuration, reported once by
+    // `doctor`; only a failure to open it (already a fallback) explains a miss.
+    if l1.is_none() && !l1_disabled {
+        reasons.push("local cache unavailable (see fallback event)".into());
     }
     if local_index.candidates.is_empty() && index.candidates.is_empty() {
         reasons.push(identity_hint);
@@ -2142,10 +2145,7 @@ fn record_event_duration(
     if let Err(error) = diagnostics::append(&event_log_path(), &event) {
         eprintln!("Bellows diagnostics unavailable: {error:#}");
     }
-    if matches!(
-        kind,
-        "hit" | "l1_hit" | "miss" | "bypass" | "fallback" | "wait" | "single_flight" | "corrupt"
-    ) {
+    if terminal::Output::from_env().prints(kind) {
         eprintln!(
             "{}",
             terminal::status(terminal::stderr_color(), kind, crate_name, detail)
@@ -2187,6 +2187,20 @@ fn doctor(server: &str, token: Option<&str>) -> Result<()> {
     println!(
         "{}",
         terminal::success(color, "fallback", "official rustc enabled")
+    );
+    let l1 = if env::var("BELLOWS_L1").as_deref() == Ok("0") {
+        "off (BELLOWS_L1=0)"
+    } else {
+        "on"
+    };
+    println!("{}", terminal::success(color, "local cache", l1));
+    println!(
+        "{}",
+        terminal::success(
+            color,
+            "output",
+            &format!("{} (BELLOWS_OUTPUT)", terminal::Output::from_env().name())
+        )
     );
     Ok(())
 }
@@ -2252,13 +2266,8 @@ fn show_stats(
             terminal::key_value(color, "active leases", remote.active_leases)
         );
         println!("{}", terminal::section(color, "This workspace"));
-        for (kind, count) in events {
-            println!(
-                "{}",
-                terminal::key_value(color, &kind.replace('_', " "), count)
-            );
-        }
-        diagnostics::print_summary(&diagnostics, 6);
+        diagnostics::print_grouped(&diagnostics, color);
+        diagnostics::print_details(&diagnostics, 6);
     }
     Ok(())
 }
@@ -2303,13 +2312,8 @@ fn show_local_stats(selection: &diagnostics::Selection, json: bool) -> Result<()
         "{}",
         terminal::section(color, "Selected decisions (retained log)")
     );
-    for (kind, count) in events {
-        println!(
-            "{}",
-            terminal::key_value(color, &kind.replace('_', " "), count)
-        );
-    }
-    diagnostics::print_summary(&diagnostics, 6);
+    diagnostics::print_grouped(&diagnostics, color);
+    diagnostics::print_details(&diagnostics, 6);
     Ok(())
 }
 

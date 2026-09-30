@@ -3009,10 +3009,18 @@ fn check_bundled_members(invocation: &Invocation, rlib: &[u8], workspace: &Path)
 /// Cargo's home (`/bellows/cargo-home/registry/…`) rather than one shared
 /// `/bellows/workspace`.
 fn remap_plan(identity: &Identity) -> Vec<(Vec<String>, String)> {
+    // rustc reverse-maps a virtual path (to reopen a dependency's source for
+    // a diagnostic snippet) only when exactly one mapping produces it, so
+    // list only spellings rustc can see: never the verbatim form, and on
+    // Windows never the forward-slash duplicate.
     let usable = |spellings: Vec<String>| {
+        let mut seen = BTreeSet::new();
         spellings
             .into_iter()
-            .filter(|spelling| !spelling.starts_with(r"\\?\"))
+            .filter(|spelling| {
+                !spelling.starts_with(r"\\?\") && !(cfg!(windows) && spelling.contains('/'))
+            })
+            .filter(|spelling| seen.insert(spelling.clone()))
             .collect::<Vec<_>>()
     };
     let canonical = |spellings: &[String]| {
@@ -3027,11 +3035,12 @@ fn remap_plan(identity: &Identity) -> Vec<(Vec<String>, String)> {
                 .collect::<Vec<_>>()
         })
     };
+    // Native separators below the virtual root, as rustc joins them.
     let under = |base: &str, parts: Vec<String>| {
         std::iter::once(base.to_owned())
             .chain(parts)
             .collect::<Vec<_>>()
-            .join("/")
+            .join(std::path::MAIN_SEPARATOR_STR)
     };
     let cargo_home = identity.normalizer.spellings("$CARGO_HOME");
     let checkout = identity.root_normalizer.spellings("$CHECKOUT");

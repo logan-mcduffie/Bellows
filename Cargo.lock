@@ -143,6 +143,7 @@ dependencies = [
  "blake3",
  "clap",
  "fs2",
+ "memchr",
  "reqwest",
  "serde",
  "serde_json",

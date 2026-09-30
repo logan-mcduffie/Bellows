@@ -582,18 +582,19 @@ fn diagnostics_distinguish_source_environment_flags_corruption_and_sessions() {
     )
     .unwrap();
     f.build();
+    // The library and the final binary are both cacheable.
     let first = f.explain(&["--latest", "--summary"]);
-    assert_eq!(first["decisions"]["miss"], 1);
+    assert_eq!(first["decisions"]["miss"], 2);
     let first_id = first["session_ids"][0].as_str().unwrap().to_owned();
     f.clean();
     let warm = stderr(&f.build());
     assert!(warm.contains("LOCAL HIT"), "{warm}");
     let summary = f.explain(&["--latest", "--summary"]);
-    assert_eq!(summary["decisions"]["l1_hit"], 1);
+    assert_eq!(summary["decisions"]["l1_hit"], 2);
     assert!(summary["decisions"].get("miss").is_none());
     assert_eq!(
         f.explain(&["--session", &first_id, "--summary"])["decisions"]["miss"],
-        1
+        2
     );
     fs::write(
         f.workspace.join("src/value.rs"),
@@ -654,7 +655,7 @@ fn diagnostics_distinguish_source_environment_flags_corruption_and_sessions() {
     let key = events
         .iter()
         .rev()
-        .find(|e| e.kind == "l1_hit")
+        .find(|e| e.kind == "l1_hit" && e.detail.contains("library output"))
         .unwrap()
         .static_key
         .as_ref()
@@ -978,7 +979,8 @@ fn waiting_build_reacquires_released_lease_without_timing_out() {
     stopped.store(true, Ordering::SeqCst);
     server.join().unwrap();
     assert!(output.status.success(), "{}", stderr(&output));
-    assert_eq!(lease_requests.load(Ordering::SeqCst), 2);
+    // Library: wait, then acquire the released lease. Binary: acquire.
+    assert_eq!(lease_requests.load(Ordering::SeqCst), 3);
     let recorded = fs::read_to_string(events).unwrap();
     assert!(
         recorded.contains("\"kind\":\"lease_acquired\""),

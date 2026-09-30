@@ -582,18 +582,19 @@ fn diagnostics_distinguish_source_environment_flags_corruption_and_sessions() {
     )
     .unwrap();
     f.build();
+    // The library and the final binary are both cacheable.
     let first = f.explain(&["--latest", "--summary"]);
-    assert_eq!(first["decisions"]["miss"], 1);
+    assert_eq!(first["decisions"]["miss"], 2);
     let first_id = first["session_ids"][0].as_str().unwrap().to_owned();
     f.clean();
     let warm = stderr(&f.build());
     assert!(warm.contains("LOCAL HIT"), "{warm}");
     let summary = f.explain(&["--latest", "--summary"]);
-    assert_eq!(summary["decisions"]["l1_hit"], 1);
+    assert_eq!(summary["decisions"]["l1_hit"], 2);
     assert!(summary["decisions"].get("miss").is_none());
     assert_eq!(
         f.explain(&["--session", &first_id, "--summary"])["decisions"]["miss"],
-        1
+        2
     );
     fs::write(
         f.workspace.join("src/value.rs"),
@@ -654,7 +655,7 @@ fn diagnostics_distinguish_source_environment_flags_corruption_and_sessions() {
     let key = events
         .iter()
         .rev()
-        .find(|e| e.kind == "l1_hit")
+        .find(|e| e.kind == "l1_hit" && e.detail.contains("library output"))
         .unwrap()
         .static_key
         .as_ref()
@@ -978,7 +979,8 @@ fn waiting_build_reacquires_released_lease_without_timing_out() {
     stopped.store(true, Ordering::SeqCst);
     server.join().unwrap();
     assert!(output.status.success(), "{}", stderr(&output));
-    assert_eq!(lease_requests.load(Ordering::SeqCst), 2);
+    // Library: wait, then acquire the released lease. Binary: acquire.
+    assert_eq!(lease_requests.load(Ordering::SeqCst), 3);
     let recorded = fs::read_to_string(events).unwrap();
     assert!(
         recorded.contains("\"kind\":\"lease_acquired\""),
@@ -986,4 +988,758 @@ fn waiting_build_reacquires_released_lease_without_timing_out() {
     );
     assert!(!recorded.contains("\"kind\":\"fallback\""), "{recorded}");
     assert_eq!(f.value("target"), "42");
+}
+
+fn write_files(root: &std::path::Path, files: &[(&str, &str)]) {
+    for (path, contents) in files {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+}
+
+/// Copy the fixture's sources (not its target) into a sibling checkout.
+fn second_checkout(f: &mut Fixture, name: &str) {
+    fn copy(from: &std::path::Path, to: &std::path::Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            if name == "target" || name == ".bellows" {
+                continue;
+            }
+            if entry.file_type().unwrap().is_dir() {
+                copy(&entry.path(), &to.join(&name));
+            } else {
+                fs::copy(entry.path(), to.join(&name)).unwrap();
+            }
+        }
+    }
+    let other = f.temp.path().join(name);
+    copy(&f.workspace, &other);
+    f.workspace = other;
+}
+
+/// Cache decisions for one crate from wrapper status lines, e.g. "LOCAL HIT".
+fn decisions(output: &Output, crate_name: &str) -> Vec<String> {
+    stderr(output)
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let (label, rest) = line.split_once(&format!(" {crate_name} "))?;
+            let label = label.trim();
+            (!rest.is_empty() && label.chars().all(|c| c.is_ascii_uppercase() || c == ' '))
+                .then(|| label.to_owned())
+        })
+        .collect()
+}
+
+fn events(f: &Fixture) -> Vec<bellows_core::Event> {
+    fs::read_to_string(f.cache.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[test]
+fn test_harnesses_share_across_checkouts_unless_they_embed_a_checkout_path() {
+    let mut f = Fixture::new(
+        "pub fn value() -> u32 { 42 }\n#[cfg(test)] mod tests { #[test] fn unit() { assert_eq!(super::value(), 42); } }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    write_files(
+        &f.workspace,
+        &[
+            (
+                "tests/pure.rs",
+                "#[test] fn pure() { assert_eq!(fixture::value(), 42); assert!(file!().ends_with(\"pure.rs\")); }",
+            ),
+            (
+                "tests/baked.rs",
+                "#[test] fn baked() { let manifest = concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/Cargo.toml\"); assert!(std::fs::read_to_string(manifest).unwrap().contains(\"fixture\")); println!(\"BAKED={}\", env!(\"CARGO_MANIFEST_DIR\")); }",
+            ),
+        ],
+    );
+    f.lock();
+    let test = |f: &Fixture| {
+        checked(
+            f.local()
+                .args(["cargo", "test", "--offline", "--", "--nocapture"]),
+        )
+    };
+    let first = test(&f);
+    assert_eq!(
+        decisions(&first, "pure"),
+        ["CACHE MISS"],
+        "{}",
+        stderr(&first)
+    );
+    second_checkout(&mut f, "second checkout");
+    let second = test(&f);
+    let log = stderr(&second);
+    assert_eq!(decisions(&second, "pure"), ["LOCAL HIT"], "{log}");
+    assert_eq!(decisions(&second, "baked"), ["CACHE MISS"], "{log}");
+    assert!(
+        log.contains("environment changed: CARGO_MANIFEST_DIR"),
+        "{log}"
+    );
+    // The recompiled path-baking test reads this checkout's files.
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(
+        stdout.contains(&format!("BAKED={}", f.workspace.display())),
+        "{stdout}"
+    );
+    // Identical results: every harness passes in both checkouts.
+    let results = |output: &Output| {
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| line.starts_with("test ") && line.contains(" ... "))
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    assert_eq!(results(&first), results(&second));
+    assert_eq!(results(&second).len(), 3);
+    assert!(results(&second).iter().all(|line| line.ends_with("... ok")));
+
+    // A clean target in the same checkout restores even the pinned harness.
+    f.clean();
+    let warm = test(&f);
+    assert_eq!(
+        decisions(&warm, "baked"),
+        ["LOCAL HIT"],
+        "{}",
+        stderr(&warm)
+    );
+    if cfg!(windows) {
+        let deps = f.workspace.join("target/debug/deps");
+        let names = fs::read_dir(&deps)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        for suffix in [".exe", ".pdb"] {
+            assert!(
+                names
+                    .iter()
+                    .any(|name| name.starts_with("pure-") && name.ends_with(suffix)),
+                "restored {suffix} missing: {names:?}"
+            );
+        }
+    }
+}
+
+fn native_archive(f: &Fixture, value: i32) {
+    fs::create_dir_all(f.workspace.join("native")).unwrap();
+    fs::write(
+        f.workspace.join("native/value.c"),
+        format!("int native_value(void) {{ return {value}; }}"),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        checked(
+            f.command("cc")
+                .args(["-c", "native/value.c", "-o", "native/value.o"]),
+        );
+        let _ = fs::remove_file(f.workspace.join("native/libaudit_native.a"));
+        checked(
+            f.command("ar")
+                .args(["rcs", "native/libaudit_native.a", "native/value.o"]),
+        );
+    }
+    #[cfg(windows)]
+    {
+        let finder = PathBuf::from(std::env::var_os("ProgramFiles(x86)").unwrap())
+            .join("Microsoft Visual Studio/Installer/vswhere.exe");
+        let found = checked(f.command(finder).args([
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-property",
+            "installationPath",
+        ]));
+        let installation = PathBuf::from(String::from_utf8(found.stdout).unwrap().trim());
+        let version = fs::read_to_string(
+            installation.join("VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt"),
+        )
+        .unwrap();
+        let tools = installation
+            .join("VC/Tools/MSVC")
+            .join(version.trim())
+            .join("bin/Hostx64/x64");
+        checked(f.command(tools.join("cl.exe")).args([
+            "/nologo",
+            "/c",
+            "native/value.c",
+            "/Fonative/value.obj",
+        ]));
+        checked(f.command(tools.join("lib.exe")).args([
+            "/nologo",
+            "/OUT:native/audit_native.lib",
+            "native/value.obj",
+        ]));
+    }
+}
+
+#[test]
+fn native_library_changes_invalidate_a_cached_link() {
+    let f = Fixture::new("", "");
+    fs::write(
+        f.workspace.join("src/app.rs"),
+        "unsafe extern \"C\" { fn native_value() -> i32; } fn main() { println!(\"{}\", unsafe { native_value() }); }",
+    )
+    .unwrap();
+    let link = || {
+        checked(f.local().arg(BELLOWS).args([
+            "rustc",
+            "src/app.rs",
+            "--edition=2024",
+            "--crate-name=app",
+            "--crate-type=bin",
+            "--emit=dep-info,link",
+            "-Cextra-filename=-audit",
+            "--out-dir=out",
+            "-L",
+            "native=native",
+            "-l",
+            "static=audit_native",
+        ]))
+    };
+    let run = || {
+        let output = checked(
+            &mut f.command(
+                f.workspace
+                    .join(format!("out/app-audit{}", std::env::consts::EXE_SUFFIX)),
+            ),
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    native_archive(&f, 1);
+    assert_eq!(decisions(&link(), "app"), ["CACHE MISS"]);
+    assert_eq!(run(), "1");
+    fs::remove_dir_all(f.workspace.join("out")).unwrap();
+    let restored = link();
+    assert_eq!(
+        decisions(&restored, "app"),
+        ["LOCAL HIT"],
+        "{}",
+        stderr(&restored)
+    );
+    assert_eq!(run(), "1");
+    native_archive(&f, 2);
+    fs::remove_dir_all(f.workspace.join("out")).unwrap();
+    let relinked = link();
+    assert_eq!(
+        decisions(&relinked, "app"),
+        ["CACHE MISS"],
+        "{}",
+        stderr(&relinked)
+    );
+    assert!(
+        stderr(&relinked).contains("input changed"),
+        "{}",
+        stderr(&relinked)
+    );
+    assert_eq!(run(), "2");
+}
+
+#[test]
+fn incremental_compiles_publish_only_from_scratch_sessions() {
+    let mut f = Fixture::new(
+        "pub fn value() -> u32 { 1 }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    f.lock();
+    let build = |f: &Fixture| {
+        checked(
+            f.local()
+                .args(["cargo", "build", "--offline"])
+                .env("CARGO_INCREMENTAL", "1"),
+        )
+    };
+    let stored = |f: &Fixture| {
+        events(f)
+            .iter()
+            .filter(|e| e.kind == "store" && e.detail.contains("library output"))
+            .count()
+    };
+    build(&f);
+    assert_eq!(stored(&f), 1);
+    second_checkout(&mut f, "second checkout");
+    let restored = build(&f);
+    assert_eq!(decisions(&restored, "fixture"), ["LOCAL HIT", "LOCAL HIT"]);
+    // No session existed here: the first edit compiles from scratch.
+    fs::write(
+        f.workspace.join("src/lib.rs"),
+        "pub fn value() -> u32 { 2 }",
+    )
+    .unwrap();
+    build(&f);
+    assert_eq!(stored(&f), 2);
+    // The next edit reuses that session and stays in this checkout.
+    fs::write(
+        f.workspace.join("src/lib.rs"),
+        "pub fn value() -> u32 { 3 }",
+    )
+    .unwrap();
+    build(&f);
+    assert_eq!(stored(&f), 2);
+    assert!(
+        events(&f)
+            .iter()
+            .any(|e| e.kind == "not_stored" && e.detail.contains("reused an existing session"))
+    );
+    let binary = f.workspace.join(format!(
+        "target/debug/fixture{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    let output = checked(&mut f.command(binary));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "3");
+}
+
+#[test]
+fn proc_macro_consumers_share_across_checkouts() {
+    let mut f = Fixture::new(
+        "pub fn value() -> u32 { derive::answer!() }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    write_files(
+        &f.workspace,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[dependencies]\nderive={path=\"derive\"}\n[workspace]\nmembers=[\"derive\"]\n",
+            ),
+            (
+                "derive/Cargo.toml",
+                "[package]\nname=\"derive\"\nversion=\"0.1.0\"\nedition=\"2024\"\nbuild=\"build.rs\"\n[lib]\nproc-macro=true\n",
+            ),
+            // Like wit-bindgen: export the (empty) OUT_DIR and bake it in.
+            (
+                "derive/build.rs",
+                "fn main() { println!(\"cargo:rustc-env=MACRO_DEBUG_DIR={}\", std::env::var(\"OUT_DIR\").unwrap()); }",
+            ),
+            (
+                "derive/src/lib.rs",
+                "use proc_macro::TokenStream;\nconst DEBUG: &str = env!(\"MACRO_DEBUG_DIR\");\n#[proc_macro]\npub fn answer(_: TokenStream) -> TokenStream {\n    if std::env::var_os(\"FIXTURE_MACRO_DEBUG\").is_some() { std::fs::write(std::path::Path::new(DEBUG).join(\"expanded.rs\"), \"42\").unwrap(); }\n    \"42u32\".parse().unwrap()\n}\n",
+            ),
+        ],
+    );
+    f.lock();
+    f.build();
+    second_checkout(&mut f, "second checkout");
+    let restored = f.build();
+    let log = stderr(&restored);
+    assert_eq!(decisions(&restored, "derive"), ["LOCAL HIT"], "{log}");
+    assert_eq!(
+        decisions(&restored, "fixture"),
+        ["LOCAL HIT", "LOCAL HIT"],
+        "{log}"
+    );
+    assert!(log.contains("proc macros: derive"), "{log}");
+    assert_eq!(f.value("target"), "42");
+    // The substituted directory is real and writable for the macro.
+    f.clean();
+    checked(
+        f.local()
+            .args(["cargo", "build", "--release", "--offline"])
+            .env("FIXTURE_MACRO_DEBUG", "1")
+            .env("CARGO_INCREMENTAL", "0"),
+    );
+    assert_eq!(f.value("target"), "42");
+}
+
+#[test]
+fn restore_replaces_an_executable_that_is_still_running() {
+    let f = Fixture::new("", "");
+    fs::write(
+        f.workspace.join("src/app.rs"),
+        "fn main() { if std::env::args().nth(1).is_some() { std::thread::sleep(std::time::Duration::from_secs(20)); } println!(\"ready\"); }",
+    )
+    .unwrap();
+    let link = || {
+        checked(f.local().arg(BELLOWS).args([
+            "rustc",
+            "src/app.rs",
+            "--edition=2024",
+            "--crate-name=app",
+            "--crate-type=bin",
+            "--emit=dep-info,link",
+            "-Cextra-filename=-running",
+            "--out-dir=out",
+        ]))
+    };
+    assert_eq!(decisions(&link(), "app"), ["CACHE MISS"]);
+    let binary = f
+        .workspace
+        .join(format!("out/app-running{}", std::env::consts::EXE_SUFFIX));
+    // A test binary still executing (Windows locks its image) while Cargo
+    // asks for the same unit again.
+    let mut running = f.command(&binary).arg("wait").spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let restored = link();
+    assert_eq!(
+        decisions(&restored, "app"),
+        ["LOCAL HIT"],
+        "{}",
+        stderr(&restored)
+    );
+    let output = checked(&mut f.command(&binary));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ready");
+    running.kill().unwrap();
+    let _ = running.wait();
+}
+
+#[test]
+fn profiles_with_identical_compiler_arguments_share_results() {
+    let f = Fixture::new(
+        "pub fn value() -> u32 { 42 }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    let manifest = fs::read_to_string(f.workspace.join("Cargo.toml")).unwrap();
+    fs::write(
+        f.workspace.join("Cargo.toml"),
+        format!("{manifest}[profile.fast]\ninherits=\"release\"\n"),
+    )
+    .unwrap();
+    f.build();
+    let fast = checked(
+        f.local()
+            .args(["cargo", "build", "--profile", "fast", "--offline"]),
+    );
+    assert_eq!(
+        decisions(&fast, "fixture"),
+        ["LOCAL HIT", "LOCAL HIT"],
+        "{}",
+        stderr(&fast)
+    );
+    let output = checked(&mut f.command(f.workspace.join(format!(
+        "target/fast/fixture{}",
+        std::env::consts::EXE_SUFFIX
+    ))));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
+}
+
+#[test]
+fn read_only_clients_restore_but_never_publish() {
+    let f = Fixture::new(
+        "pub fn value() -> u32 { 42 }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    let read_only = || {
+        checked(
+            f.local()
+                .args(["cargo", "build", "--release", "--offline"])
+                .env("BELLOWS_READ_ONLY", "1"),
+        )
+    };
+    read_only();
+    assert!(!events(&f).iter().any(|e| e.kind == "store"));
+    f.clean();
+    let still_cold = read_only();
+    assert!(
+        !stderr(&still_cold).contains("HIT"),
+        "{}",
+        stderr(&still_cold)
+    );
+    f.clean();
+    f.build();
+    f.clean();
+    let restored = read_only();
+    assert_eq!(decisions(&restored, "fixture"), ["LOCAL HIT", "LOCAL HIT"]);
+    assert_eq!(f.value("target"), "42");
+}
+
+#[test]
+fn build_script_runs_are_restored_and_track_declared_inputs() {
+    let mut f = Fixture::new(
+        "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    write_files(
+        &f.workspace,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\nbuild=\"build.rs\"\n[workspace]\n",
+            ),
+            ("data.txt", "7"),
+            (
+                "build.rs",
+                "fn main() {\n    println!(\"cargo:rerun-if-changed=data.txt\");\n    let value = std::fs::read_to_string(\"data.txt\").unwrap();\n    let out = std::env::var(\"OUT_DIR\").unwrap();\n    std::fs::write(format!(\"{out}/generated.rs\"), format!(\"pub fn value() -> u32 {{ {} }}\", value.trim())).unwrap();\n    println!(\"cargo:rustc-cfg=generated\");\n}\n",
+            ),
+        ],
+    );
+    f.lock();
+    let script = |f: &Fixture| {
+        events(f)
+            .into_iter()
+            .filter(|e| e.crate_name == "build-script:fixture")
+            .map(|e| e.kind)
+            .collect::<Vec<_>>()
+    };
+    f.build();
+    assert_eq!(script(&f), ["miss", "store"]);
+    assert_eq!(f.value("target"), "7");
+    second_checkout(&mut f, "second checkout");
+    let restored = f.build();
+    let log = stderr(&restored);
+    assert_eq!(script(&f), ["miss", "store", "l1_hit"], "{log}");
+    assert_eq!(
+        decisions(&restored, "fixture"),
+        ["LOCAL HIT", "LOCAL HIT"],
+        "{log}"
+    );
+    assert_eq!(f.value("target"), "7");
+    // A declared input changes: the script runs again and so does the crate.
+    fs::write(f.workspace.join("data.txt"), "9").unwrap();
+    f.build();
+    // The rerun starts over the restored OUT_DIR, so it stays local.
+    assert_eq!(
+        script(&f),
+        ["miss", "store", "l1_hit", "miss", "not_stored"]
+    );
+    assert_eq!(f.value("target"), "9");
+    // Plain Cargo in the same target directory still runs the real script.
+    fs::write(f.workspace.join("data.txt"), "11").unwrap();
+    checked(f.command("cargo").args(["build", "--release", "--offline"]));
+    assert_eq!(f.value("target"), "11");
+}
+
+#[test]
+fn repeated_builds_stay_cargo_no_ops_after_compiles_and_restores() {
+    let mut f = Fixture::new(
+        "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    write_files(
+        &f.workspace,
+        &[
+            // A build-dependency compiled in the same build: Cargo compares
+            // its rlib's mtime with the build-script executable's.
+            (
+                "Cargo.toml",
+                "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\nbuild=\"build.rs\"\n[build-dependencies]\nhelper={path=\"helper\"}\n[workspace]\nmembers=[\"helper\"]\n",
+            ),
+            (
+                "helper/Cargo.toml",
+                "[package]\nname=\"helper\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
+            ),
+            ("helper/src/lib.rs", "pub fn value() -> u32 { 5 }"),
+            (
+                "build.rs",
+                "fn main() { println!(\"cargo:rerun-if-changed=build.rs\"); let out = std::env::var(\"OUT_DIR\").unwrap(); std::fs::write(format!(\"{out}/generated.rs\"), format!(\"pub fn value() -> u32 {{ {} }}\", helper::value())).unwrap(); }",
+            ),
+        ],
+    );
+    f.lock();
+    // An installed Bellows is usually older than anything it builds; a
+    // launcher that inherited its mtime made Cargo rebuild every dependent.
+    let aged = f
+        .temp
+        .path()
+        .join(format!("bellows-aged{}", std::env::consts::EXE_SUFFIX));
+    fs::copy(BELLOWS, &aged).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&aged)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+        .unwrap();
+    let build = |f: &Fixture| {
+        checked(
+            f.command(&aged)
+                .args(["local", "--cache-dir"])
+                .arg(&f.cache)
+                .args(["--", "cargo", "build", "--release", "--offline"]),
+        )
+    };
+    let decisions_so_far = |f: &Fixture| {
+        events(f)
+            .iter()
+            .filter(|e| matches!(e.kind.as_str(), "hit" | "l1_hit" | "miss" | "bypass"))
+            .count()
+    };
+    build(&f);
+    let after_compile = decisions_so_far(&f);
+    let noop = build(&f);
+    assert!(
+        stderr(&noop).contains("0 reused · 0 rebuilt"),
+        "{}",
+        stderr(&noop)
+    );
+    assert_eq!(decisions_so_far(&f), after_compile);
+    // The same holds after every unit was restored in another checkout.
+    second_checkout(&mut f, "second checkout");
+    build(&f);
+    let after_restore = decisions_so_far(&f);
+    let noop = build(&f);
+    assert!(
+        stderr(&noop).contains("0 reused · 0 rebuilt"),
+        "{}",
+        stderr(&noop)
+    );
+    assert_eq!(decisions_so_far(&f), after_restore);
+    assert_eq!(f.value("target"), "5");
+}
+
+#[test]
+fn diagnostics_show_real_paths_for_snapshot_tests() {
+    let f = Fixture::new("", "");
+    let source = f.workspace.join("ui/warn.rs");
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::write(&source, "fn main() { let unused = 1; }").unwrap();
+    let compile = |path: &std::path::Path| {
+        f.local()
+            .arg(BELLOWS)
+            .arg("rustc")
+            .arg(path)
+            .args([
+                "--edition=2024",
+                "--crate-name=warn",
+                "--crate-type=bin",
+                "--emit=dep-info,link",
+                "-Cextra-filename=-ui",
+                "--out-dir=out",
+            ])
+            .output()
+            .unwrap()
+    };
+    // trybuild compiles files by absolute path and snapshots the messages.
+    let expected = format!("{}", source.display());
+    for attempt in ["miss", "hit"] {
+        let output = compile(&source);
+        let log = stderr(&output);
+        assert!(output.status.success(), "{log}");
+        assert!(log.contains(&expected), "{attempt}: {log}");
+        assert!(!log.contains("/bellows/"), "{attempt}: {log}");
+        fs::remove_dir_all(f.workspace.join("out")).unwrap();
+    }
+    let failing = f.workspace.join("ui/fail.rs");
+    fs::write(&failing, "fn main() { let x: u32 = \"no\"; }").unwrap();
+    let output = compile(&failing);
+    assert!(!output.status.success());
+    let log = stderr(&output);
+    assert!(log.contains(&format!("{}", failing.display())), "{log}");
+    assert!(!log.contains("/bellows/"), "{log}");
+}
+
+#[test]
+fn repeated_clippy_runs_stay_no_ops_with_intact_dependency_info() {
+    let f = Fixture::new(
+        "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    write_files(
+        &f.workspace,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\nbuild=\"build.rs\"\n[workspace]\n",
+            ),
+            (
+                "build.rs",
+                "fn main() { println!(\"cargo:rerun-if-changed=build.rs\"); let out = std::env::var(\"OUT_DIR\").unwrap(); std::fs::write(format!(\"{out}/generated.rs\"), \"pub fn value() -> u32 { 5 }\").unwrap(); }",
+            ),
+        ],
+    );
+    f.lock();
+    let clippy = || {
+        checked(
+            f.local()
+                .args(["cargo", "clippy", "--all-targets", "--offline"]),
+        )
+    };
+    clippy();
+    let noop = clippy();
+    assert!(
+        stderr(&noop).contains("0 reused · 0 rebuilt"),
+        "{}",
+        stderr(&noop)
+    );
+    let build = f.workspace.join("target/debug/build");
+    for entry in fs::read_dir(build).unwrap() {
+        for file in fs::read_dir(entry.unwrap().path()).unwrap() {
+            let path = file.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "d") {
+                let text = fs::read_to_string(&path).unwrap();
+                for line in text.lines().filter(|l| l.starts_with("# env-dep:")) {
+                    assert!(
+                        line.starts_with("# env-dep:CLIPPY")
+                            || line.starts_with("# env-dep:OUT_DIR"),
+                        "{}: {line}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn diagnostics_quote_restored_dependency_sources_like_plain_cargo() {
+    let f = Fixture::new("", "");
+    // Like trybuild: a separate package (compiled from its own directory as
+    // a path dependency) whose bound is quoted in a consumer's error.
+    write_files(
+        &f.workspace,
+        &[
+            (
+                "engine/Cargo.toml",
+                "[package]\nname=\"engine\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[workspace]\n",
+            ),
+            (
+                "engine/src/lib.rs",
+                "pub struct Server;\npub trait Side {}\nimpl Side for Server {}\npub fn register<S: Side>() {}\n",
+            ),
+            (
+                "ui/Cargo.toml",
+                "[package]\nname=\"ui\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[dependencies]\nengine={path=\"../engine\"}\n[workspace]\n",
+            ),
+            (
+                "ui/src/lib.rs",
+                "pub fn wrong() { engine::register::<u8>(); }\n",
+            ),
+        ],
+    );
+    let manifest = |f: &Fixture| f.workspace.join("ui/Cargo.toml");
+    let bellows = |f: &Fixture| {
+        f.local()
+            .args(["cargo", "build", "--offline", "--manifest-path"])
+            .arg(manifest(f))
+            .env("CARGO_TARGET_DIR", f.workspace.join("target"))
+            .output()
+            .unwrap()
+    };
+    let diagnostic = |output: &Output| {
+        let text = stderr(output);
+        let start = text.find("error[E0277]").expect(&text);
+        let end = text[start..]
+            .find("\n\n")
+            .map_or(text.len(), |end| start + end);
+        text[start..end].to_owned()
+    };
+    assert!(!bellows(&f).status.success());
+    // Restore the dependency into a clean target. (Across checkouts Cargo
+    // itself gives an out-of-workspace path dependency a different
+    // `-C metadata`, so it is rebuilt there.)
+    f.clean();
+    let cached = bellows(&f);
+    let log = stderr(&cached);
+    assert_eq!(decisions(&cached, "engine"), ["LOCAL HIT"], "{log}");
+    let plain = f
+        .command("cargo")
+        .args(["build", "--offline", "--manifest-path"])
+        .arg(manifest(&f))
+        .env("CARGO_TARGET_DIR", f.workspace.join("plain-target"))
+        .output()
+        .unwrap();
+    assert_eq!(diagnostic(&cached), diagnostic(&plain));
+    assert!(
+        diagnostic(&cached).contains("pub fn register<S: Side>()"),
+        "{log}"
+    );
+    assert!(!log.contains("/bellows/"), "{log}");
 }

@@ -176,6 +176,42 @@ const LEGACY_BUILD_VARIANT: &str = "static identity changed:";
 const LEGACY_ENTRY_GONE: &str = "previously observed identity";
 
 pub fn reason_code(kind: &str, detail: &str) -> &'static str {
+    match kind {
+        "hit" | "l1_hit" | "single_flight" => {
+            return if detail.contains("build-script run") {
+                "build_script"
+            } else if detail.contains("linked output") {
+                "linked"
+            } else if detail.contains("library output") {
+                "library"
+            } else {
+                "unspecified"
+            };
+        }
+        "store" => {
+            return if detail.contains("pinned to this checkout") {
+                "checkout_pinned"
+            } else if detail.contains("shareable") {
+                "shareable"
+            } else {
+                "unspecified"
+            };
+        }
+        "not_stored" => {
+            return if detail.contains("incremental") {
+                "incremental_session"
+            } else if detail.contains("blob size limit") {
+                "too_large_for_server"
+            } else if detail.contains("native member") {
+                "native_inputs"
+            } else if detail.contains("cardinality") {
+                "too_many_outputs"
+            } else {
+                "unsupported_outputs"
+            };
+        }
+        _ => {}
+    }
     let variant = detail.contains(BUILD_VARIANT) || detail.contains(LEGACY_BUILD_VARIANT);
     if variant && detail.contains("compiler version changed") {
         "compiler_changed"
@@ -197,6 +233,8 @@ pub fn reason_code(kind: &str, detail: &str) -> &'static str {
         "remote_unavailable"
     } else if detail.contains("symlinked compiler input") {
         "symlink_input"
+    } else if detail.contains("unstable compiler flag") {
+        "unstable_flags"
     } else if detail.contains("host-native CPU") {
         "host_cpu"
     } else if detail.contains("custom sysroot") || detail.contains("custom target specification") {
@@ -274,13 +312,24 @@ pub fn summarize(events: &[Event]) -> Summary {
         *summary.decisions.entry(event.kind.clone()).or_default() += 1;
         if !matches!(
             event.kind.as_str(),
-            "miss" | "bypass" | "fallback" | "corrupt"
+            "miss"
+                | "bypass"
+                | "fallback"
+                | "corrupt"
+                | "not_stored"
+                | "hit"
+                | "l1_hit"
+                | "single_flight"
+                | "store"
         ) {
             continue;
         }
+        // Retained events recorded before a category existed carry
+        // "unspecified"; derive the current category from their detail.
         let reason = event
             .reason
             .clone()
+            .filter(|reason| reason != "unspecified")
             .unwrap_or_else(|| reason_code(&event.kind, &event.detail).into());
         let group = groups
             .entry((event.kind.clone(), reason.clone()))
@@ -311,14 +360,17 @@ pub fn print_summary(summary: &Summary, limit: usize) {
     print_reasons(summary.reasons.iter(), limit);
 }
 
-/// Examples for rebuilt work and problems. Bypasses are by design and already
-/// counted by [`print_grouped`].
+/// Examples for rebuilt work and problems. Bypasses are by design and, like
+/// reuse and storage, already counted by [`print_grouped`].
 pub fn print_details(summary: &Summary, limit: usize) {
     print_reasons(
-        summary
-            .reasons
-            .iter()
-            .filter(|reason| reason.kind != "bypass"),
+        summary.reasons.iter().filter(|reason| {
+            REBUILT
+                .iter()
+                .chain(PROBLEMS)
+                .chain(NOT_STORED)
+                .any(|kind| *kind == reason.kind)
+        }),
         limit,
     );
 }
@@ -328,6 +380,7 @@ const REBUILT: &[&str] = &["miss"];
 const NOT_CACHEABLE: &[&str] = &["bypass"];
 const PROBLEMS: &[&str] = &["fallback", "corrupt"];
 const STORED: &[&str] = &["store"];
+const NOT_STORED: &[&str] = &["not_stored"];
 
 /// Decisions grouped by meaning: reused work, rebuilt work and why, work that
 /// Bellows never caches by design, and actual problems. Intentional
@@ -356,7 +409,7 @@ pub fn print_grouped(summary: &Summary, color: bool) {
             println!("{row}  {detail}");
         }
     };
-    line("reused", count(REUSED), String::new());
+    line("reused", count(REUSED), breakdown(REUSED));
     line("rebuilt", count(REBUILT), breakdown(REBUILT));
     let bypassed = breakdown(NOT_CACHEABLE);
     line(
@@ -379,10 +432,17 @@ pub fn print_grouped(summary: &Summary, color: bool) {
         },
     );
     if count(STORED) > 0 {
-        line("stored", count(STORED), String::new());
+        line("stored", count(STORED), breakdown(STORED));
+    }
+    if count(NOT_STORED) > 0 {
+        line(
+            "not stored",
+            count(NOT_STORED),
+            format!("compiled, kept local: {}", breakdown(NOT_STORED)),
+        );
     }
     for (kind, value) in &summary.decisions {
-        if ![REUSED, REBUILT, NOT_CACHEABLE, PROBLEMS, STORED]
+        if ![REUSED, REBUILT, NOT_CACHEABLE, PROBLEMS, STORED, NOT_STORED]
             .iter()
             .any(|group| group.contains(&kind.as_str()))
         {
@@ -407,6 +467,14 @@ fn reason_label(reason: &str) -> String {
         "unsupported_outputs" => "unmodeled outputs",
         "native_inputs" => "native inputs",
         "compiler_probe" => "compiler probes",
+        "library" => "libraries",
+        "linked" => "linked outputs",
+        "build_script" => "build-script runs",
+        "shareable" => "shareable",
+        "checkout_pinned" => "pinned to checkout",
+        "incremental_session" => "incremental session reuse",
+        "too_many_outputs" => "too many outputs",
+        "too_large_for_server" => "too large for server",
         other => return other.replace('_', " "),
     }
     .into()

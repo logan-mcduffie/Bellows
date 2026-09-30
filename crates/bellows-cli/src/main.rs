@@ -2,9 +2,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use bellows_core::{
     ActionCandidate, ArchiveManifest, Artifact, CandidateIndex, DeclaredActionRecord, EnvInput,
     Event, ExecuteRequest, ExecuteResponse, FileInput, GcReport, GcRequest, HealthResponse,
-    LeaseRequest, LeaseResponse, PROTOCOL_VERSION, PathNormalizer, PlatformIdentity, ServerStats,
-    Store, StreamArtifact, atomic_write, compiler_action_key, declared_action_key, digest_bytes,
-    digest_file, now_ms, parse_dep_info, rustup_home, tree_digest, validate_archive_manifest,
+    LeaseRequest, LeaseResponse, PIN_PREFIX, PROTOCOL_VERSION, PathNormalizer, PlatformIdentity,
+    ServerStats, Store, StreamArtifact, atomic_write, compiler_action_key, declared_action_key,
+    digest_bytes, now_ms, parse_dep_info, rustup_home, tree_digest, validate_archive_manifest,
     validate_candidate_manifest, validate_declared_command, validate_declared_record,
     validate_relative_path,
 };
@@ -23,7 +23,12 @@ use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod archive;
+mod build_script;
 mod diagnostics;
+mod digests;
+mod leak;
+mod link;
 mod restore;
 mod terminal;
 
@@ -194,6 +199,8 @@ fn main() -> ExitCode {
     let args: Vec<OsString> = env::args_os().collect();
     let result = if env::var_os(bellows_core::execution::REMAP_ENV).is_some() {
         bellows_core::execution::remap_compiler(&args[1..]).map(|status| status.code().unwrap_or(1))
+    } else if let Some(real) = build_script::launched_as(&args) {
+        build_script::run(&real, &args[1..]).map(|status| status.code().unwrap_or(1))
     } else if is_wrapper_invocation(&args) {
         rustc_wrapper(&args[1..]).map(|status| status.code().unwrap_or(1))
     } else {
@@ -337,8 +344,7 @@ fn run_command(server: String, token: Option<String>, command: Vec<OsString>) ->
         .env("BELLOWS_SERVER", server)
         .env_remove("BELLOWS_LOCAL_ONLY")
         .env("BELLOWS_WORKSPACE", &workspace)
-        .env("BELLOWS_STATE_DIR", &state_dir)
-        .env("CARGO_INCREMENTAL", "0");
+        .env("BELLOWS_STATE_DIR", &state_dir);
     if let Some(token) = token {
         child.env("BELLOWS_AUTH_TOKEN", token);
     }
@@ -351,6 +357,7 @@ fn run_command(server: String, token: Option<String>, command: Vec<OsString>) ->
             &display_command(program, arguments),
         )
     );
+    digests::prune(&state_dir, Duration::from_secs(14 * 24 * 60 * 60));
     let session = diagnostics::BuildSession::start(&state_dir, &workspace);
     session.configure(&mut child);
     let result = child.status().context("start wrapped command");
@@ -387,6 +394,7 @@ fn run_local_command(cache_dir: Option<PathBuf>, command: Vec<OsString>) -> Resu
         .env("BELLOWS_STATE_DIR", &state_dir)
         .env_remove("BELLOWS_SERVER")
         .env_remove("BELLOWS_AUTH_TOKEN");
+    digests::prune(&state_dir, Duration::from_secs(14 * 24 * 60 * 60));
     let session = diagnostics::BuildSession::start(&state_dir, &workspace);
     session.configure(&mut child);
     let result = child.status().context("start locally wrapped command");
@@ -700,15 +708,116 @@ fn bounded_timeout(
     Ok(Duration::from_millis(milliseconds))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputKind {
+    /// rlib/rmeta/dep-info only: rustc never runs a linker.
+    Library,
+    /// Executables, test harnesses, cdylib/dylib/proc-macro shared objects.
+    Linked,
+}
+
+impl OutputKind {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Library => "library",
+            Self::Linked => "linked",
+        }
+    }
+}
+
+/// File naming for the compilation target (Cargo omits `--target` for host
+/// units such as build scripts and procedural macros).
+#[derive(Debug, Clone, Copy)]
+struct Naming {
+    exe_suffix: &'static str,
+    dll_prefix: &'static str,
+    dll_suffix: &'static str,
+    msvc: bool,
+}
+
+impl Naming {
+    fn for_target(target: Option<&str>) -> Self {
+        let (windows, msvc, apple, wasm) = match target {
+            Some(triple) => (
+                triple.contains("windows"),
+                triple.contains("msvc"),
+                triple.contains("apple"),
+                triple.starts_with("wasm"),
+            ),
+            None => (
+                cfg!(windows),
+                cfg!(target_env = "msvc"),
+                cfg!(target_vendor = "apple"),
+                false,
+            ),
+        };
+        if wasm {
+            Self {
+                exe_suffix: ".wasm",
+                dll_prefix: "",
+                dll_suffix: ".wasm",
+                msvc: false,
+            }
+        } else if windows {
+            Self {
+                exe_suffix: ".exe",
+                dll_prefix: "",
+                dll_suffix: ".dll",
+                msvc,
+            }
+        } else if apple {
+            Self {
+                exe_suffix: "",
+                dll_prefix: "lib",
+                dll_suffix: ".dylib",
+                msvc: false,
+            }
+        } else {
+            Self {
+                exe_suffix: "",
+                dll_prefix: "lib",
+                dll_suffix: ".so",
+                msvc: false,
+            }
+        }
+    }
+}
+
+/// A `-l` request on a library compile whose file rustc bundles into the rlib.
+#[derive(Debug, Clone)]
+struct StaticLibrary {
+    name: String,
+    verbatim: bool,
+}
+
 #[derive(Debug)]
 struct Invocation {
     rustc: PathBuf,
     args: Vec<String>,
     crate_name: String,
     out_dir: PathBuf,
+    kind: OutputKind,
+    naming: Naming,
+    /// Output file-name stems owned by this unit (`{crate}{extra}`, `lib…`).
+    stems: Vec<String>,
+    /// Outputs that must exist after a successful compile.
     expected_names: BTreeSet<String>,
     explicit_inputs: Vec<PathBuf>,
+    /// Crate names of directly loaded procedural macros.
+    proc_macros: Vec<String>,
+    /// Cargo's shared incremental directory (`-C incremental=`).
+    incremental: Option<PathBuf>,
+    /// `{crate}{extra-filename}`: unique per Cargo unit.
+    unit: String,
+    /// This compile produces a procedural macro (it runs inside rustc).
+    proc_macro_crate: bool,
+    static_libraries: Vec<StaticLibrary>,
+    native_search: Vec<PathBuf>,
 }
+
+/// Crates found in the sysroot; Cargo passes them to `--extern` without a
+/// path (`--extern proc_macro`). The compiler identity covers them.
+const SYSROOT_CRATES: &[&str] = &["proc_macro", "test", "std", "core", "alloc"];
 
 impl Invocation {
     fn analyze(raw: &[OsString]) -> std::result::Result<Self, String> {
@@ -727,19 +836,15 @@ impl Invocation {
         {
             return Err("compiler probe".into());
         }
-        if args.iter().any(|a| a.contains("incremental=")) {
-            return Err("incremental compilation is enabled".into());
-        }
         if args.iter().any(|arg| arg.starts_with('@')) {
             return Err("rustc response files are not modeled".into());
-        }
-        if args.iter().any(|arg| arg == "--test") {
-            return Err("test harness outputs are not modeled".into());
         }
         if option_value(&args, "--sysroot").is_some() {
             return Err("custom sysroot contents are not modeled".into());
         }
-        if option_value(&args, "--target")
+        let target = option_value(&args, "--target");
+        if target
+            .as_deref()
             .is_some_and(|target| target.ends_with(".json") || Path::new(&target).is_file())
         {
             return Err("custom target specification contents are not modeled".into());
@@ -747,22 +852,19 @@ impl Invocation {
         if codegen_value(&args, "target-cpu").as_deref() == Some("native") {
             return Err("host-native CPU features are not modeled in the cache key".into());
         }
-        if args.iter().enumerate().any(|(i, arg)| {
-            let value = if arg == "-C" {
-                args.get(i + 1).map(String::as_str)
-            } else {
-                arg.strip_prefix("-C")
-            };
-            value.is_some_and(|value| value == "save-temps" || value.starts_with("save-temps="))
-        }) {
+        if codegen_values(&args)
+            .any(|value| value == "save-temps" || value.starts_with("save-temps="))
+        {
             return Err("compiler temporary outputs are not modeled".into());
         }
-        if args.iter().any(|arg| arg == "-Z" || arg.starts_with("-Z")) {
-            return Err("unstable compiler flags are not modeled".into());
+        if let Some(flag) = unmodeled_unstable_flag(&args) {
+            return Err(format!("unstable compiler flag -Z {flag} is not modeled"));
         }
         let crate_name = option_value(&args, "--crate-name").ok_or("missing --crate-name")?;
+        let test_harness = args.iter().any(|arg| arg == "--test");
         let declared_crate_types = multi_option_values(&args, "--crate-type");
-        let crate_types = if declared_crate_types.is_empty() {
+        let crate_types = if test_harness || declared_crate_types.is_empty() {
+            // `--test` builds a harness executable whatever the crate type.
             vec!["bin".to_owned()]
         } else {
             declared_crate_types
@@ -771,21 +873,32 @@ impl Invocation {
                 .map(str::to_owned)
                 .collect::<Vec<_>>()
         };
-        if crate_types
-            .iter()
-            .any(|kind| !matches!(kind.as_str(), "lib" | "rlib"))
-        {
-            return Err(format!("linked crate type {}", crate_types.join(",")));
+        if let Some(kind) = crate_types.iter().find(|kind| {
+            !matches!(
+                kind.as_str(),
+                "lib" | "rlib" | "bin" | "cdylib" | "dylib" | "proc-macro"
+            )
+        }) {
+            return Err(format!("linked crate type {kind} is not modeled"));
         }
-        if has_native_or_external_codegen_inputs(&args) {
-            return Err("native linker or external codegen inputs are not modeled".into());
-        }
+        let incremental = codegen_value(&args, "incremental").map(PathBuf::from);
+        let (native_search, static_libraries) = native_inputs(&args)?;
         let out_dir = PathBuf::from(option_value(&args, "--out-dir").ok_or("missing --out-dir")?);
-        let extra_filename =
-            codegen_value(&args, "extra-filename").ok_or("missing -C extra-filename")?;
-        if extra_filename.is_empty() || extra_filename.contains('/') {
-            return Err("ambiguous extra filename".into());
-        }
+        // Cargo omits the extra filename for packages that build a cdylib or
+        // dylib (users load them by name) and for MSVC/wasm executables
+        // (debug-info names must stay predictable). The unit is still unique
+        // within its output directory.
+        let predictable_name = crate_types
+            .iter()
+            .any(|kind| matches!(kind.as_str(), "bin" | "cdylib" | "dylib"));
+        let extra_filename = match codegen_value(&args, "extra-filename") {
+            Some(extra) if extra.is_empty() || extra.contains(['/', '\\']) => {
+                return Err("ambiguous extra filename".into());
+            }
+            Some(extra) => extra,
+            None if predictable_name => String::new(),
+            None => return Err("missing -C extra-filename".into()),
+        };
         let source = args
             .iter()
             .find(|arg| arg.ends_with(".rs") && Path::new(arg.as_str()).exists())
@@ -793,25 +906,24 @@ impl Invocation {
             .ok_or("missing primary Rust source")?;
 
         let mut explicit_inputs = vec![source.clone()];
-        let mut proc_macro = false;
+        let mut proc_macros = Vec::new();
         for value in multi_option_values(&args, "--extern") {
-            let Some((_, path)) = value.split_once('=') else {
+            let Some((name, path)) = value.split_once('=') else {
+                let name = value.rsplit(':').next().unwrap_or(&value);
+                if SYSROOT_CRATES.contains(&name) {
+                    continue;
+                }
                 return Err("extern dependency has no explicit artifact path".into());
             };
             let path = PathBuf::from(path);
             if !path.is_file() {
                 return Err("extern dependency artifact is missing".into());
             }
-            if path.exists() {
-                let ext = path.extension().and_then(OsStr::to_str).unwrap_or_default();
-                if matches!(ext, "so" | "dylib" | "dll") {
-                    proc_macro = true;
-                }
-                explicit_inputs.push(path);
+            let ext = path.extension().and_then(OsStr::to_str).unwrap_or_default();
+            if matches!(ext, "so" | "dylib" | "dll") {
+                proc_macros.push(name.rsplit(':').next().unwrap_or(name).to_owned());
             }
-        }
-        if proc_macro {
-            return Err("invocation loads a procedural macro or dynamic compiler plugin".into());
+            explicit_inputs.push(path);
         }
 
         let emits = multi_option_values(&args, "--emit");
@@ -823,65 +935,187 @@ impl Invocation {
         {
             return Err("unsupported emit set or custom output destination; running rustc to produce every requested output".into());
         }
-        let emit = &emits[0];
-        let mut expected_names = BTreeSet::new();
-        if emit
-            .split(',')
-            .any(|e| e.split('=').next() == Some("dep-info"))
-        {
-            expected_names.insert(format!("{crate_name}{extra_filename}.d"));
-        }
-        if emit
-            .split(',')
-            .any(|e| e.split('=').next() == Some("metadata"))
-        {
-            expected_names.insert(format!("lib{crate_name}{extra_filename}.rmeta"));
-        }
-        if emit.split(',').any(|e| e.split('=').next() == Some("link")) {
-            expected_names.insert(format!("lib{crate_name}{extra_filename}.rlib"));
-        }
-        if expected_names.is_empty() || !expected_names.iter().any(|n| n.ends_with(".d")) {
+        let emit = emits[0].split(',').collect::<BTreeSet<_>>();
+        if !emit.contains("dep-info") {
             return Err("unsupported emit set".into());
         }
+        let naming = Naming::for_target(target.as_deref());
+        let unit = format!("{crate_name}{extra_filename}");
+        let library = format!("lib{unit}");
+        let mut expected_names = BTreeSet::from([format!("{unit}.d")]);
+        let has = |kind: &str| crate_types.iter().any(|t| t == kind);
+        let mut linked = false;
+        if emit.contains("metadata") {
+            expected_names.insert(format!("{library}.rmeta"));
+        }
+        if emit.contains("link") {
+            if has("lib") || has("rlib") {
+                expected_names.insert(format!("{library}.rlib"));
+            }
+            if has("bin") {
+                expected_names.insert(format!("{unit}{}", naming.exe_suffix));
+                linked = true;
+            }
+            if has("cdylib") || has("dylib") || has("proc-macro") {
+                expected_names.insert(format!("{}{unit}{}", naming.dll_prefix, naming.dll_suffix));
+                linked = true;
+            }
+        }
+        let kind = if linked {
+            OutputKind::Linked
+        } else {
+            OutputKind::Library
+        };
+        if has_unmodeled_codegen_inputs(&args) {
+            return Err("native linker or external codegen inputs are not modeled".into());
+        }
+        // Link inputs come from `--print link-args`; clippy-driver combined
+        // with that print request writes corrupted `# env-dep:` names (for
+        // example `64` in place of CLIPPY_ARGS), which would make Cargo
+        // rebuild on every run. Its linked units (build scripts and proc
+        // macros of workspace members) are compiled directly.
+        let driver = rustc
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .unwrap_or_default();
+        if kind == OutputKind::Linked && !(driver == "rustc" || driver.starts_with("rustc-")) {
+            return Err(format!(
+                "linked outputs compiled by {driver} are not modeled"
+            ));
+        }
+        let stems = vec![unit.clone(), library];
+        let proc_macro_crate = has("proc-macro");
         Ok(Self {
             rustc,
             args,
             crate_name,
             out_dir,
+            kind,
+            naming,
+            stems,
             expected_names,
             explicit_inputs,
+            proc_macros,
+            incremental,
+            unit,
+            proc_macro_crate,
+            static_libraries,
+            native_search,
+        })
+    }
+
+    /// True for a file name this unit's compile writes.
+    fn owns(&self, file_name: &str) -> bool {
+        self.stems.iter().any(|stem| {
+            file_name
+                .strip_prefix(stem.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
         })
     }
 }
 
-fn has_native_or_external_codegen_inputs(args: &[String]) -> bool {
-    args.iter().enumerate().any(|(index, arg)| {
-        if arg == "-l" || (arg.starts_with("-l") && arg.len() > 2) {
-            return true;
+/// Parse native search paths and libraries. Library search directories
+/// (`-L native=`, `-L framework=`) cannot supply Rust crates; `-L all=`,
+/// `crate=` and bare `-L` can, so they remain unmodeled.
+fn native_inputs(
+    args: &[String],
+) -> std::result::Result<(Vec<PathBuf>, Vec<StaticLibrary>), String> {
+    let mut search = Vec::new();
+    let mut libraries = Vec::new();
+    let mut values = Vec::<(&str, &str)>::new();
+    for (index, arg) in args.iter().enumerate() {
+        for flag in ["-L", "-l"] {
+            if arg == flag {
+                if let Some(value) = args.get(index + 1) {
+                    values.push((flag, value));
+                }
+            } else if let Some(value) = arg.strip_prefix(flag)
+                && !value.is_empty()
+            {
+                values.push((flag, value));
+            }
         }
-        if arg == "-L" {
-            return args
-                .get(index + 1)
-                .is_none_or(|value| !value.starts_with("dependency="));
+    }
+    for (flag, value) in values {
+        if flag == "-L" {
+            match value.split_once('=') {
+                Some(("dependency", _)) => {}
+                Some(("native" | "framework", path)) => search.push(PathBuf::from(path)),
+                _ => {
+                    return Err(format!(
+                        "native linker or external codegen inputs are not modeled: search path -L {value} may supply crates"
+                    ));
+                }
+            }
+            continue;
         }
-        if let Some(value) = arg.strip_prefix("-L") {
-            return !value.starts_with("dependency=");
-        }
-        let codegen = if arg == "-C" {
-            args.get(index + 1).map(String::as_str)
-        } else {
-            arg.strip_prefix("-C")
+        let (kind, name) = match value.split_once('=') {
+            Some((kind, name)) => (kind, name),
+            None => ("dylib", value),
         };
-        codegen.is_some_and(|value| {
-            [
-                "linker=",
-                "linker-plugin-lto=",
-                "profile-use=",
-                "llvm-plugins=",
-            ]
+        let (kind, modifiers) = kind.split_once(':').unwrap_or((kind, ""));
+        let name = name.split(':').next().unwrap_or(name);
+        match kind {
+            "static" => {
+                if !modifiers.split(',').any(|m| m == "-bundle") {
+                    libraries.push(StaticLibrary {
+                        name: name.to_owned(),
+                        verbatim: modifiers.split(',').any(|m| m == "+verbatim"),
+                    });
+                }
+            }
+            "dylib" | "framework" | "raw-dylib" => {}
+            _ => {
+                return Err(format!(
+                    "native linker or external codegen inputs are not modeled: -l {value}"
+                ));
+            }
+        }
+    }
+    Ok((search, libraries))
+}
+
+/// Unstable flags whose effect is fully described by the arguments (kept in
+/// the key) and whose inputs arrive through dep-info. `-Zbuild-std` passes
+/// the first two to every crate; the rust-src sources are tracked files and
+/// the nightly compiler is part of the identity. Anything else that could
+/// write extra files or read untracked inputs stays unmodeled.
+const MODELED_UNSTABLE_FLAGS: &[&str] = &[
+    "unstable-options",
+    "force-unstable-if-unmarked",
+    "share-generics",
+    "threads",
+    "macro-backtrace",
+];
+
+fn unmodeled_unstable_flag(args: &[String]) -> Option<String> {
+    args.iter().enumerate().find_map(|(index, arg)| {
+        let value = if arg == "-Z" {
+            args.get(index + 1).map(String::as_str).unwrap_or_default()
+        } else {
+            arg.strip_prefix("-Z")?
+        };
+        let name = value.split('=').next().unwrap_or(value);
+        (!MODELED_UNSTABLE_FLAGS.contains(&name)).then(|| name.to_owned())
+    })
+}
+
+/// Codegen inputs that remain outside the model for any output kind.
+fn has_unmodeled_codegen_inputs(args: &[String]) -> bool {
+    codegen_values(args).any(|value| {
+        ["linker-plugin-lto=", "profile-use=", "llvm-plugins="]
             .iter()
             .any(|prefix| value.starts_with(prefix))
-        })
+    })
+}
+
+fn codegen_values(args: &[String]) -> impl Iterator<Item = &str> {
+    args.iter().enumerate().filter_map(|(i, arg)| {
+        if arg == "-C" {
+            args.get(i + 1).map(String::as_str)
+        } else {
+            arg.strip_prefix("-C")
+        }
     })
 }
 
@@ -925,13 +1159,53 @@ fn codegen_value(args: &[String], name: &str) -> Option<String> {
 struct Identity {
     static_key: String,
     normalizer: PathNormalizer,
+    /// Normalizes only the workspace and target roots: path-valued `env!`
+    /// dependencies compare in this form when the outputs embed no root.
+    root_normalizer: PathNormalizer,
     workspace: PathBuf,
     fingerprint: diagnostics::Fingerprint,
     diagnostic_group: String,
+    digests: digests::Digests,
+    /// Synthetic inputs that pin a leaking candidate to this checkout.
+    pins: Vec<(String, String)>,
+    /// Environment overrides given to rustc (see `stable_empty_directories`).
+    virtual_env: BTreeMap<String, String>,
 }
+
+impl Identity {
+    /// The value rustc sees for an environment variable.
+    fn env_value(&self, name: &str) -> Option<String> {
+        self.virtual_env
+            .get(name)
+            .cloned()
+            .or_else(|| env::var(name).ok())
+    }
+
+    fn pin_value(&self, name: &str) -> Option<&str> {
+        self.pins
+            .iter()
+            .find(|(pin, _)| pin == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// A successful compile whose result is deliberately not stored.
+#[derive(Debug)]
+struct NotStored(String);
+
+impl std::fmt::Display for NotStored {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NotStored {}
 
 fn rustc_wrapper(raw: &[OsString]) -> Result<ExitStatus> {
     let started = Instant::now();
+    if let Some((out_dir, unit_file)) = build_script_unit(raw) {
+        build_script::remove_launcher(&out_dir, &unit_file);
+    }
     let result = match cache_or_compile(raw) {
         Ok(status) => Ok(status),
         Err(error) => {
@@ -946,6 +1220,19 @@ fn rustc_wrapper(raw: &[OsString]) -> Result<ExitStatus> {
             passthrough(raw)
         }
     };
+    if result.as_ref().is_ok_and(ExitStatus::success)
+        && let Some((out_dir, unit_file)) = build_script_unit(raw)
+        && out_dir.join(&unit_file).is_file()
+        && let Err(error) = build_script::install_launcher(&out_dir, &unit_file)
+    {
+        record_event(
+            "fallback",
+            wrapper_crate_name(raw),
+            None,
+            None,
+            &format!("build-script launcher not installed; the script runs uncached: {error:#}"),
+        );
+    }
     record_event_duration(
         "compiler_timing",
         wrapper_crate_name(raw),
@@ -955,6 +1242,26 @@ fn rustc_wrapper(raw: &[OsString]) -> Result<ExitStatus> {
         Some(started.elapsed().as_millis() as u64),
     );
     result
+}
+
+/// The output directory and executable name of a build-script compile.
+fn build_script_unit(raw: &[OsString]) -> Option<(PathBuf, String)> {
+    let args = raw
+        .iter()
+        .skip(1)
+        .map(|arg| arg.to_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()?;
+    let crate_name = option_value(&args, "--crate-name")?;
+    let out_dir = PathBuf::from(option_value(&args, "--out-dir")?);
+    if !build_script::is_build_script_compile(&crate_name, &out_dir)
+        || !multi_option_values(&args, "--emit")
+            .iter()
+            .any(|emit| emit.split(',').any(|kind| kind == "link"))
+    {
+        return None;
+    }
+    let extra = codegen_value(&args, "extra-filename").unwrap_or_default();
+    Some((out_dir, build_script::unit_file(&crate_name, &extra)))
 }
 
 fn wrapper_crate_name(raw: &[OsString]) -> &str {
@@ -1252,16 +1559,41 @@ fn cache_or_compile(raw: &[OsString]) -> Result<ExitStatus> {
         }
         return Ok(status);
     }
+    // A read-only client (for example CI jobs sharing a developer's local
+    // service) restores verified results but never publishes its own.
+    let captured = captured.filter(|_| env::var("BELLOWS_READ_ONLY").as_deref() != Ok("1"));
     if let Some(captured) = captured {
-        if let Some(store) = &l1
-            && let Err(error) = cache_captured(store, &captured)
-        {
+        let scope = if captured.pinned {
+            format!(
+                " ({} output, pinned to this checkout: it embeds the workspace or target path)",
+                invocation.kind.name()
+            )
+        } else {
+            format!(
+                " ({} output, shareable across checkouts)",
+                invocation.kind.name()
+            )
+        };
+        let mut stored_locally = false;
+        if let Some(store) = &l1 {
+            match cache_captured(store, &captured) {
+                Ok(()) => stored_locally = true,
+                Err(error) => record_event(
+                    "fallback",
+                    &invocation.crate_name,
+                    Some(&identity.static_key),
+                    None,
+                    &format!("L1 publication failed: {error:#}"),
+                ),
+            }
+        }
+        if stored_locally && remote.is_none() {
             record_event(
-                "fallback",
+                "store",
                 &invocation.crate_name,
                 Some(&identity.static_key),
-                None,
-                &format!("L1 publication failed: {error:#}"),
+                Some(&captured.candidate.action_key),
+                &format!("stored compiler result{scope}"),
             );
         }
         if let Some(remote) = &remote
@@ -1273,7 +1605,15 @@ fn cache_or_compile(raw: &[OsString]) -> Result<ExitStatus> {
                     &invocation.crate_name,
                     Some(&identity.static_key),
                     Some(&action_key),
-                    "published compiler result",
+                    &format!("published compiler result{scope}"),
+                ),
+                // A result larger than the server accepts stays local.
+                Err(error) if format!("{error:#}").contains("413") => record_event(
+                    "not_stored",
+                    &invocation.crate_name,
+                    Some(&identity.static_key),
+                    None,
+                    "compiled but not stored remotely: an output exceeds the server's blob size limit (kept in the local cache)",
                 ),
                 Err(error) => record_event(
                     "fallback",
@@ -1299,8 +1639,35 @@ fn passthrough(raw: &[OsString]) -> Result<ExitStatus> {
 }
 
 fn normalizer(workspace: &Path, out_dir: &Path) -> PathNormalizer {
+    let mut bases = root_bases(workspace, out_dir);
+    let home = bellows_core::user_home();
+    if let Some(cargo_home) = env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|home| home.join(".cargo")))
+    {
+        bases.push(("$CARGO_HOME".into(), canonical_base(cargo_home)));
+    }
+    bases.push(("$RUSTUP_HOME".into(), canonical_base(rustup_home())));
+    if let Some(home) = home {
+        bases.push(("$HOME".into(), canonical_base(home)));
+    }
+    PathNormalizer::new(bases)
+}
+
+/// The per-checkout roots: the workspace and the Cargo target directory.
+fn root_bases(workspace: &Path, out_dir: &Path) -> Vec<(String, PathBuf)> {
     let target = target_root(workspace, out_dir);
     let mut bases = vec![("$WORKSPACE".into(), workspace.to_path_buf())];
+    // The directory a `bellows run/local` session started in. A nested Cargo
+    // build (a build script compiling another workspace) runs rustc from a
+    // subdirectory but inherits paths such as OUT_DIR from the outer build.
+    if let Some(checkout) = env::var_os("BELLOWS_WORKSPACE").map(PathBuf::from)
+        && checkout.is_absolute()
+        && checkout != workspace
+    {
+        bases.push(("$CHECKOUT".into(), canonical_base(checkout.clone())));
+        bases.push(("$CHECKOUT".into(), checkout));
+    }
     // Cargo's manifest directory may retain an 8.3 spelling even when the
     // process working directory has already been expanded by Windows.
     for alias in [
@@ -1315,23 +1682,34 @@ fn normalizer(workspace: &Path, out_dir: &Path) -> PathNormalizer {
         }
     }
     if let Some(target) = target {
+        // Profiles that pass identical rustc arguments (for example
+        // `release` and a `test-fast` inheriting it) differ only in their
+        // `<target>/<profile>` directory. Naming it separately lets one
+        // verified result serve every such profile.
+        if let Some(profile) = profile_root(&target, out_dir) {
+            bases.push(("$PROFILE".into(), canonical_base(profile.clone())));
+            bases.push(("$PROFILE".into(), profile));
+        }
         bases.push(("$TARGET".into(), canonical_base(target.clone())));
         // Retain the caller's spelling too: Windows temp directories may use
         // 8.3 names that canonicalize() expands to a different path string.
         bases.push(("$TARGET".into(), target));
     }
-    let home = bellows_core::user_home();
-    if let Some(cargo_home) = env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .or_else(|| home.as_ref().map(|home| home.join(".cargo")))
-    {
-        bases.push(("$CARGO_HOME".into(), canonical_base(cargo_home)));
-    }
-    bases.push(("$RUSTUP_HOME".into(), canonical_base(rustup_home())));
-    if let Some(home) = home {
-        bases.push(("$HOME".into(), canonical_base(home)));
-    }
-    PathNormalizer::new(bases)
+    bases
+}
+
+/// `<target>[/<triple>]/<profile>` for Cargo's `deps`, `build/<unit>` and
+/// `examples` output directories.
+fn profile_root(target: &Path, out_dir: &Path) -> Option<PathBuf> {
+    out_dir
+        .ancestors()
+        .find(|dir| {
+            dir.file_name()
+                .is_some_and(|name| name == "deps" || name == "build" || name == "examples")
+        })
+        .and_then(Path::parent)
+        .filter(|profile| profile.starts_with(target) && *profile != target)
+        .map(Path::to_path_buf)
 }
 
 fn canonical_base(path: PathBuf) -> PathBuf {
@@ -1394,7 +1772,26 @@ fn normalized_compiler_arguments(
         .map(|path| path.to_string_lossy());
     let mut normalized = Vec::with_capacity(invocation.args.len());
     let mut path_value = false;
-    for arg in &invocation.args {
+    let mut skip_next = false;
+    for (index, arg) in invocation.args.iter().enumerate() {
+        // The incremental session directory is scratch state, not an input:
+        // incremental and non-incremental compiles of the same crate share
+        // one identity (see the incremental policy in compile_and_capture).
+        if std::mem::take(&mut skip_next) {
+            continue;
+        }
+        if arg == "-C"
+            && invocation
+                .args
+                .get(index + 1)
+                .is_some_and(|value| value.starts_with("incremental="))
+        {
+            skip_next = true;
+            continue;
+        }
+        if arg.starts_with("-Cincremental=") {
+            continue;
+        }
         let is_path = path_value
             || source.as_deref() == Some(arg.as_str())
             || arg.starts_with("--out-dir=")
@@ -1416,10 +1813,9 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
     // not the parent Bellows session's launch directory.
     let workspace = env::current_dir()?.canonicalize()?;
     let normalizer = normalizer(&workspace, &invocation.out_dir);
-    let compiler = Command::new(&invocation.rustc).arg("-vV").output()?;
-    if !compiler.status.success() {
-        bail!("rustc -vV failed")
-    }
+    let root_normalizer = PathNormalizer::new(root_bases(&workspace, &invocation.out_dir));
+    let digests = digests::Digests::new(&state_dir(&workspace));
+    let compiler = compiler_identity(&invocation.rustc, &state_dir(&workspace))?;
     let normalized_args = normalized_compiler_arguments(invocation, &normalizer);
     let mut components = diagnostics::argument_components(&normalized_args, str::to_owned);
     components.insert(
@@ -1441,6 +1837,10 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
         "dependency parser changed".into(),
         digest_bytes(dep_info_format),
     );
+    components.insert(
+        "output kind changed".into(),
+        digest_bytes(invocation.kind.name().as_bytes()),
+    );
     let mut hasher = blake3::Hasher::new();
     hash_field(
         &mut hasher,
@@ -1449,10 +1849,19 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
     );
     hash_field(&mut hasher, "compiler", &compiler.stdout);
     hash_field(&mut hasher, "dep-info-format", dep_info_format);
+    hash_field(
+        &mut hasher,
+        "output-kind",
+        invocation.kind.name().as_bytes(),
+    );
     for arg in &normalized_args {
         hash_field(&mut hasher, "arg", arg.as_bytes());
     }
-    hash_field(&mut hasher, "remap", b"$WORKSPACE=/bellows/workspace");
+    hash_field(
+        &mut hasher,
+        "remap",
+        b"remap-v2:$CARGO_HOME=/bellows/cargo-home;$CHECKOUT=/bellows/checkout;$WORKSPACE=<checkout- or cargo-home-relative>;$TARGET=/bellows/target;$PROFILE=/bellows/profile",
+    );
     for (name, value) in relevant_environment(&normalizer) {
         hash_field(&mut hasher, &format!("env:{name}"), value.as_bytes());
         components.insert(
@@ -1461,12 +1870,13 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
         );
     }
     let mut inputs = invocation.explicit_inputs.clone();
+    inputs.extend(resolve_static_libraries(invocation, &workspace)?);
     inputs.sort();
     inputs.dedup();
     for path in inputs {
         let absolute = canonical_compiler_input(&absolute_path(&path, &workspace))
             .with_context(|| format!("canonicalize compiler input {}", path.display()))?;
-        let input_digest = digest_file(&absolute)?;
+        let input_digest = digests.file(&absolute)?;
         components.insert(
             format!(
                 "explicit input changed: {}",
@@ -1489,7 +1899,22 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
         .first()
         .map(|p| normalizer.normalize(&absolute_path(p, &workspace).to_string_lossy()))
         .unwrap_or_default();
+    let mut pins = vec![(
+        format!("{PIN_PREFIX}$WORKSPACE"),
+        workspace.to_string_lossy().into_owned(),
+    )];
+    if let Some(target) = target_root(&workspace, &invocation.out_dir) {
+        pins.push((
+            format!("{PIN_PREFIX}$TARGET"),
+            canonical_base(target).to_string_lossy().into_owned(),
+        ));
+    }
+    if let Some(checkout) = root_normalizer.spellings("$CHECKOUT").first() {
+        pins.push((format!("{PIN_PREFIX}$CHECKOUT"), checkout.clone()));
+    }
+    let virtual_env = stable_empty_directories(invocation, &root_normalizer);
     Ok(Identity {
+        virtual_env,
         fingerprint: diagnostics::Fingerprint {
             key: static_key.clone(),
             components,
@@ -1497,8 +1922,141 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
         diagnostic_group: format!("{}:{source}", invocation.crate_name),
         static_key,
         normalizer,
+        root_normalizer,
         workspace,
+        digests,
+        pins,
     })
+}
+
+/// A procedural macro runs only inside rustc, so a checkout directory it
+/// bakes in (wit-bindgen bakes its build script's `OUT_DIR` as
+/// `DEBUG_OUTPUT_DIR`) is only used while compiling its consumers. When such
+/// a directory is empty, a machine-wide empty directory at a checkout-
+/// independent path is observably equivalent, and it makes the macro — and
+/// through its crate hash every consumer — identical across worktrees.
+/// Cargo's own variables and non-empty directories are never substituted.
+fn stable_empty_directories(
+    invocation: &Invocation,
+    root_normalizer: &PathNormalizer,
+) -> BTreeMap<String, String> {
+    let mut overrides = BTreeMap::new();
+    if !invocation.proc_macro_crate {
+        return overrides;
+    }
+    let Some(root) = user_cache_root().map(|root| root.join("stable-dirs-v1")) else {
+        return overrides;
+    };
+    for (name, value) in env::vars() {
+        if name.starts_with("CARGO_") {
+            continue;
+        }
+        let normalized = root_normalizer.normalize(&value);
+        if !(normalized.starts_with("$TARGET") || normalized.starts_with("$PROFILE")) {
+            continue;
+        }
+        let empty = fs::read_dir(&value).is_ok_and(|mut entries| entries.next().is_none());
+        if !empty {
+            continue;
+        }
+        let stable = root.join(&digest_bytes(normalized.as_bytes())[..32]);
+        if fs::create_dir_all(&stable).is_ok() {
+            overrides.insert(name, stable.to_string_lossy().into_owned());
+        }
+    }
+    overrides
+}
+
+/// The platform user cache, independent of per-workspace `BELLOWS_STATE_DIR`.
+fn user_cache_root() -> Option<PathBuf> {
+    if let Some(root) = env::var_os("XDG_CACHE_HOME") {
+        return Some(PathBuf::from(root).join("bellows"));
+    }
+    if let Some(root) = env::var_os("LOCALAPPDATA") {
+        return Some(PathBuf::from(root).join("Bellows"));
+    }
+    env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache/bellows"))
+}
+
+struct CompilerIdentity {
+    stdout: Vec<u8>,
+}
+
+/// `rustc -vV` output, memoized per concrete compiler binary. A rustup proxy
+/// resolves its toolchain from overrides and environment on every call, so
+/// only binaries that are not proxies are memoized.
+fn compiler_identity(rustc: &Path, state: &Path) -> Result<CompilerIdentity> {
+    let proxy = rustc.parent().is_none_or(|dir| {
+        dir.join(format!("rustup{}", env::consts::EXE_SUFFIX))
+            .exists()
+    });
+    let memo = (!proxy && rustc.is_absolute())
+        .then(|| fs::metadata(rustc).ok())
+        .flatten()
+        .map(|metadata| {
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |time| time.as_nanos());
+            let key = digest_bytes(
+                format!("{}\0{}\0{modified}", rustc.display(), metadata.len()).as_bytes(),
+            );
+            state.join("compilers-v1").join(key)
+        });
+    if let Some(memo) = &memo
+        && let Ok(stdout) = fs::read(memo)
+        && !stdout.is_empty()
+    {
+        return Ok(CompilerIdentity { stdout });
+    }
+    let output = Command::new(rustc).arg("-vV").output()?;
+    if !output.status.success() {
+        bail!("rustc -vV failed")
+    }
+    if let Some(memo) = memo {
+        let _ = atomic_write(&memo, &output.stdout);
+    }
+    Ok(CompilerIdentity {
+        stdout: output.stdout,
+    })
+}
+
+/// Files a library compile bundles for `-l static=NAME`: every candidate in
+/// every `-L native=` directory, so a newly shadowing archive also misses.
+fn resolve_static_libraries(invocation: &Invocation, workspace: &Path) -> Result<Vec<PathBuf>> {
+    if invocation.kind != OutputKind::Library || invocation.static_libraries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut found = Vec::new();
+    for library in &invocation.static_libraries {
+        let names = if library.verbatim {
+            vec![library.name.clone()]
+        } else if invocation.naming.msvc {
+            vec![format!("{}.lib", library.name)]
+        } else {
+            vec![
+                format!("lib{}.a", library.name),
+                format!("{}.lib", library.name),
+            ]
+        };
+        let before = found.len();
+        for dir in &invocation.native_search {
+            for name in &names {
+                let path = absolute_path(&dir.join(name), workspace);
+                if path.is_file() {
+                    found.push(path);
+                }
+            }
+        }
+        if found.len() == before {
+            bail!(
+                "static native library {} was not found in the -L native directories",
+                library.name
+            )
+        }
+    }
+    Ok(found)
 }
 
 fn relevant_environment(normalizer: &PathNormalizer) -> BTreeMap<String, String> {
@@ -1509,11 +2067,29 @@ fn relevant_environment(normalizer: &PathNormalizer) -> BTreeMap<String, String>
 }
 
 fn is_relevant_environment_name(name: &str) -> bool {
+    // Scheduling, terminal and rustup-proxy bookkeeping never reach rustc's
+    // output. A crate that reads one with env!/option_env! is still tracked
+    // exactly through dep-info.
     const EXCLUDED_CARGO_CONTROL: &[&str] = &[
+        "CARGO_BUILD_JOBS",
+        "CARGO_INCREMENTAL",
         "CARGO_MAKEFLAGS",
+        "CARGO_PRIMARY_PACKAGE",
         "CARGO_TARGET_TMPDIR",
+        "CARGO_TERM_COLOR",
+        "CARGO_TERM_PROGRESS_WHEN",
+        "CARGO_TERM_PROGRESS_WIDTH",
+        "CARGO_TERM_QUIET",
+        "CARGO_TERM_VERBOSE",
+        "CLIPPY_TERMINAL_WIDTH",
         "RUSTC_WRAPPER",
         "RUSTC_WORKSPACE_WRAPPER",
+        "RUSTUP_TOOLCHAIN_SOURCE",
+        "RUST_BACKTRACE",
+        "RUST_LOG",
+        "RUST_MIN_STACK",
+        "RUST_RECURSION_COUNT",
+        "RUST_TEST_THREADS",
     ];
     const EXACT: &[&str] = &[
         "AR",
@@ -1528,6 +2104,8 @@ fn is_relevant_environment_name(name: &str) -> bool {
         "LC_ALL",
         "LD_LIBRARY_PATH",
         "LIB",
+        "LIBPATH",
+        "LIBRARY_PATH",
         "MACOSX_DEPLOYMENT_TARGET",
         "NM",
         "OBJCOPY",
@@ -1541,6 +2119,14 @@ fn is_relevant_environment_name(name: &str) -> bool {
         "STRIP",
         "TARGET",
         "TZ",
+        "UCRTVersion",
+        "UniversalCRTSdkDir",
+        "VCINSTALLDIR",
+        "VCToolsInstallDir",
+        "VCToolsVersion",
+        "VSINSTALLDIR",
+        "WindowsSdkDir",
+        "WindowsSDKVersion",
     ];
     const PREFIXES: &[&str] = &[
         "AR_", "CARGO_", "CC_", "CFLAGS", "CLIPPY_", "CPPFLAGS", "CXX_", "CXXFLAGS", "DEP_",
@@ -1548,6 +2134,7 @@ fn is_relevant_environment_name(name: &str) -> bool {
     ];
     const BELLOWS_CONTROL: &[&str] = &[
         "BELLOWS_AUTH_TOKEN",
+        "BELLOWS_READ_ONLY",
         "BELLOWS_DEMO_COMPILE_DELAY_MS",
         "BELLOWS_EVENT_LOG",
         "BELLOWS_LOCAL_ONLY",
@@ -1572,20 +2159,62 @@ fn validate_candidate(
     identity: &Identity,
 ) -> std::result::Result<(), String> {
     validate_candidate_manifest(candidate).map_err(|error| error.to_string())?;
+    // Environment first: it is free, and a checkout pin rejects before any
+    // large link input is read. Named variables before pins, so a miss names
+    // the variable whose embedded path differs.
+    let (pins, named): (Vec<_>, Vec<_>) = candidate
+        .env
+        .iter()
+        .partition(|input| input.name.starts_with(PIN_PREFIX));
+    for input in named.into_iter().chain(pins) {
+        let actual = if input.name.starts_with(PIN_PREFIX) {
+            match identity.pin_value(&input.name) {
+                Some(value) => EnvInput::capture(&input.name, Some(value)),
+                None => return Err(format!("environment changed: {}", input.name)),
+            }
+        } else {
+            let value = identity.env_value(&input.name);
+            if input.normalized {
+                match value {
+                    Some(value) => EnvInput::capture_normalized(
+                        &input.name,
+                        &identity.root_normalizer.normalize(&value),
+                    ),
+                    None => EnvInput::capture(&input.name, None),
+                }
+            } else {
+                EnvInput::capture(&input.name, value.as_deref())
+            }
+        };
+        if actual.value_digest != input.value_digest {
+            return Err(if input.name.starts_with(PIN_PREFIX) {
+                format!(
+                    "environment changed: {} (the cached output embeds another checkout's path)",
+                    input.name
+                )
+            } else {
+                format!("environment changed: {}", input.name)
+            });
+        }
+    }
     for input in &candidate.files {
         let localized = identity.normalizer.localize(&input.path);
         let path = absolute_path(Path::new(&localized), &identity.workspace);
-        let actual =
-            digest_file(&path).map_err(|_| format!("input disappeared: {}", input.path))?;
+        let actual = identity
+            .digests
+            .file(&path)
+            .map_err(|_| format!("input disappeared: {}", input.path))?;
         if actual != input.digest {
             return Err(format!("input changed: {}", input.path));
         }
     }
-    for input in &candidate.env {
-        let value = env::var(&input.name).ok();
-        let actual = EnvInput::capture(&input.name, value.as_deref());
-        if actual.value_digest != input.value_digest {
-            return Err(format!("environment changed: {}", input.name));
+    for input in &candidate.host_files {
+        let actual = identity
+            .digests
+            .file(Path::new(&input.path))
+            .map_err(|_| format!("input disappeared: {}", input.path))?;
+        if actual != input.digest {
+            return Err(format!("input changed: {}", input.path));
         }
     }
     Ok(())
@@ -1631,7 +2260,7 @@ fn try_candidates(
                     &invocation.crate_name,
                     Some(&identity.static_key),
                     Some(&candidate.action_key),
-                    "restored remote compiler result",
+                    &hit_detail("restored remote compiler result", invocation, candidate),
                 );
                 return Ok(Some(success_status()));
             }
@@ -1671,7 +2300,11 @@ fn try_l1_candidates(
                     &invocation.crate_name,
                     Some(&identity.static_key),
                     Some(&candidate.action_key),
-                    "restored runner-local compiler result",
+                    &hit_detail(
+                        "restored runner-local compiler result",
+                        invocation,
+                        candidate,
+                    ),
                 );
                 return Ok(Some(success_status()));
             }
@@ -1699,12 +2332,53 @@ fn success_status() -> ExitStatus {
     ExitStatus::from_raw(0)
 }
 
+fn hit_detail(prefix: &str, invocation: &Invocation, candidate: &ActionCandidate) -> String {
+    let mut detail = format!("{prefix} ({} output", invocation.kind.name());
+    if !candidate.proc_macros.is_empty() {
+        detail.push_str(&format!(
+            "; proc macros: {}",
+            candidate.proc_macros.join(", ")
+        ));
+    }
+    detail.push(')');
+    detail
+}
+
 fn restore(
     remote: &Remote,
     l1: Option<&Store>,
     invocation: &Invocation,
     identity: &Identity,
     candidate: &ActionCandidate,
+) -> Result<()> {
+    restore_with(invocation, identity, candidate, |digest| {
+        let bytes = remote.blob(digest)?;
+        if let Some(store) = l1 {
+            let _ = store.put_blob(digest, &bytes);
+        }
+        Ok(bytes)
+    })
+}
+
+fn restore_l1(
+    store: &Store,
+    invocation: &Invocation,
+    identity: &Identity,
+    candidate: &ActionCandidate,
+) -> Result<()> {
+    restore_with(invocation, identity, candidate, |digest| {
+        store.read_blob(digest)
+    })
+    .context("L1")
+}
+
+/// Verify the manifest describes exactly this unit's outputs, fetch and verify
+/// every blob, then write each output atomically with its mode.
+fn restore_with(
+    invocation: &Invocation,
+    identity: &Identity,
+    candidate: &ActionCandidate,
+    fetch: impl Fn(&str) -> Result<Vec<u8>>,
 ) -> Result<()> {
     validate_candidate_manifest(candidate)?;
     let supplied = candidate
@@ -1724,41 +2398,34 @@ fn restore(
     }
     let mut downloaded = Vec::with_capacity(candidate.artifacts.len());
     for artifact in &candidate.artifacts {
-        if !invocation.expected_names.contains(&artifact.file_name) {
+        let allowed = match invocation.kind {
+            OutputKind::Library => invocation.expected_names.contains(&artifact.file_name),
+            OutputKind::Linked => invocation.owns(&artifact.file_name),
+        };
+        if !allowed {
             bail!("manifest contains unexpected output {}", artifact.file_name)
         }
-        let stored = remote.blob(&artifact.digest)?;
-        downloaded.push((artifact, stored));
+        downloaded.push((artifact, fetch(&artifact.digest)?));
     }
-    let stdout_blob = remote.blob(&candidate.stdout.digest)?;
-    let stderr_blob = remote.blob(&candidate.stderr.digest)?;
+    let stdout_blob = fetch(&candidate.stdout.digest)?;
+    let stderr_blob = fetch(&candidate.stderr.digest)?;
     if stdout_blob.len() as u64 != candidate.stdout.len
         || stderr_blob.len() as u64 != candidate.stderr.len
     {
         bail!("compiler stream length does not match manifest")
     }
     for (artifact, stored) in downloaded {
-        if let Some(store) = l1 {
-            let _ = store.put_blob(&artifact.digest, &stored);
-        }
         let bytes = if artifact.file_name.ends_with(".d") {
             transform_dep_info(&stored, &identity.normalizer, true)
         } else {
             stored
         };
-        atomic_write(&invocation.out_dir.join(&artifact.file_name), &bytes)?;
-        #[cfg(unix)]
-        if artifact.executable {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(
-                invocation.out_dir.join(&artifact.file_name),
-                fs::Permissions::from_mode(0o755),
-            )?;
+        let destination = invocation.out_dir.join(&artifact.file_name);
+        install_output(&destination, &bytes)?;
+        set_file_executable(&destination, artifact.executable)?;
+        if !artifact.file_name.ends_with(".d") {
+            identity.digests.remember(&destination, &artifact.digest);
         }
-    }
-    if let Some(store) = l1 {
-        let _ = store.put_blob(&candidate.stdout.digest, &stdout_blob);
-        let _ = store.put_blob(&candidate.stderr.digest, &stderr_blob);
     }
     let stdout = transform_compiler_stream(&stdout_blob, &identity.normalizer, true);
     let stderr = transform_compiler_stream(&stderr_blob, &identity.normalizer, true);
@@ -1767,64 +2434,56 @@ fn restore(
     Ok(())
 }
 
-fn restore_l1(
-    store: &Store,
-    invocation: &Invocation,
-    identity: &Identity,
-    candidate: &ActionCandidate,
-) -> Result<()> {
-    validate_candidate_manifest(candidate)?;
-    let supplied = candidate
-        .artifacts
-        .iter()
-        .map(|artifact| artifact.file_name.as_str())
-        .collect::<BTreeSet<_>>();
-    for expected in &invocation.expected_names {
-        let rmeta_may_be_folded_into_rlib = expected.ends_with(".rmeta")
-            && invocation
-                .expected_names
-                .iter()
-                .any(|name| name.ends_with(".rlib"));
-        if !supplied.contains(expected.as_str()) && !rmeta_may_be_folded_into_rlib {
-            bail!("L1 manifest is missing expected output {expected}")
+/// Replace an output file. Windows refuses to replace an executable image
+/// that is running (a test binary still executing, or a loaded DLL) but
+/// allows renaming it; move it aside and sweep leftovers on later restores.
+fn install_output(destination: &Path, bytes: &[u8]) -> Result<()> {
+    match atomic_write(destination, bytes) {
+        Ok(()) => Ok(()),
+        #[cfg(windows)]
+        Err(error) if destination.exists() => {
+            let parent = destination.parent().context("output has no parent")?;
+            let aside = parent.join(format!(
+                ".bellows-replaced-{}-{}-{}",
+                std::process::id(),
+                now_ms(),
+                destination
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .unwrap_or("output")
+            ));
+            fs::rename(destination, &aside).with_context(|| {
+                format!("replace in-use output {}: {error:#}", destination.display())
+            })?;
+            atomic_write(destination, bytes)?;
+            sweep_replaced(parent);
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(windows)]
+fn sweep_replaced(dir: &Path) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(".bellows-replaced-"))
+            {
+                // Still-running images stay locked and are retried later.
+                let _ = fs::remove_file(entry.path());
+            }
         }
     }
-    let mut downloaded = Vec::with_capacity(candidate.artifacts.len());
-    for artifact in &candidate.artifacts {
-        if !invocation.expected_names.contains(&artifact.file_name) {
-            bail!(
-                "L1 manifest contains unexpected output {}",
-                artifact.file_name
-            )
-        }
-        let stored = store.read_blob(&artifact.digest)?;
-        downloaded.push((artifact, stored));
-    }
-    let stdout_blob = store.read_blob(&candidate.stdout.digest)?;
-    let stderr_blob = store.read_blob(&candidate.stderr.digest)?;
-    if stdout_blob.len() as u64 != candidate.stdout.len
-        || stderr_blob.len() as u64 != candidate.stderr.len
-    {
-        bail!("L1 compiler stream length does not match manifest")
-    }
-    for (artifact, stored) in downloaded {
-        let bytes = if artifact.file_name.ends_with(".d") {
-            transform_dep_info(&stored, &identity.normalizer, true)
-        } else {
-            stored
-        };
-        atomic_write(&invocation.out_dir.join(&artifact.file_name), &bytes)?;
-    }
-    let stdout = transform_compiler_stream(&stdout_blob, &identity.normalizer, true);
-    let stderr = transform_compiler_stream(&stderr_blob, &identity.normalizer, true);
-    std::io::stdout().write_all(&stdout)?;
-    std::io::stderr().write_all(&stderr)?;
-    Ok(())
 }
 
 struct Captured {
     candidate: ActionCandidate,
     blobs: BTreeMap<String, Vec<u8>>,
+    /// The outputs embed a checkout root; the candidate carries pin inputs.
+    pinned: bool,
 }
 
 fn compile_and_capture(
@@ -1837,26 +2496,80 @@ fn compile_and_capture(
     {
         thread::sleep(Duration::from_millis(delay.min(10_000)));
     }
-    let mut args = invocation.args.clone();
-    args.push("--remap-path-prefix".into());
-    args.push(format!(
-        "{}=/bellows/workspace",
-        identity.workspace.display()
-    ));
-    if let Some(target) = target_root(&identity.workspace, &invocation.out_dir) {
-        args.push("--remap-path-prefix".into());
-        args.push(format!("{}=/bellows/target", target.display()));
+    // Incremental policy: publish only a from-scratch incremental compile.
+    // A compile that reused an existing session could carry state from
+    // another source version; its result stays in this checkout.
+    //
+    // Cargo shares one incremental directory between all units, where a
+    // crate's lib, test harness and binaries all create `{crate}-*` sessions
+    // concurrently. Each unit gets its own subdirectory instead, named so
+    // `cargo clean -p` still removes it, which makes "from scratch" exact.
+    let unit_incremental = invocation.incremental.as_deref().map(|dir| {
+        absolute_path(dir, &identity.workspace).join(format!(
+            "{}-bellows{}",
+            invocation.crate_name,
+            invocation
+                .unit
+                .strip_prefix(&invocation.crate_name)
+                .unwrap_or_default()
+        ))
+    });
+    let reused_session = unit_incremental
+        .as_deref()
+        .is_some_and(|dir| fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_some()));
+    let mut args = Vec::with_capacity(invocation.args.len() + 6);
+    let mut rewrite_next = false;
+    for arg in &invocation.args {
+        let replacement = unit_incremental
+            .as_ref()
+            .map(|dir| format!("incremental={}", dir.display()));
+        if std::mem::take(&mut rewrite_next) && arg.starts_with("incremental=") {
+            args.push(replacement.unwrap_or_else(|| arg.clone()));
+        } else if arg.starts_with("-Cincremental=") {
+            args.push(format!(
+                "-C{}",
+                replacement.unwrap_or_else(|| arg[2..].to_owned())
+            ));
+        } else {
+            rewrite_next = arg == "-C";
+            args.push(arg.clone());
+        }
     }
+    for (spellings, virtual_root) in remap_plan(identity) {
+        for spelling in spellings {
+            args.push("--remap-path-prefix".into());
+            args.push(format!("{spelling}={virtual_root}"));
+        }
+    }
+    // rustc writes the exact linker command to a file, leaving the stdout
+    // Cargo reads untouched.
+    let link_record = if invocation.kind == OutputKind::Linked {
+        fs::create_dir_all(&invocation.out_dir).context("create output directory")?;
+        let record = tempfile::Builder::new()
+            .prefix(".bellows-link-")
+            .tempfile_in(&invocation.out_dir)
+            .context("create link-args record")?
+            .into_temp_path();
+        args.push(format!("--print=link-args={}", record.display()));
+        Some(record)
+    } else {
+        None
+    };
+    let started = std::time::SystemTime::now();
     let mut child = Command::new(&invocation.rustc)
         .args(&args)
+        .envs(&identity.virtual_env)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .context("start rustc")?;
     let stdout = child.stdout.take().context("capture rustc stdout")?;
     let stderr = child.stderr.take().context("capture rustc stderr")?;
-    let stdout_thread = thread::spawn(move || tee(stdout, std::io::stdout()));
-    let stderr_thread = thread::spawn(move || tee(stderr, std::io::stderr()));
+    let roots = virtual_roots(identity);
+    let stderr_roots = roots.clone();
+    let stdout_thread = thread::spawn(move || tee_devirtualized(stdout, std::io::stdout(), &roots));
+    let stderr_thread =
+        thread::spawn(move || tee_devirtualized(stderr, std::io::stderr(), &stderr_roots));
     let status = child.wait()?;
     let stdout = stdout_thread
         .join()
@@ -1867,21 +2580,53 @@ fn compile_and_capture(
     if !status.success() {
         return Ok((status, None));
     }
-
-    let captured = match capture_outputs(invocation, identity, stdout, stderr) {
+    let link_command = match &link_record {
+        Some(record) => Some(fs::read_to_string(record).context("read link-args record")?),
+        None => None,
+    };
+    drop(link_record);
+    let result = if reused_session {
+        Err(anyhow::Error::new(NotStored(
+            "incremental compile reused an existing session; result stays in this checkout".into(),
+        )))
+    } else {
+        capture_outputs(
+            invocation,
+            identity,
+            stdout,
+            stderr,
+            started,
+            link_command.as_deref(),
+        )
+    };
+    let captured = match result {
         Ok(captured) => Some(captured),
         Err(error) => {
-            record_event(
-                "fallback",
-                &invocation.crate_name,
-                Some(&identity.static_key),
-                None,
-                &format!("capture skipped after successful rustc: {error:#}"),
-            );
+            if let Some(reason) = error.downcast_ref::<NotStored>() {
+                record_event(
+                    "not_stored",
+                    &invocation.crate_name,
+                    Some(&identity.static_key),
+                    None,
+                    &format!("compiled but not stored: {reason}"),
+                );
+            } else {
+                record_event(
+                    "fallback",
+                    &invocation.crate_name,
+                    Some(&identity.static_key),
+                    None,
+                    &format!("capture skipped after successful rustc: {error:#}"),
+                );
+            }
             None
         }
     };
     Ok((status, captured))
+}
+
+fn not_stored(reason: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(NotStored(reason.into()))
 }
 
 // rustc's JSON diagnostics/artifact notifications contain escaped strings.
@@ -1944,24 +2689,73 @@ fn transform_dep_info(bytes: &[u8], normalizer: &PathNormalizer, localize: bool)
     .into_bytes()
 }
 
+/// Outputs of a linked unit: every regular file named for this unit that
+/// rustc wrote during the compile. The predicted primary outputs must be
+/// among them; directory outputs (`.dSYM`) are not modeled.
+fn discover_linked_outputs(
+    invocation: &Invocation,
+    started: std::time::SystemTime,
+) -> Result<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    // Allow for filesystems whose timestamps are coarser than the clock.
+    let threshold = started - Duration::from_secs(2);
+    for entry in fs::read_dir(&invocation.out_dir)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !invocation.owns(&name) {
+            continue;
+        }
+        let metadata = fs::symlink_metadata(entry.path())?;
+        let fresh = metadata.modified().is_ok_and(|time| time >= threshold);
+        if !fresh {
+            continue;
+        }
+        if !metadata.is_file() {
+            return Err(not_stored(format!(
+                "rustc produced a non-file output {name} (split debuginfo directories are not modeled)"
+            )));
+        }
+        names.insert(name);
+    }
+    for expected in &invocation.expected_names {
+        if !names.contains(expected) {
+            bail!("rustc succeeded but expected output {expected} is absent")
+        }
+    }
+    Ok(names)
+}
+
 fn capture_outputs(
     invocation: &Invocation,
     identity: &Identity,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+    started: std::time::SystemTime,
+    link_command: Option<&str>,
 ) -> Result<Captured> {
+    let names = match invocation.kind {
+        OutputKind::Library => invocation.expected_names.clone(),
+        OutputKind::Linked => discover_linked_outputs(invocation, started)?,
+    };
+    // Each root is scanned separately: a registry crate's "workspace" is its
+    // registry directory, identical in every checkout, and pinning it must
+    // not also pin the per-checkout target directory.
+    let scanners = ["$CHECKOUT", "$WORKSPACE", "$TARGET"].map(|token| {
+        (
+            token,
+            leak::Scanner::new(&identity.root_normalizer.spellings(token)),
+        )
+    });
+    let mut leaked = BTreeSet::<&str>::new();
     let mut blobs = BTreeMap::new();
     let mut artifacts = Vec::new();
     let mut dep_text = None;
-    for name in &invocation.expected_names {
+    for name in &names {
         let path = invocation.out_dir.join(name);
         if !path.is_file() {
-            if name.ends_with(".rmeta")
-                && invocation
-                    .expected_names
-                    .iter()
-                    .any(|n| n.ends_with(".rlib"))
-            {
+            if name.ends_with(".rmeta") && names.iter().any(|n| n.ends_with(".rlib")) {
                 continue;
             }
             bail!(
@@ -1975,9 +2769,33 @@ fn capture_outputs(
             dep_text = Some(String::from_utf8(raw).context("dep-info is not UTF-8")?);
             normalized
         } else {
+            if name.ends_with(".rlib") {
+                check_bundled_members(invocation, &raw, &identity.workspace)?;
+            }
+            // Linker-written companions (program databases, export files,
+            // import libraries) record the linker's working directory and
+            // module paths; see `leaks_in_program_database`.
+            let lower = name.to_ascii_lowercase();
+            let program_database = invocation.kind == OutputKind::Linked
+                && [".pdb", ".exp", ".lib"]
+                    .iter()
+                    .any(|extension| lower.ends_with(extension));
+            for (token, scanner) in &scanners {
+                let leaks = if program_database {
+                    scanner.leaks_in_program_database(&raw)
+                } else {
+                    scanner.leaks(&raw)
+                };
+                if !leaked.contains(token) && leaks {
+                    leaked.insert(token);
+                }
+            }
             raw
         };
         let digest = digest_bytes(&stored);
+        if !name.ends_with(".d") {
+            identity.digests.remember(&path, &digest);
+        }
         let executable = is_executable(&path)?;
         blobs.insert(digest.clone(), stored);
         artifacts.push(Artifact {
@@ -1990,9 +2808,32 @@ fn capture_outputs(
     let (dep_files, dep_env) = parse_dep_info(&dep_text);
     let mut file_paths = invocation.explicit_inputs.clone();
     file_paths.extend(dep_files.into_iter().map(PathBuf::from));
+    file_paths.extend(resolve_static_libraries(invocation, &identity.workspace)?);
+    let mut files = Vec::new();
+    let mut host_files = Vec::new();
+    let mut record = |absolute: &Path, host: bool| -> Result<()> {
+        let digest = identity.digests.file(absolute)?;
+        let normalized = identity.normalizer.normalize(&absolute.to_string_lossy());
+        if bellows_core::validate_normalized_input_path(&normalized).is_ok() {
+            files.push(FileInput {
+                path: normalized,
+                digest,
+            });
+        } else if host {
+            host_files.push(FileInput {
+                path: absolute.to_string_lossy().into_owned(),
+                digest,
+            });
+        } else {
+            bail!(
+                "compiler input outside every normalized root: {}",
+                absolute.display()
+            )
+        }
+        Ok(())
+    };
     file_paths.sort();
     file_paths.dedup();
-    let mut files = Vec::new();
     for path in file_paths {
         let absolute = absolute_path(&path, &identity.workspace);
         if !absolute.is_file() {
@@ -2003,20 +2844,74 @@ fn capture_outputs(
         }
         let absolute = canonical_compiler_input(&absolute)
             .with_context(|| format!("canonicalize rustc dependency {}", absolute.display()))?;
-        files.push(FileInput {
-            path: identity.normalizer.normalize(&absolute.to_string_lossy()),
-            digest: digest_file(&absolute)?,
-        });
+        record(&absolute, true)?;
+    }
+    if let Some(text) = link_command {
+        let command = link::parse_link_command(text).context("parse linker command")?;
+        let sysroot = sysroot(&invocation.rustc)?;
+        let outputs = |path: &Path| {
+            path.parent() == Some(invocation.out_dir.as_path())
+                && path
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| invocation.owns(name))
+        };
+        let inputs = link::link_inputs(
+            &command,
+            &link::LinkContext {
+                cwd: &identity.workspace,
+                msvc: invocation.naming.msvc,
+                outputs: &outputs,
+            },
+        )?;
+        let sysroot = sysroot.canonicalize().unwrap_or(sysroot);
+        for path in inputs.files {
+            // Toolchain files are identified by `rustc -vV`; symlinked system
+            // libraries (libfoo.so -> libfoo.so.1) are recorded by content.
+            let absolute = absolute_path(&path, &identity.workspace);
+            let resolved = absolute.canonicalize().unwrap_or(absolute);
+            if resolved.starts_with(&sysroot) {
+                continue;
+            }
+            record(&resolved, true)?;
+        }
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
     files.dedup_by(|a, b| a.path == b.path);
+    host_files.sort_by(|a, b| a.path.cmp(&b.path));
+    host_files.dedup_by(|a, b| a.path == b.path);
     let mut env_inputs = dep_env
         .into_iter()
         .map(|(name, _)| {
-            let value = env::var(&name).ok();
-            EnvInput::capture(&name, value.as_deref())
+            let value = identity.env_value(&name);
+            match value {
+                Some(value) => {
+                    let normalized = identity.root_normalizer.normalize(&value);
+                    // Compare normalized only when no output embeds a root
+                    // this value names (the profile directory is inside the
+                    // target directory).
+                    let names_leaked_root = leaked.iter().any(|token| {
+                        normalized.contains(token)
+                            || (*token == "$TARGET" && normalized.contains("$PROFILE"))
+                    });
+                    if normalized != value && !names_leaked_root {
+                        EnvInput::capture_normalized(&name, &normalized)
+                    } else {
+                        EnvInput::capture(&name, Some(&value))
+                    }
+                }
+                None => EnvInput::capture(&name, None),
+            }
         })
         .collect::<Vec<_>>();
+    let pinned = !leaked.is_empty();
+    env_inputs.extend(
+        identity
+            .pins
+            .iter()
+            .filter(|(name, _)| leaked.iter().any(|token| name.ends_with(token)))
+            .map(|(name, value)| EnvInput::capture(name, Some(value))),
+    );
     env_inputs.sort_by(|a, b| a.name.cmp(&b.name));
     env_inputs.dedup_by(|a, b| a.name == b.name);
     let normalized_stdout = transform_compiler_stream(&stdout, &identity.normalizer, false);
@@ -2027,7 +2922,7 @@ fn capture_outputs(
     let stderr_len = normalized_stderr.len() as u64;
     blobs.insert(stdout_digest.clone(), normalized_stdout);
     blobs.insert(stderr_digest.clone(), normalized_stderr);
-    let action_key = compiler_action_key(&identity.static_key, &files, &env_inputs);
+    let action_key = compiler_action_key(&identity.static_key, &files, &host_files, &env_inputs);
     let candidate = ActionCandidate {
         protocol: PROTOCOL_VERSION,
         static_key: identity.static_key.clone(),
@@ -2035,6 +2930,7 @@ fn capture_outputs(
         crate_name: invocation.crate_name.clone(),
         created_ms: now_ms(),
         files,
+        host_files,
         env: env_inputs,
         artifacts,
         stdout: StreamArtifact {
@@ -2045,8 +2941,274 @@ fn capture_outputs(
             digest: stderr_digest,
             len: stderr_len,
         },
+        proc_macros: invocation.proc_macros.clone(),
     };
-    Ok(Captured { candidate, blobs })
+    validate_candidate_manifest(&candidate).map_err(|error| {
+        if error.to_string().contains("cardinality") {
+            not_stored(format!("{error:#}"))
+        } else {
+            error
+        }
+    })?;
+    Ok(Captured {
+        candidate,
+        blobs,
+        pinned,
+    })
+}
+
+fn sysroot(rustc: &Path) -> Result<PathBuf> {
+    let output = Command::new(rustc)
+        .args(["--print", "sysroot"])
+        .output()
+        .context("run rustc --print sysroot")?;
+    if !output.status.success() {
+        bail!("rustc --print sysroot failed")
+    }
+    Ok(PathBuf::from(String::from_utf8(output.stdout)?.trim()))
+}
+
+/// rustc bundles `-l static` archives, and archives named by `#[link(kind =
+/// "static")]` in source, into the rlib. Only archives resolved from `-l`
+/// are inputs; any other native member means an unmodeled bundled library.
+fn check_bundled_members(invocation: &Invocation, rlib: &[u8], workspace: &Path) -> Result<()> {
+    let members = archive::member_names(rlib).context("read rlib members")?;
+    let foreign = members
+        .into_iter()
+        .filter(|name| name != "lib.rmeta" && !name.ends_with(".rcgu.o") && !name.starts_with('/'))
+        .collect::<BTreeSet<_>>();
+    if foreign.is_empty() {
+        return Ok(());
+    }
+    let mut declared = BTreeSet::new();
+    for library in resolve_static_libraries(invocation, workspace).unwrap_or_default() {
+        if let Ok(bytes) = fs::read(&library)
+            && let Ok(names) = archive::member_names(&bytes)
+        {
+            declared.extend(names);
+        }
+    }
+    if let Some(unknown) = foreign.iter().find(|name| !declared.contains(*name)) {
+        return Err(not_stored(format!(
+            "rlib bundles native member {unknown} that no -l static library supplies (#[link] in source)"
+        )));
+    }
+    Ok(())
+}
+
+/// Each root's spellings and the checkout-independent path rustc embeds in
+/// their place, least specific first (rustc applies the last matching
+/// mapping; on Windows the canonical form is a verbatim `\\?\C:\…` path that
+/// never prefixes rustc's own paths, so every spelling is listed).
+///
+/// A virtual path must mean the same directory in every compile of a
+/// session: a dependency's metadata is read by its consumers, which reverse
+/// the mapping to render source snippets. Cargo runs rustc from a path
+/// dependency's own directory, so the working directory is remapped through
+/// its place in the session checkout (`/bellows/checkout/crates/x`) or in
+/// Cargo's home (`/bellows/cargo-home/registry/…`) rather than one shared
+/// `/bellows/workspace`.
+fn remap_plan(identity: &Identity) -> Vec<(Vec<String>, String)> {
+    // rustc reverse-maps a virtual path (to reopen a dependency's source for
+    // a diagnostic snippet) only when exactly one mapping produces it, so
+    // list only spellings rustc can see: never the verbatim form, and on
+    // Windows never the forward-slash duplicate.
+    let usable = |spellings: Vec<String>| {
+        let mut seen = BTreeSet::new();
+        spellings
+            .into_iter()
+            .filter(|spelling| {
+                let verbatim = spelling.starts_with(r"\\?\");
+                let forward = cfg!(windows) && spelling.contains('/');
+                !(verbatim || forward)
+            })
+            .filter(|spelling| seen.insert(spelling.clone()))
+            .collect::<Vec<_>>()
+    };
+    let canonical = |spellings: &[String]| {
+        spellings
+            .iter()
+            .find_map(|spelling| Path::new(spelling).canonicalize().ok())
+    };
+    let relative = |path: &Path, root: &Path| {
+        path.strip_prefix(root).ok().map(|rest| {
+            rest.components()
+                .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        })
+    };
+    // Native separators below the virtual root, as rustc joins them.
+    let under = |base: &str, parts: Vec<String>| {
+        std::iter::once(base.to_owned())
+            .chain(parts)
+            .collect::<Vec<_>>()
+            .join(std::path::MAIN_SEPARATOR_STR)
+    };
+    let cargo_home = identity.normalizer.spellings("$CARGO_HOME");
+    let checkout = identity.root_normalizer.spellings("$CHECKOUT");
+    let workspace_spellings = identity.root_normalizer.spellings("$WORKSPACE");
+    let workspace = &identity.workspace;
+    let workspace_virtual = match (canonical(&checkout), canonical(&cargo_home)) {
+        (Some(root), _) if relative(workspace, &root).is_some() => {
+            under("/bellows/checkout", relative(workspace, &root).unwrap())
+        }
+        (_, Some(root)) if relative(workspace, &root).is_some() => {
+            under("/bellows/cargo-home", relative(workspace, &root).unwrap())
+        }
+        // Without a session checkout the working directory is the checkout.
+        (None, _) => "/bellows/checkout".to_owned(),
+        _ => "/bellows/workspace".to_owned(),
+    };
+    vec![
+        (usable(cargo_home), "/bellows/cargo-home".to_owned()),
+        (usable(checkout), "/bellows/checkout".to_owned()),
+        (usable(workspace_spellings), workspace_virtual),
+        (
+            usable(identity.root_normalizer.spellings("$TARGET")),
+            "/bellows/target".to_owned(),
+        ),
+        (
+            usable(identity.root_normalizer.spellings("$PROFILE")),
+            "/bellows/profile".to_owned(),
+        ),
+    ]
+    .into_iter()
+    .filter(|(spellings, _)| !spellings.is_empty())
+    .collect()
+}
+
+/// Remapping keeps checkout paths out of objects and debuginfo, but rustc
+/// also applies it to diagnostics. Messages are rewritten back to this
+/// checkout's real paths, so compiler output (and snapshot tests of it, such
+/// as trybuild) reads exactly as without Bellows. Stored streams are then
+/// normalized from the real paths and localized again on every replay.
+fn virtual_roots(identity: &Identity) -> Vec<(String, String)> {
+    // Rewrite to the spelling rustc saw, which is Cargo's, not the canonical
+    // one: Windows temp directories, for example, are often reached through
+    // an 8.3 name (`RUNNER~1`). rustc's working directory is exactly the
+    // wrapper's, and the checkout is the matching ancestor of it.
+    let cwd = env::current_dir().ok();
+    let checkout_display = identity
+        .root_normalizer
+        .spellings("$CHECKOUT")
+        .iter()
+        .find_map(|spelling| {
+            let root = Path::new(spelling).canonicalize().ok()?;
+            let depth = identity
+                .workspace
+                .strip_prefix(&root)
+                .ok()?
+                .components()
+                .count();
+            cwd.as_ref()?.ancestors().nth(depth).map(Path::to_path_buf)
+        });
+    let as_given = |spellings: &[String]| {
+        spellings
+            .iter()
+            .find(|spelling| {
+                Path::new(spelling)
+                    .canonicalize()
+                    .is_ok_and(|canonical| canonical != Path::new(spelling))
+            })
+            .or_else(|| spellings.first())
+            .cloned()
+    };
+    let workspace = identity.root_normalizer.spellings("$WORKSPACE");
+    let mut roots = remap_plan(identity)
+        .into_iter()
+        .filter_map(|(spellings, virtual_root)| {
+            let display = if spellings.iter().any(|s| workspace.contains(s))
+                && virtual_root != "/bellows/checkout"
+                && let Some(cwd) = &cwd
+            {
+                Some(cwd.to_string_lossy().into_owned())
+            } else if virtual_root == "/bellows/checkout"
+                && let Some(checkout) = &checkout_display
+            {
+                Some(checkout.to_string_lossy().into_owned())
+            } else {
+                as_given(&spellings)
+            };
+            display.map(|real| (virtual_root, real))
+        })
+        .collect::<Vec<_>>();
+    // Longest virtual prefix first: `/bellows/checkout/crates/x` before
+    // `/bellows/checkout`.
+    roots.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    roots.dedup_by(|a, b| a.0 == b.0);
+    roots
+}
+
+fn devirtualize_line(line: &[u8], roots: &[(String, String)]) -> Vec<u8> {
+    let mentions = |bytes: &[u8]| {
+        roots
+            .iter()
+            .any(|(virtual_root, _)| memchr::memmem::find(bytes, virtual_root.as_bytes()).is_some())
+    };
+    if !mentions(line) {
+        return line.to_vec();
+    }
+    let replace = |text: &str| {
+        roots
+            .iter()
+            .fold(text.to_owned(), |text, (virtual_root, real)| {
+                text.replace(virtual_root, real)
+            })
+    };
+    fn visit(value: &mut serde_json::Value, replace: &dyn Fn(&str) -> String) {
+        match value {
+            serde_json::Value::String(text) => *text = replace(text),
+            serde_json::Value::Array(values) => values.iter_mut().for_each(|v| visit(v, replace)),
+            serde_json::Value::Object(values) => {
+                values.values_mut().for_each(|v| visit(v, replace))
+            }
+            _ => {}
+        }
+    }
+    let body = line.strip_suffix(b"\n").unwrap_or(line);
+    let body = body.strip_suffix(b"\r").unwrap_or(body);
+    let ending = &line[body.len()..];
+    if let Ok(mut value @ serde_json::Value::Object(_)) = serde_json::from_slice(body) {
+        visit(&mut value, &replace);
+        let mut result = serde_json::to_vec(&value).expect("serialize compiler JSON");
+        result.extend_from_slice(ending);
+        return result;
+    }
+    match std::str::from_utf8(line) {
+        Ok(text) => replace(text).into_bytes(),
+        Err(_) => line.to_vec(),
+    }
+}
+
+fn tee_devirtualized(
+    mut reader: impl Read,
+    mut writer: impl Write,
+    roots: &[(String, String)],
+) -> Result<Vec<u8>> {
+    let mut captured = Vec::new();
+    let mut pending = Vec::new();
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        pending.extend_from_slice(&buffer[..count]);
+        while let Some(end) = pending.iter().position(|b| *b == b'\n') {
+            let line = devirtualize_line(&pending[..=end], roots);
+            writer.write_all(&line)?;
+            captured.extend_from_slice(&line);
+            pending.drain(..=end);
+        }
+        writer.flush()?;
+    }
+    if !pending.is_empty() {
+        let line = devirtualize_line(&pending, roots);
+        writer.write_all(&line)?;
+        writer.flush()?;
+        captured.extend_from_slice(&line);
+    }
+    Ok(captured)
 }
 
 fn tee(mut reader: impl Read, mut writer: impl Write) -> Result<Vec<u8>> {
@@ -2145,7 +3307,10 @@ fn record_event_duration(
     if let Err(error) = diagnostics::append(&event_log_path(), &event) {
         eprintln!("Bellows diagnostics unavailable: {error:#}");
     }
-    if terminal::Output::from_env().prints(kind) {
+    // Cargo captures a build script's stderr; decisions are recorded only.
+    if !build_script::SILENT.load(std::sync::atomic::Ordering::Relaxed)
+        && terminal::Output::from_env().prints(kind)
+    {
         eprintln!(
             "{}",
             terminal::status(terminal::stderr_color(), kind, crate_name, detail)
@@ -3390,23 +4555,53 @@ mod tests {
         );
     }
 
-    #[test]
-    fn prior_protocol_candidates_are_cleanly_rejected() {
-        let workspace = std::env::temp_dir().join(format!("bellows-protocol-test-{}", now_ms()));
-        let identity = Identity {
+    fn test_identity(workspace: &Path) -> Identity {
+        let bases = vec![("$WORKSPACE".to_owned(), workspace.to_path_buf())];
+        Identity {
             static_key: digest_bytes(b"identity"),
             fingerprint: diagnostics::Fingerprint::default(),
             diagnostic_group: String::new(),
-            normalizer: PathNormalizer::new(vec![("$WORKSPACE".into(), workspace.clone())]),
-            workspace,
-        };
-        let candidate = ActionCandidate {
-            protocol: PROTOCOL_VERSION - 1,
+            normalizer: PathNormalizer::new(bases.clone()),
+            root_normalizer: PathNormalizer::new(bases),
+            workspace: workspace.to_path_buf(),
+            digests: digests::Digests::uncached(),
+            pins: vec![(
+                format!("{PIN_PREFIX}$WORKSPACE"),
+                workspace.to_string_lossy().into_owned(),
+            )],
+            virtual_env: BTreeMap::new(),
+        }
+    }
+
+    fn test_invocation(out_dir: &Path, expected: &[&str], inputs: Vec<PathBuf>) -> Invocation {
+        Invocation {
+            rustc: PathBuf::from("rustc"),
+            args: vec![],
+            crate_name: "fixture".into(),
+            out_dir: out_dir.to_path_buf(),
+            kind: OutputKind::Library,
+            naming: Naming::for_target(None),
+            stems: vec!["fixture-abc".into(), "libfixture-abc".into()],
+            expected_names: expected.iter().map(|name| (*name).to_owned()).collect(),
+            explicit_inputs: inputs,
+            proc_macros: vec![],
+            incremental: None,
+            unit: "fixture-abc".into(),
+            proc_macro_crate: false,
+            static_libraries: vec![],
+            native_search: vec![],
+        }
+    }
+
+    fn empty_candidate(identity: &Identity, protocol: u32) -> ActionCandidate {
+        ActionCandidate {
+            protocol,
             static_key: identity.static_key.clone(),
-            action_key: digest_bytes(b"action"),
+            action_key: compiler_action_key(&identity.static_key, &[], &[], &[]),
             crate_name: "fixture".into(),
             created_ms: 0,
             files: vec![],
+            host_files: vec![],
             env: vec![],
             artifacts: vec![],
             stdout: StreamArtifact {
@@ -3417,7 +4612,47 @@ mod tests {
                 digest: digest_bytes(b""),
                 len: 0,
             },
-        };
+            proc_macros: vec![],
+        }
+    }
+
+    #[test]
+    fn checkout_pins_and_normalized_environment_validate_per_checkout() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        let identity = test_identity(&first);
+        let mut candidate = empty_candidate(&identity, PROTOCOL_VERSION);
+        let pin = format!("{PIN_PREFIX}$WORKSPACE");
+        candidate.env = vec![EnvInput::capture(&pin, identity.pin_value(&pin))];
+        candidate.action_key = compiler_action_key(&candidate.static_key, &[], &[], &candidate.env);
+        assert!(validate_candidate(&candidate, &identity).is_ok());
+        let other = test_identity(&second);
+        let reason = validate_candidate(&candidate, &other).unwrap_err();
+        assert!(reason.contains("another checkout's path"), "{reason}");
+
+        // A normalized env-dep matches the same relative location anywhere.
+        let name = "BELLOWS_TEST_NORMALIZED_DIR";
+        // SAFETY: only this test reads or writes this variable.
+        unsafe { env::set_var(name, second.join("out")) };
+        let mut normalized = empty_candidate(&other, PROTOCOL_VERSION);
+        normalized.env = vec![EnvInput::capture_normalized(
+            name,
+            &format!("$WORKSPACE{}out", std::path::MAIN_SEPARATOR),
+        )];
+        normalized.action_key =
+            compiler_action_key(&normalized.static_key, &[], &[], &normalized.env);
+        assert!(validate_candidate(&normalized, &other).is_ok());
+        unsafe { env::set_var(name, second.join("elsewhere")) };
+        assert!(validate_candidate(&normalized, &other).is_err());
+        unsafe { env::remove_var(name) };
+    }
+
+    #[test]
+    fn prior_protocol_candidates_are_cleanly_rejected() {
+        let workspace = std::env::temp_dir().join(format!("bellows-protocol-test-{}", now_ms()));
+        let identity = test_identity(&workspace);
+        let candidate = empty_candidate(&identity, PROTOCOL_VERSION - 1);
         assert_eq!(
             validate_candidate(&candidate, &identity).unwrap_err(),
             format!("unsupported candidate protocol {}", PROTOCOL_VERSION - 1)
@@ -3448,25 +4683,20 @@ mod tests {
             ),
         )
         .unwrap();
-        let invocation = Invocation {
-            rustc: PathBuf::from("rustc"),
-            args: vec![],
-            crate_name: "fixture".into(),
-            out_dir: out_dir.clone(),
-            expected_names: BTreeSet::from([dep_name.into(), rmeta_name.into()]),
-            explicit_inputs: vec![source],
-        };
-        let identity = Identity {
-            static_key: digest_bytes(b"identity"),
-            fingerprint: diagnostics::Fingerprint::default(),
-            diagnostic_group: String::new(),
-            normalizer: PathNormalizer::new(vec![("$WORKSPACE".into(), workspace.clone())]),
-            workspace: workspace.clone(),
-        };
+        let invocation = test_invocation(&out_dir, &[dep_name, rmeta_name], vec![source]);
+        let identity = test_identity(&workspace);
         let stdout = format!("compiled {}", workspace.display()).into_bytes();
         let stderr = format!("warning in {}", workspace.display()).into_bytes();
-        let captured =
-            capture_outputs(&invocation, &identity, stdout.clone(), stderr.clone()).unwrap();
+        let captured = capture_outputs(
+            &invocation,
+            &identity,
+            stdout.clone(),
+            stderr.clone(),
+            std::time::SystemTime::now(),
+            None,
+        )
+        .unwrap();
+        assert!(!captured.pinned);
         assert_eq!(
             captured.candidate.files[0].path,
             format!("$WORKSPACE{0}src{0}lib.rs", std::path::MAIN_SEPARATOR)
@@ -3601,66 +4831,120 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    fn analyze_with(dir: &Path, extra: &[&str]) -> std::result::Result<Invocation, String> {
+        fs::create_dir_all(dir.join("out")).unwrap();
+        fs::write(dir.join("lib.rs"), "pub fn answer() -> u8 { 42 }").unwrap();
+        let mut raw = vec![
+            OsString::from("rustc"),
+            OsString::from("--crate-name=demo"),
+            dir.join("lib.rs").into_os_string(),
+            OsString::from("-Cextra-filename=-abc"),
+            OsString::from("--out-dir"),
+            dir.join("out").into_os_string(),
+        ];
+        raw.extend(extra.iter().map(OsString::from));
+        Invocation::analyze(&raw)
+    }
+
     #[test]
-    fn link_arguments_do_not_make_linked_crates_cacheable() {
-        for crate_type in ["bin", "rlib,cdylib"] {
-            let raw = vec![
-                OsString::from("rustc"),
-                OsString::from("--crate-name=demo"),
-                OsString::from(format!("--crate-type={crate_type}")),
-                OsString::from("-C"),
-                OsString::from("link-arg=-fuse-ld=lld"),
-            ];
-            assert!(Invocation::analyze(&raw).unwrap_err().contains("linked"));
-        }
-        let repeated = vec![
-            OsString::from("rustc"),
-            OsString::from("--crate-name=demo"),
-            OsString::from("--crate-type"),
-            OsString::from("rlib"),
-            OsString::from("--crate-type"),
-            OsString::from("cdylib"),
-            OsString::from("-C"),
-            OsString::from("link-arg=-fuse-ld=lld"),
-        ];
+    fn linked_crate_types_and_test_harnesses_are_modeled() {
+        let temp = tempfile::tempdir().unwrap();
+        let exe = std::env::consts::EXE_SUFFIX;
+        let linked = |extra: &[&str]| analyze_with(temp.path(), extra).unwrap();
+
+        let test = linked(&["--emit=dep-info,link", "--test"]);
+        assert_eq!(test.kind, OutputKind::Linked);
+        assert!(test.expected_names.contains(&format!("demo-abc{exe}")));
+        assert!(test.owns("demo-abc.pdb") && test.owns("demo-abc") && test.owns("demo-abc.d"));
+        assert!(!test.owns("demo-abcd") && !test.owns("demo-abc2.pdb"));
+
+        let bin = linked(&[
+            "--crate-type=bin",
+            "--emit=dep-info,link",
+            "-Clink-arg=-fuse-ld=lld",
+        ]);
+        assert_eq!(bin.kind, OutputKind::Linked);
+
+        let cdylib = linked(&["--crate-type=rlib,cdylib", "--emit=dep-info,metadata,link"]);
+        assert_eq!(cdylib.kind, OutputKind::Linked);
+        assert!(cdylib.expected_names.contains("libdemo-abc.rlib"));
+        let dll = Naming::for_target(None);
         assert!(
-            Invocation::analyze(&repeated)
-                .unwrap_err()
-                .contains("linked crate type rlib,cdylib")
+            cdylib
+                .expected_names
+                .contains(&format!("{}demo-abc{}", dll.dll_prefix, dll.dll_suffix))
         );
-        let default_bin = vec![
-            OsString::from("rustc"),
-            OsString::from("--crate-name=demo"),
-            OsString::from("-Clink-arg=-fuse-ld=lld"),
-        ];
-        assert!(
-            Invocation::analyze(&default_bin)
-                .unwrap_err()
-                .contains("linked")
+
+        // Checking a test target writes metadata only: no linker runs.
+        let check = linked(&["--emit=dep-info,metadata", "--test"]);
+        assert_eq!(check.kind, OutputKind::Library);
+        assert!(check.expected_names.contains("libdemo-abc.rmeta"));
+
+        let staticlib = analyze_with(
+            temp.path(),
+            &["--crate-type=staticlib", "--emit=dep-info,link"],
+        );
+        assert!(staticlib.unwrap_err().contains("staticlib"));
+    }
+
+    #[test]
+    fn target_naming_follows_the_triple() {
+        let windows = Naming::for_target(Some("x86_64-pc-windows-msvc"));
+        assert_eq!(
+            (windows.exe_suffix, windows.dll_suffix, windows.msvc),
+            (".exe", ".dll", true)
+        );
+        let wasm = Naming::for_target(Some("wasm32-unknown-unknown"));
+        assert_eq!(
+            (wasm.exe_suffix, wasm.dll_prefix, wasm.dll_suffix),
+            (".wasm", "", ".wasm")
+        );
+        let linux = Naming::for_target(Some("x86_64-unknown-linux-gnu"));
+        assert_eq!(
+            (linux.exe_suffix, linux.dll_prefix, linux.dll_suffix),
+            ("", "lib", ".so")
         );
     }
 
     #[test]
-    fn bypasses_linked_and_incremental_invocations() {
-        let bin = vec![
-            OsString::from("rustc"),
-            OsString::from("--crate-name"),
-            OsString::from("demo"),
-            OsString::from("src/main.rs"),
-            OsString::from("--crate-type"),
-            OsString::from("bin"),
-        ];
-        assert!(Invocation::analyze(&bin).unwrap_err().contains("linked"));
-        let incremental = vec![
-            OsString::from("rustc"),
-            OsString::from("-C"),
-            OsString::from("incremental=/tmp/x"),
-        ];
-        assert!(
-            Invocation::analyze(&incremental)
-                .unwrap_err()
-                .contains("incremental")
-        );
+    fn incremental_invocations_share_the_non_incremental_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let emit = ["--crate-type=rlib", "--emit=dep-info,link"];
+        let plain = analyze_with(temp.path(), &emit).unwrap();
+        let spaced = analyze_with(
+            temp.path(),
+            &[emit[0], emit[1], "-C", "incremental=/x/incr"],
+        )
+        .unwrap();
+        let joined =
+            analyze_with(temp.path(), &[emit[0], emit[1], "-Cincremental=/y/incr"]).unwrap();
+        assert_eq!(spaced.incremental, Some(PathBuf::from("/x/incr")));
+        let normalizer = PathNormalizer::new(vec![]);
+        let args = normalized_compiler_arguments(&plain, &normalizer);
+        assert_eq!(normalized_compiler_arguments(&spaced, &normalizer), args);
+        assert_eq!(normalized_compiler_arguments(&joined, &normalizer), args);
+    }
+
+    #[test]
+    fn proc_macro_consumers_record_macro_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let so = temp.path().join("libderive-abc.so");
+        fs::write(&so, b"dylib").unwrap();
+        let external = format!("derive={}", so.display());
+        let invocation = analyze_with(
+            temp.path(),
+            &[
+                "--crate-type=rlib",
+                "--emit=dep-info,metadata,link",
+                "--extern",
+                &external,
+                "--extern",
+                "proc_macro",
+            ],
+        )
+        .unwrap();
+        assert_eq!(invocation.proc_macros, ["derive"]);
+        assert!(invocation.explicit_inputs.contains(&so));
     }
 
     #[test]
@@ -3671,61 +4955,153 @@ mod tests {
             vec!["--sysroot", "/custom/toolchain"],
             vec!["--target=custom.json"],
             vec!["-Csave-temps"],
-            vec!["--test"],
         ] {
             let mut raw = vec![OsString::from("rustc")];
             raw.extend(extra.into_iter().map(OsString::from));
             let reason = Invocation::analyze(&raw).unwrap_err();
             assert!(reason.contains("not modeled"), "{reason}");
         }
-        for search in [
-            "/native",
-            "all=/native",
-            "crate=/native",
-            "framework=/native",
-            "native=/native",
-        ] {
-            assert!(has_native_or_external_codegen_inputs(&[
-                "-L".into(),
-                search.into()
-            ]));
-            assert!(has_native_or_external_codegen_inputs(&[format!(
-                "-L{search}"
-            )]));
+    }
+
+    #[test]
+    fn native_search_paths_that_can_supply_crates_stay_unmodeled() {
+        let parse =
+            |args: &[&str]| native_inputs(&args.iter().map(|a| a.to_string()).collect::<Vec<_>>());
+        for search in ["/native", "all=/native", "crate=/native"] {
+            assert!(parse(&["-L", search]).unwrap_err().contains("not modeled"));
+            assert!(
+                parse(&[&format!("-L{search}")])
+                    .unwrap_err()
+                    .contains("not modeled")
+            );
         }
-        assert!(!has_native_or_external_codegen_inputs(&[
-            "-Ldependency=/rust-deps".into()
+        let (dirs, libs) = parse(&[
+            "-L",
+            "dependency=/deps",
+            "-Lnative=/opt/sdk",
+            "-L",
+            "framework=/f",
+            "-l",
+            "static=zstd",
+            "-lstatic:+verbatim=libq.a",
+            "-l",
+            "asound",
+            "-ldylib=z",
+            "-lstatic:-bundle=nb",
+        ])
+        .unwrap();
+        assert_eq!(dirs, [PathBuf::from("/opt/sdk"), PathBuf::from("/f")]);
+        assert_eq!(
+            libs.iter()
+                .map(|l| (l.name.as_str(), l.verbatim))
+                .collect::<Vec<_>>(),
+            [("zstd", false), ("libq.a", true)]
+        );
+        assert!(parse(&["-l", "link-arg=-foo"]).is_err());
+        assert!(has_unmodeled_codegen_inputs(&[
+            "-C".into(),
+            "profile-use=/p.profdata".into()
+        ]));
+        assert!(has_unmodeled_codegen_inputs(&[
+            "-Cllvm-plugins=/opt/plugin".into()
+        ]));
+        assert!(has_unmodeled_codegen_inputs(&[
+            "-C".into(),
+            "linker-plugin-lto=/opt/p".into()
+        ]));
+        assert!(!has_unmodeled_codegen_inputs(&["-Clinker=mold".into()]));
+        assert!(!has_unmodeled_codegen_inputs(&[
+            "-C".into(),
+            "link-arg=-fuse-ld=lld".into()
         ]));
     }
 
     #[test]
-    fn identifies_unmodeled_native_inputs() {
-        assert!(has_native_or_external_codegen_inputs(&[
-            "-L".into(),
-            "native=/opt/sdk".into()
-        ]));
-        assert!(has_native_or_external_codegen_inputs(&[
-            "-C".into(),
-            "profile-use=/tmp/default.profdata".into()
-        ]));
-        for input in [
-            vec!["-l".into(), "foo".into()],
-            vec!["-lstatic=foo".into()],
-            vec!["-Lnative=/opt/sdk".into()],
-            vec!["-C".into(), "linker-plugin-lto=/opt/plugin".into()],
-            vec!["-Cllvm-plugins=/opt/plugin".into()],
-            vec!["-Clinker=mold".into()],
-        ] {
-            assert!(has_native_or_external_codegen_inputs(&input));
-        }
-        assert!(!has_native_or_external_codegen_inputs(&[
-            "-L".into(),
-            "dependency=/tmp/target".into()
-        ]));
-        assert!(!has_native_or_external_codegen_inputs(&[
-            "-C".into(),
-            "link-arg=-fuse-ld=lld".into()
-        ]));
+    fn only_descriptive_unstable_flags_are_modeled() {
+        let args = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            unmodeled_unstable_flag(&args(&[
+                "-Zunstable-options",
+                "-Z",
+                "force-unstable-if-unmarked",
+                "-Zthreads=8"
+            ])),
+            None
+        );
+        assert_eq!(
+            unmodeled_unstable_flag(&args(&["-Z", "self-profile"])).as_deref(),
+            Some("self-profile")
+        );
+        assert_eq!(
+            unmodeled_unstable_flag(&args(&["-Zdump-mir=all"])).as_deref(),
+            Some("dump-mir")
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let std = temp.path().join("libstd-abc.rlib");
+        fs::write(&std, b"rlib").unwrap();
+        let external = format!("noprelude:std={}", std.display());
+        let invocation = analyze_with(
+            temp.path(),
+            &[
+                "--crate-type=rlib",
+                "--emit=dep-info,metadata,link",
+                "-Zunstable-options",
+                "--extern",
+                &external,
+            ],
+        )
+        .unwrap();
+        assert!(invocation.explicit_inputs.contains(&std));
+    }
+
+    #[test]
+    fn diagnostics_name_this_checkouts_real_paths() {
+        let roots = vec![
+            (
+                "/bellows/workspace".to_owned(),
+                "/home/dev/checkout a".to_owned(),
+            ),
+            (
+                "/bellows/target".to_owned(),
+                "/home/dev/checkout a/target".to_owned(),
+            ),
+        ];
+        assert_eq!(
+            devirtualize_line(
+                b"error: --> /bellows/workspace/tests/ui/fail.rs:3:5\n",
+                &roots
+            ),
+            b"error: --> /home/dev/checkout a/tests/ui/fail.rs:3:5\n"
+        );
+        let json = br#"{"rendered":"--> /bellows/workspace/src/lib.rs","spans":[{"file_name":"/bellows/target/out/gen.rs"}]}"#;
+        let mut line = json.to_vec();
+        line.extend_from_slice(b"\r\n");
+        let converted = devirtualize_line(&line, &roots);
+        assert!(converted.ends_with(b"\r\n"));
+        let value: serde_json::Value =
+            serde_json::from_slice(&converted[..converted.len() - 2]).unwrap();
+        assert_eq!(value["rendered"], "--> /home/dev/checkout a/src/lib.rs");
+        assert_eq!(
+            value["spans"][0]["file_name"],
+            "/home/dev/checkout a/target/out/gen.rs"
+        );
+        assert_eq!(devirtualize_line(b"unrelated\n", &roots), b"unrelated\n");
+    }
+
+    #[test]
+    fn library_compiles_accept_a_linker_they_never_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let invocation = analyze_with(
+            temp.path(),
+            &[
+                "--crate-type=rlib",
+                "--emit=dep-info,metadata,link",
+                "-Clinker=/opt/mold/cc",
+                "-Lnative=/usr/lib",
+            ],
+        )
+        .unwrap();
+        assert_eq!(invocation.kind, OutputKind::Library);
     }
 
     #[test]

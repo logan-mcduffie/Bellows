@@ -67,9 +67,9 @@ Local mode stores verified compiler artifacts in the platform user cache
 (`$XDG_CACHE_HOME/bellows`, `~/.cache/bellows`, or the Windows local app-data
 directory). Override it with `--cache-dir` or `BELLOWS_STATE_DIR`. It never
 constructs a network client, does not require `bellowsd`, and preserves Cargo's
-incremental setting. Release builds are cacheable by default; incremental
-dev-profile rustc actions safely bypass while Cargo continues using its own
-incremental state.
+incremental setting. Incremental dev-profile compiles are looked up like any
+other; on a miss rustc keeps its incremental session, and only from-scratch
+results are published (see [local builds](docs/local-builds.md)).
 
 ```bash
 bellows stats --local
@@ -138,15 +138,24 @@ running a shared service.
 
 ## What is safe to cache today
 
-The MVP caches compiler-produced Rust libraries and metadata when it can prove
+The transparent wrapper caches Rust libraries and metadata, final links
+(binaries, `--test` harnesses, examples, `cdylib`/`dylib`, procedural-macro
+crates, build-script executables) and build-script runs, whenever it can prove
 an unambiguous action identity. Its key covers:
 
 - exact `rustc -vV` identity;
 - normalized file-location arguments, exact literal flags, and relevant environment;
-- primary sources and explicitly supplied `--extern` artifacts;
+- primary sources and explicitly supplied `--extern` artifacts, including
+  procedural-macro `.so`/`.dll` files;
 - all transitive files learned from rustc dep-info;
 - all `env!` and `option_env!` values reported as dep-info env dependencies;
+- for links, every file the linker reads, taken from rustc's own
+  `--print link-args`: transitive rlibs, objects, linker scripts, every
+  candidate a `-l` could resolve to, C runtime objects, and the linker programs;
 - Cargo's unique `-C extra-filename` output identity.
+
+See [linked outputs](docs/linked-outputs.md) for the design and the failure
+modes each rule guards against.
 
 The static key includes compiler-, Cargo-, target-, and native-toolchain
 environment variables, but deliberately excludes per-run CI metadata such as
@@ -156,31 +165,33 @@ the candidate manifest.
 
 A static command identity retains several dependency manifests, allowing old
 branches to become hits again. Every candidate is revalidated before restore.
-Values actually consumed by `env!` and `option_env!` are compared literally:
-an embedded checkout path cannot safely be reused in a different checkout.
+Every output is scanned for the workspace, target, and session checkout paths
+after a remapped compile. A result that embeds one is pinned to that checkout;
+otherwise path-valued `env!` values compare relative to those roots, so
+worktrees share it.
 Inputs reached through symlinks conservatively bypass publication until their
 resolution can be modeled. Unmodeled emit kinds and custom output destinations
 also bypass, so a successful hit always supplies the requested output set.
-Native-capable search paths (including bare `-L` and `-Lall`), custom sysroots
-and target JSON files, and `target-cpu=native` bypass. Only Cargo's explicit
-dependency search paths are eligible. Literal flag values such as `--cfg`
+Search paths that can supply crates (bare `-L`, `-L all=`, `-L crate=`), custom
+sysroots and target JSON files, and `target-cpu=native` bypass. `-L native=`
+and `-L framework=` are accepted: static archives bundled into an rlib are
+resolved and hashed, and any other bundled native member stops publication. Literal flag values such as `--cfg`
 strings are never path-normalized.
 Every downloaded blob is rehashed. Dep-info and compiler streams are normalized
 against workspace, target, Cargo, Rustup, and home roots, then localized on the
 receiving runner.
 
-The transparent rustc wrapper conservatively bypasses final binaries, tests, examples, procedural
-macros, dynamic/static libraries, compiler probes, incremental sessions, and
-ambiguous emit sets. Link arguments are inert for the cached library-only
-outputs and remain part of the cache key. Native search paths/libraries,
-explicit linkers, response files, unstable flags, and external codegen inputs
-still bypass until modeled. Final binaries,
-build-script products, and nested Cargo output can instead use `bellows action
-run`, whose explicit input/output manifest and isolated offline sandbox become
-the correctness boundary. A bypass is visible, not a silent correctness bet.
+The transparent rustc wrapper still bypasses static libraries, compiler probes,
+response files, most unstable `-Z` flags, profile/plugin codegen inputs, and
+ambiguous emit sets. Link arguments and `-C linker=` are part of every key and
+only matter to linked outputs. Nested Cargo output that should be declared
+explicitly can use `bellows action run`, whose input/output manifest and
+isolated offline sandbox become the correctness boundary. A bypass is visible,
+not a silent correctness bet.
 
-Injected `--remap-path-prefix` flags make library metadata checkout-independent
-but also cause rendered compiler diagnostics to use `/bellows/workspace` paths.
+Injected `--remap-path-prefix` flags make outputs checkout-independent. rustc
+also applies them to diagnostics, so Bellows rewrites messages back to the
+receiving checkout's real paths, live and when a cached result replays.
 Cargo metadata can itself encode path-dependency package IDs, so fleets should
 still use consistent checkout layouts for the best hit rate.
 

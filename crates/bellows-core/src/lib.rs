@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 pub const CONTENT_KEY_LEN: usize = 64;
 pub const MAX_CANDIDATE_FILES: usize = 100_000;
 pub const MAX_CANDIDATE_ENV: usize = 4_096;
@@ -33,6 +33,7 @@ pub fn digest_bytes(bytes: &[u8]) -> String {
 pub fn compiler_action_key(
     static_key: &str,
     files: &[FileInput],
+    host_files: &[FileInput],
     environment: &[EnvInput],
 ) -> String {
     let mut hasher = blake3::Hasher::new();
@@ -41,6 +42,11 @@ pub fn compiler_action_key(
         &mut hasher,
         "files",
         &serde_json::to_vec(files).unwrap_or_default(),
+    );
+    hash_key_field(
+        &mut hasher,
+        "host-files",
+        &serde_json::to_vec(host_files).unwrap_or_default(),
     );
     hash_key_field(
         &mut hasher,
@@ -75,10 +81,19 @@ pub struct FileInput {
     pub digest: String,
 }
 
+/// Prefix for synthetic environment inputs that pin a candidate to this
+/// checkout's absolute roots (`@bellows:root:$WORKSPACE`). They are not process
+/// environment variables and are computed by the client during validation.
+pub const PIN_PREFIX: &str = "@bellows:root:";
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnvInput {
     pub name: String,
     pub value_digest: Option<String>,
+    /// The digest covers the value after workspace/target path normalization.
+    /// Only recorded when no captured output contains a checkout path.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub normalized: bool,
 }
 
 impl EnvInput {
@@ -86,6 +101,15 @@ impl EnvInput {
         Self {
             name: name.into(),
             value_digest: value.map(|v| digest_bytes(v.as_bytes())),
+            normalized: false,
+        }
+    }
+
+    pub fn capture_normalized(name: impl Into<String>, normalized_value: &str) -> Self {
+        Self {
+            name: name.into(),
+            value_digest: Some(digest_bytes(normalized_value.as_bytes())),
+            normalized: true,
         }
     }
 }
@@ -111,10 +135,19 @@ pub struct ActionCandidate {
     pub crate_name: String,
     pub created_ms: u64,
     pub files: Vec<FileInput>,
+    /// Absolute inputs outside every normalized root, such as system native
+    /// libraries and C runtime objects read by the linker. They only match on
+    /// a host whose files at those exact paths are byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_files: Vec<FileInput>,
     pub env: Vec<EnvInput>,
     pub artifacts: Vec<Artifact>,
     pub stdout: StreamArtifact,
     pub stderr: StreamArtifact,
+    /// Crate names of procedural macros passed directly with `--extern`.
+    /// Diagnostic only; their artifact digests are part of the static key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proc_macros: Vec<String>,
 }
 
 pub fn validate_content_key(key: &str) -> Result<()> {
@@ -130,7 +163,9 @@ pub fn validate_content_key(key: &str) -> Result<()> {
 
 pub fn validate_normalized_input_path(value: &str) -> Result<()> {
     const ROOTS: &[&str] = &[
+        "$CHECKOUT",
         "$WORKSPACE",
+        "$PROFILE",
         "$TARGET",
         "$CARGO_HOME",
         "$RUSTUP_HOME",
@@ -161,6 +196,27 @@ pub fn validate_normalized_input_path(value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Host inputs are absolute paths that no normalized root covers.
+pub fn validate_host_input_path(value: &str) -> Result<()> {
+    if value.is_empty() || value.len() > 4096 || value.contains('\0') {
+        bail!("host input path is empty or too long")
+    }
+    let windows_drive = value.as_bytes().get(1) == Some(&b':')
+        && value.as_bytes()[0].is_ascii_alphabetic()
+        && matches!(value.as_bytes().get(2), Some(b'/' | b'\\'));
+    if !(value.starts_with('/') || windows_drive || value.starts_with("\\\\")) {
+        bail!("host input path is not absolute: {value}")
+    }
+    if value
+        .split(['/', '\\'])
+        .skip(1)
+        .any(|segment| matches!(segment, "." | ".."))
+    {
+        bail!("host input path contains a forbidden segment: {value}")
+    }
+    Ok(())
+}
+
 pub fn validate_candidate_manifest(candidate: &ActionCandidate) -> Result<()> {
     if candidate.protocol != PROTOCOL_VERSION {
         bail!("unsupported candidate protocol {}", candidate.protocol)
@@ -183,6 +239,23 @@ pub fn validate_candidate_manifest(candidate: &ActionCandidate) -> Result<()> {
         validate_content_key(&file.digest)?;
         if !file_paths.insert(&file.path) {
             bail!("duplicate candidate input path: {}", file.path)
+        }
+    }
+    if candidate.host_files.len() > MAX_CANDIDATE_FILES
+        || candidate.proc_macros.len() > MAX_CANDIDATE_ENV
+    {
+        bail!("candidate manifest exceeds cardinality limits")
+    }
+    for file in &candidate.host_files {
+        validate_host_input_path(&file.path)?;
+        validate_content_key(&file.digest)?;
+        if !file_paths.insert(&file.path) {
+            bail!("duplicate candidate input path: {}", file.path)
+        }
+    }
+    for name in &candidate.proc_macros {
+        if name.is_empty() || name.len() > 256 {
+            bail!("invalid candidate proc-macro name")
         }
     }
     let mut environment_names = BTreeSet::new();
@@ -213,7 +286,12 @@ pub fn validate_candidate_manifest(candidate: &ActionCandidate) -> Result<()> {
     }
     validate_content_key(&candidate.stdout.digest)?;
     validate_content_key(&candidate.stderr.digest)?;
-    let expected = compiler_action_key(&candidate.static_key, &candidate.files, &candidate.env);
+    let expected = compiler_action_key(
+        &candidate.static_key,
+        &candidate.files,
+        &candidate.host_files,
+        &candidate.env,
+    );
     if expected != candidate.action_key {
         bail!("candidate action key does not match dependency manifest")
     }
@@ -1273,6 +1351,15 @@ impl PathNormalizer {
         Self { bases: rendered }
     }
 
+    /// Every recognized spelling of the directory a token stands for.
+    pub fn spellings(&self, token: &str) -> Vec<String> {
+        self.bases
+            .iter()
+            .filter(|(candidate, _)| candidate == token)
+            .map(|(_, path)| path.clone())
+            .collect()
+    }
+
     pub fn normalize(&self, value: &str) -> String {
         self.bases
             .iter()
@@ -1427,11 +1514,12 @@ mod tests {
         let env = vec![EnvInput::capture("MODE", Some("release"))];
         ActionCandidate {
             protocol: PROTOCOL_VERSION,
-            action_key: compiler_action_key(&static_key, &files, &env),
+            action_key: compiler_action_key(&static_key, &files, &[], &env),
             static_key,
             crate_name: "fixture".into(),
             created_ms: 1,
             files,
+            host_files: vec![],
             env,
             artifacts: vec![Artifact {
                 file_name: "libfixture-abc.rmeta".into(),
@@ -1446,6 +1534,7 @@ mod tests {
                 digest: digest_bytes(b"stderr"),
                 len: 6,
             },
+            proc_macros: vec![],
         }
     }
 
@@ -1680,12 +1769,15 @@ mod tests {
             digest: digest_bytes(b"source"),
         }];
         let environment = vec![EnvInput::capture("MODE", Some("release"))];
-        let key = compiler_action_key(&static_key, &files, &environment);
+        let key = compiler_action_key(&static_key, &files, &[], &environment);
         assert_eq!(key.len(), 64);
-        assert_eq!(key, compiler_action_key(&static_key, &files, &environment));
+        assert_eq!(
+            key,
+            compiler_action_key(&static_key, &files, &[], &environment)
+        );
         assert_ne!(
             key,
-            compiler_action_key(&digest_bytes(b"other"), &files, &environment)
+            compiler_action_key(&digest_bytes(b"other"), &files, &[], &environment)
         );
     }
 
@@ -1707,20 +1799,91 @@ mod tests {
 
         let mut duplicate = valid_candidate();
         duplicate.files.push(duplicate.files[0].clone());
-        duplicate.action_key =
-            compiler_action_key(&duplicate.static_key, &duplicate.files, &duplicate.env);
+        duplicate.action_key = compiler_action_key(
+            &duplicate.static_key,
+            &duplicate.files,
+            &duplicate.host_files,
+            &duplicate.env,
+        );
         assert!(validate_candidate_manifest(&duplicate).is_err());
 
         let mut escaped = valid_candidate();
         escaped.files[0].path = "$WORKSPACE/../../etc/passwd".into();
-        escaped.action_key = compiler_action_key(&escaped.static_key, &escaped.files, &escaped.env);
+        escaped.action_key = compiler_action_key(
+            &escaped.static_key,
+            &escaped.files,
+            &escaped.host_files,
+            &escaped.env,
+        );
         assert!(validate_candidate_manifest(&escaped).is_err());
 
         let mut absolute = valid_candidate();
         absolute.files[0].path = "/etc/passwd".into();
-        absolute.action_key =
-            compiler_action_key(&absolute.static_key, &absolute.files, &absolute.env);
+        absolute.action_key = compiler_action_key(
+            &absolute.static_key,
+            &absolute.files,
+            &absolute.host_files,
+            &absolute.env,
+        );
         assert!(validate_candidate_manifest(&absolute).is_err());
+    }
+
+    #[test]
+    fn host_inputs_are_absolute_and_part_of_the_action_key() {
+        for path in [
+            "/usr/lib/libasound.so",
+            r"C:\Windows\System32\kernel32.lib",
+            r"\\server\share\a.lib",
+        ] {
+            assert!(validate_host_input_path(path).is_ok(), "{path}");
+        }
+        for path in [
+            "relative/lib.a",
+            "/usr/../etc/passwd",
+            "",
+            r"C:relative.lib",
+        ] {
+            assert!(validate_host_input_path(path).is_err(), "{path}");
+        }
+        let mut candidate = valid_candidate();
+        let before = candidate.action_key.clone();
+        candidate.host_files.push(FileInput {
+            path: "/usr/lib/libz.so".into(),
+            digest: digest_bytes(b"zlib"),
+        });
+        assert!(validate_candidate_manifest(&candidate).is_err());
+        candidate.action_key = compiler_action_key(
+            &candidate.static_key,
+            &candidate.files,
+            &candidate.host_files,
+            &candidate.env,
+        );
+        assert_ne!(candidate.action_key, before);
+        assert!(validate_candidate_manifest(&candidate).is_ok());
+        candidate.host_files[0].path = "$WORKSPACE/relative".into();
+        candidate.action_key = compiler_action_key(
+            &candidate.static_key,
+            &candidate.files,
+            &candidate.host_files,
+            &candidate.env,
+        );
+        assert!(validate_candidate_manifest(&candidate).is_err());
+    }
+
+    #[test]
+    fn normalized_environment_inputs_change_the_action_key() {
+        let static_key = digest_bytes(b"static");
+        let literal = vec![EnvInput::capture("OUT_DIR", Some("$TARGET/out"))];
+        let normalized = vec![EnvInput::capture_normalized("OUT_DIR", "$TARGET/out")];
+        assert_eq!(literal[0].value_digest, normalized[0].value_digest);
+        assert_ne!(
+            compiler_action_key(&static_key, &[], &[], &literal),
+            compiler_action_key(&static_key, &[], &[], &normalized)
+        );
+        // Version-5 records without the field still decode (as literal).
+        let decoded: EnvInput =
+            serde_json::from_str(r#"{"name":"A","value_digest":null}"#).unwrap();
+        assert!(!decoded.normalized);
     }
 
     #[test]
@@ -1787,8 +1950,12 @@ mod tests {
             threads.push(std::thread::spawn(move || {
                 let mut candidate = valid_candidate();
                 candidate.files[0].digest = digest_bytes(format!("source-{index}").as_bytes());
-                candidate.action_key =
-                    compiler_action_key(&candidate.static_key, &candidate.files, &candidate.env);
+                candidate.action_key = compiler_action_key(
+                    &candidate.static_key,
+                    &candidate.files,
+                    &candidate.host_files,
+                    &candidate.env,
+                );
                 barrier.wait();
                 store.put_candidate(candidate, 32).unwrap();
             }));

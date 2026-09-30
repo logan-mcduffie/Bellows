@@ -105,9 +105,9 @@ grep -q 'HIT' <<<"$second_action"
 test -f "$workspace/libfixture.rlib"
 
 # A surviving action record with a missing blob is treated as a safe miss.
-record="$(find "$cache/store-v5/declared" -name '*.json' -type f | head -n 1)"
+record="$(find "$cache/store-v6/declared" -name '*.json' -type f | head -n 1)"
 digest="$(jq -r '.outputs[0].digest' "$record")"
-rm "$cache/store-v5/blobs/${digest:0:2}/$digest"
+rm "$cache/store-v6/blobs/${digest:0:2}/$digest"
 rm "$workspace/libfixture.rlib"
 recovered_action="$(
   cd "$workspace"

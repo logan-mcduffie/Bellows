@@ -969,6 +969,20 @@ impl Invocation {
         if has_unmodeled_codegen_inputs(&args) {
             return Err("native linker or external codegen inputs are not modeled".into());
         }
+        // Link inputs come from `--print link-args`; clippy-driver combined
+        // with that print request writes corrupted `# env-dep:` names (for
+        // example `64` in place of CLIPPY_ARGS), which would make Cargo
+        // rebuild on every run. Its linked units (build scripts and proc
+        // macros of workspace members) are compiled directly.
+        let driver = rustc
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .unwrap_or_default();
+        if kind == OutputKind::Linked && !(driver == "rustc" || driver.starts_with("rustc-")) {
+            return Err(format!(
+                "linked outputs compiled by {driver} are not modeled"
+            ));
+        }
         let stems = vec![unit.clone(), library];
         let proc_macro_crate = has("proc-macro");
         Ok(Self {

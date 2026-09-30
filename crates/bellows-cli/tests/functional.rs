@@ -1625,3 +1625,55 @@ fn diagnostics_show_real_paths_for_snapshot_tests() {
     assert!(log.contains(&format!("{}", failing.display())), "{log}");
     assert!(!log.contains("/bellows/"), "{log}");
 }
+
+#[test]
+fn repeated_clippy_runs_stay_no_ops_with_intact_dependency_info() {
+    let f = Fixture::new(
+        "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    write_files(
+        &f.workspace,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\nbuild=\"build.rs\"\n[workspace]\n",
+            ),
+            (
+                "build.rs",
+                "fn main() { println!(\"cargo:rerun-if-changed=build.rs\"); let out = std::env::var(\"OUT_DIR\").unwrap(); std::fs::write(format!(\"{out}/generated.rs\"), \"pub fn value() -> u32 { 5 }\").unwrap(); }",
+            ),
+        ],
+    );
+    f.lock();
+    let clippy = || {
+        checked(
+            f.local()
+                .args(["cargo", "clippy", "--all-targets", "--offline"]),
+        )
+    };
+    clippy();
+    let noop = clippy();
+    assert!(
+        stderr(&noop).contains("0 reused · 0 rebuilt"),
+        "{}",
+        stderr(&noop)
+    );
+    let build = f.workspace.join("target/debug/build");
+    for entry in fs::read_dir(build).unwrap() {
+        for file in fs::read_dir(entry.unwrap().path()).unwrap() {
+            let path = file.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "d") {
+                let text = fs::read_to_string(&path).unwrap();
+                for line in text.lines().filter(|l| l.starts_with("# env-dep:")) {
+                    assert!(
+                        line.starts_with("# env-dep:CLIPPY")
+                            || line.starts_with("# env-dep:OUT_DIR"),
+                        "{}: {line}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+}

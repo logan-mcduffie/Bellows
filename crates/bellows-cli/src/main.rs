@@ -2603,7 +2603,14 @@ fn capture_outputs(
             if name.ends_with(".rlib") {
                 check_bundled_members(invocation, &raw, &identity.workspace)?;
             }
-            let program_database = name.to_ascii_lowercase().ends_with(".pdb");
+            // Linker-written companions (program databases, export files,
+            // import libraries) record the linker's working directory and
+            // module paths; see `leaks_in_program_database`.
+            let lower = name.to_ascii_lowercase();
+            let program_database = invocation.kind == OutputKind::Linked
+                && [".pdb", ".exp", ".lib"]
+                    .iter()
+                    .any(|extension| lower.ends_with(extension));
             for (token, scanner) in &scanners {
                 let leaks = if program_database {
                     scanner.leaks_in_program_database(&raw)

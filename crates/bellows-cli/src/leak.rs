@@ -60,7 +60,8 @@ impl Scanner {
         }
     }
 
-    /// MSVC program databases record the linker's own bookkeeping: its
+    /// MSVC program databases (and the linker's `.exp`/import `.lib`
+    /// companions) record the linker's own bookkeeping: its
     /// working directory, command line (`/OUT:…`), the object and library
     /// modules it read, and output paths. None of it affects the program or
     /// symbolization, which uses rustc's remapped source paths. Any other

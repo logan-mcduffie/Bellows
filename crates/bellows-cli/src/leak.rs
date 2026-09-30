@@ -60,6 +60,49 @@ impl Scanner {
         }
     }
 
+    /// MSVC program databases record the linker's own bookkeeping: its
+    /// working directory, command line (`/OUT:…`), the object and library
+    /// modules it read, and output paths. None of it affects the program or
+    /// symbolization, which uses rustc's remapped source paths. Any other
+    /// string naming a checkout root, such as an unremapped source file, is
+    /// still a leak.
+    pub fn leaks_in_program_database(&self, bytes: &[u8]) -> bool {
+        if self.always {
+            return true;
+        }
+        let haystack = if self.case_insensitive {
+            bytes.to_ascii_lowercase()
+        } else {
+            bytes.to_vec()
+        };
+        for finder in &self.finders {
+            let needle = finder.needle();
+            if needle.contains(&0) {
+                // A wide (UTF-16) spelling: not linker bookkeeping.
+                if finder.find(&haystack).is_some() {
+                    return true;
+                }
+                continue;
+            }
+            for position in finder.find_iter(&haystack) {
+                let printable = |b: &u8| (0x20..0x7f).contains(b);
+                let start = haystack[..position]
+                    .iter()
+                    .rposition(|b| !printable(b))
+                    .map_or(0, |index| index + 1);
+                let end = haystack[position..]
+                    .iter()
+                    .position(|b| !printable(b))
+                    .map_or(haystack.len(), |index| position + index);
+                let text = String::from_utf8_lossy(&haystack[start..end]);
+                if !is_linker_bookkeeping(&text, needle) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn leaks(&self, bytes: &[u8]) -> bool {
         if self.always {
             return true;
@@ -72,6 +115,17 @@ impl Scanner {
             .iter()
             .any(|finder| finder.find(bytes).is_some())
     }
+}
+
+fn is_linker_bookkeeping(text: &str, root: &[u8]) -> bool {
+    const MODULES: &[&str] = &[
+        ".o", ".obj", ".rlib", ".lib", ".a", ".res", ".exe", ".dll", ".pdb", ".exp",
+    ];
+    let lower = text.to_ascii_lowercase();
+    let root = String::from_utf8_lossy(root);
+    lower.trim_end_matches(['\\', '/']) == root.trim_end_matches(['\\', '/'])
+        || lower.contains("/out:")
+        || MODULES.iter().any(|extension| lower.ends_with(extension))
 }
 
 #[cfg(test)]
@@ -88,5 +142,34 @@ mod tests {
         assert!(!scanner.leaks(b"/bellows/workspace/crates/x/src/lib.rs"));
         assert!(!scanner.leaks(b"/home/dev/checkout-b/crates/x"));
         assert!(Scanner::new(&["/w".into()]).leaks(b"anything"));
+    }
+
+    #[test]
+    fn program_databases_may_name_linker_modules_but_not_sources() {
+        let root = if cfg!(windows) {
+            r"C:\work\checkout-a"
+        } else {
+            "/work/checkout-a"
+        };
+        let scanner = Scanner::new(&[root.into()]);
+        let sep = std::path::MAIN_SEPARATOR;
+        let record = |text: String| [b"\0\x02".as_slice(), text.as_bytes(), b"\0\x01"].concat();
+        for text in [
+            root.to_owned(),
+            format!("{root}{sep}target{sep}deps{sep}m.m.abc-cgu.0.rcgu.o"),
+            format!("{root}{sep}target{sep}deps{sep}libdemo-abc.rlib"),
+            format!("{root}{sep}target{sep}deps{sep}m.pdb"),
+            format!(" /NOLOGO /OUT:{root}{sep}target{sep}m.exe /DEBUG"),
+        ] {
+            assert!(
+                !scanner.leaks_in_program_database(&record(text.clone())),
+                "{text}"
+            );
+            assert!(scanner.leaks(&record(text)));
+        }
+        let source = format!("{root}{sep}src{sep}lib.rs");
+        assert!(scanner.leaks_in_program_database(&record(source)));
+        let fixture = format!("{root}{sep}fixtures");
+        assert!(scanner.leaks_in_program_database(&record(fixture)));
     }
 }

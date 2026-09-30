@@ -2603,8 +2603,14 @@ fn capture_outputs(
             if name.ends_with(".rlib") {
                 check_bundled_members(invocation, &raw, &identity.workspace)?;
             }
+            let program_database = name.to_ascii_lowercase().ends_with(".pdb");
             for (token, scanner) in &scanners {
-                if !leaked.contains(token) && scanner.leaks(&raw) {
+                let leaks = if program_database {
+                    scanner.leaks_in_program_database(&raw)
+                } else {
+                    scanner.leaks(&raw)
+                };
+                if !leaked.contains(token) && leaks {
                     leaked.insert(token);
                 }
             }

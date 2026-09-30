@@ -97,9 +97,15 @@ try{
       Assert ((Call $exe @()) -match '42') 'Wrong restored output'
     }finally{$sentinel.Stop();$env:BELLOWS_SERVER=$server.url}
   }
-  Case 'incremental-bypass' {
+  Case 'incremental-hybrid' {
     $env:CARGO_INCREMENTAL='1'
-    try{ $text=Call $b @('cargo','build','--offline');Assert ($text -match 'incremental') 'No incremental bypass' }finally{$env:CARGO_INCREMENTAL='0'}
+    try{
+      Call $b @('cargo','build','--offline') | Out-Null
+      RemoveTest $target
+      $text=Call $b @('cargo','build','--offline')
+      Assert ($text -match 'LOCAL HIT') 'Incremental build did not restore a from-scratch result'
+      Assert ($text -notmatch 'incremental compilation is enabled') 'Incremental invocation bypassed'
+    }finally{$env:CARGO_INCREMENTAL='0'}
   }
   Case 'concurrent-local-and-remote-single-flight' {
     $clients=@();foreach($name in @('local-a','local-b')){$clients+=BeginClient $name @('cargo','build','--release','--offline') (Join-Path $report $name)}
@@ -182,9 +188,9 @@ try{
     $text=Call $b $action;Assert ($text -match 'HIT') 'Declared action missed'
     Assert (-not (Test-Path "$target/obsolete")) 'Obsolete output survived'
     Assert ((Get-FileHash $exe).Hash -eq $hash) 'Restored executable changed'
-    $record=Get-ChildItem "$env:BELLOWS_STATE_DIR/store-v5/declared" -Recurse -Filter '*.json' | Select-Object -First 1
+    $record=Get-ChildItem "$env:BELLOWS_STATE_DIR/store-v6/declared" -Recurse -Filter '*.json' | Select-Object -First 1
     $digest=(Get-Content $record.FullName -Raw | ConvertFrom-Json).outputs[0].digest
-    RemoveTest "$env:BELLOWS_STATE_DIR/store-v5/blobs/$($digest.Substring(0,2))/$digest"
+    RemoveTest "$env:BELLOWS_STATE_DIR/store-v6/blobs/$($digest.Substring(0,2))/$digest"
     $text=Call $b $action;Assert ($text -match 'stale cached result will be rebuilt') 'Missing blob not diagnosed'
     Assert ((Call $exe @()) -match '42') 'Rebuilt output wrong'
     Call $b @('gc','--local','--max-mb','0') | Out-Null
@@ -288,7 +294,7 @@ try{
   Case 'corrupt-l1-index-and-offline-service' {
     $env:BELLOWS_L1='1';RemoveTest $target
     Call $b @('run','--','cargo','build','--release','--offline') | Out-Null
-    $indexes=Get-ChildItem "$env:BELLOWS_STATE_DIR/l1-v5/actions" -Recurse -Filter '*.json'
+    $indexes=Get-ChildItem "$env:BELLOWS_STATE_DIR/l1-v6/actions" -Recurse -Filter '*.json'
     Assert ($indexes.Count -gt 0) 'No L1 indexes to corrupt'
     foreach($index in $indexes){WriteFile $index.FullName '{not-json'}
     # The current server is one created by this script, tracked by its PID.

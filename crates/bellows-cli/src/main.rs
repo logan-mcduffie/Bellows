@@ -3018,7 +3018,9 @@ fn remap_plan(identity: &Identity) -> Vec<(Vec<String>, String)> {
         spellings
             .into_iter()
             .filter(|spelling| {
-                !spelling.starts_with(r"\\?\") && !(cfg!(windows) && spelling.contains('/'))
+                let verbatim = spelling.starts_with(r"\\?\");
+                let forward = cfg!(windows) && spelling.contains('/');
+                !(verbatim || forward)
             })
             .filter(|spelling| seen.insert(spelling.clone()))
             .collect::<Vec<_>>()

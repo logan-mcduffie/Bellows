@@ -17,7 +17,7 @@ the same bytes differently.
 Backward compatibility can be added later through explicit decoders and
 migration tests. It must never be inferred from similar JSON shapes.
 
-## Protocol 6
+## Version 0.3.0 / protocol 6
 
 Protocol 6 adds linked outputs, build-script runs, checkout pins, normalized
 path-valued environment inputs, host inputs, and the `$CHECKOUT` and

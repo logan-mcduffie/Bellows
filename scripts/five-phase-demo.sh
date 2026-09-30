@@ -64,7 +64,7 @@ grep -q 'CACHE MISS.*forge_core' "$scratch/p1-cold.log"
 ) 2>&1 | tee "$scratch/p1-l1.log"
 grep -q 'LOCAL HIT.*forge_core' "$scratch/p1-l1.log"
 
-rm -rf "$scratch/client-state/l1-v5"
+rm -rf "$scratch/client-state/l1-v6"
 (
   cd "$scratch/workspace"
   CARGO_TARGET_DIR="$scratch/p1-remote" "$bellows" run -- cargo build

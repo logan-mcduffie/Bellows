@@ -163,6 +163,7 @@ pub fn validate_content_key(key: &str) -> Result<()> {
 
 pub fn validate_normalized_input_path(value: &str) -> Result<()> {
     const ROOTS: &[&str] = &[
+        "$CHECKOUT",
         "$WORKSPACE",
         "$PROFILE",
         "$TARGET",

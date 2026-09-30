@@ -1594,6 +1594,16 @@ fn normalizer(workspace: &Path, out_dir: &Path) -> PathNormalizer {
 fn root_bases(workspace: &Path, out_dir: &Path) -> Vec<(String, PathBuf)> {
     let target = target_root(workspace, out_dir);
     let mut bases = vec![("$WORKSPACE".into(), workspace.to_path_buf())];
+    // The directory a `bellows run/local` session started in. A nested Cargo
+    // build (a build script compiling another workspace) runs rustc from a
+    // subdirectory but inherits paths such as OUT_DIR from the outer build.
+    if let Some(checkout) = env::var_os("BELLOWS_WORKSPACE").map(PathBuf::from)
+        && checkout.is_absolute()
+        && checkout != workspace
+    {
+        bases.push(("$CHECKOUT".into(), canonical_base(checkout.clone())));
+        bases.push(("$CHECKOUT".into(), checkout));
+    }
     // Cargo's manifest directory may retain an 8.3 spelling even when the
     // process working directory has already been expanded by Windows.
     for alias in [
@@ -1789,7 +1799,7 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
     hash_field(
         &mut hasher,
         "remap",
-        b"$WORKSPACE=/bellows/workspace;$TARGET=/bellows/target;$PROFILE=/bellows/profile",
+        b"$CHECKOUT=/bellows/checkout;$WORKSPACE=/bellows/workspace;$TARGET=/bellows/target;$PROFILE=/bellows/profile",
     );
     for (name, value) in relevant_environment(&normalizer) {
         hash_field(&mut hasher, &format!("env:{name}"), value.as_bytes());
@@ -1837,6 +1847,9 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
             format!("{PIN_PREFIX}$TARGET"),
             canonical_base(target).to_string_lossy().into_owned(),
         ));
+    }
+    if let Some(checkout) = root_normalizer.spellings("$CHECKOUT").first() {
+        pins.push((format!("{PIN_PREFIX}$CHECKOUT"), checkout.clone()));
     }
     let virtual_env = stable_empty_directories(invocation, &root_normalizer);
     Ok(Identity {
@@ -2419,6 +2432,7 @@ fn compile_and_capture(
     // rustc applies the last matching mapping, so the target (often inside
     // the workspace) comes last.
     for (token, virtual_root) in [
+        ("$CHECKOUT", "/bellows/checkout"),
         ("$WORKSPACE", "/bellows/workspace"),
         ("$TARGET", "/bellows/target"),
         ("$PROFILE", "/bellows/profile"),
@@ -2629,7 +2643,7 @@ fn capture_outputs(
     // Each root is scanned separately: a registry crate's "workspace" is its
     // registry directory, identical in every checkout, and pinning it must
     // not also pin the per-checkout target directory.
-    let scanners = ["$WORKSPACE", "$TARGET"].map(|token| {
+    let scanners = ["$CHECKOUT", "$WORKSPACE", "$TARGET"].map(|token| {
         (
             token,
             leak::Scanner::new(&identity.root_normalizer.spellings(token)),

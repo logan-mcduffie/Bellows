@@ -1507,3 +1507,80 @@ fn build_script_runs_are_restored_and_track_declared_inputs() {
     checked(f.command("cargo").args(["build", "--release", "--offline"]));
     assert_eq!(f.value("target"), "11");
 }
+
+#[test]
+fn repeated_builds_stay_cargo_no_ops_after_compiles_and_restores() {
+    let mut f = Fixture::new(
+        "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    write_files(
+        &f.workspace,
+        &[
+            // A build-dependency compiled in the same build: Cargo compares
+            // its rlib's mtime with the build-script executable's.
+            (
+                "Cargo.toml",
+                "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\nbuild=\"build.rs\"\n[build-dependencies]\nhelper={path=\"helper\"}\n[workspace]\nmembers=[\"helper\"]\n",
+            ),
+            (
+                "helper/Cargo.toml",
+                "[package]\nname=\"helper\"\nversion=\"0.1.0\"\nedition=\"2024\"\n",
+            ),
+            ("helper/src/lib.rs", "pub fn value() -> u32 { 5 }"),
+            (
+                "build.rs",
+                "fn main() { println!(\"cargo:rerun-if-changed=build.rs\"); let out = std::env::var(\"OUT_DIR\").unwrap(); std::fs::write(format!(\"{out}/generated.rs\"), format!(\"pub fn value() -> u32 {{ {} }}\", helper::value())).unwrap(); }",
+            ),
+        ],
+    );
+    f.lock();
+    // An installed Bellows is usually older than anything it builds; a
+    // launcher that inherited its mtime made Cargo rebuild every dependent.
+    let aged = f
+        .temp
+        .path()
+        .join(format!("bellows-aged{}", std::env::consts::EXE_SUFFIX));
+    fs::copy(BELLOWS, &aged).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&aged)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+        .unwrap();
+    let build = |f: &Fixture| {
+        checked(
+            f.command(&aged)
+                .args(["local", "--cache-dir"])
+                .arg(&f.cache)
+                .args(["--", "cargo", "build", "--release", "--offline"]),
+        )
+    };
+    let decisions_so_far = |f: &Fixture| {
+        events(f)
+            .iter()
+            .filter(|e| matches!(e.kind.as_str(), "hit" | "l1_hit" | "miss" | "bypass"))
+            .count()
+    };
+    build(&f);
+    let after_compile = decisions_so_far(&f);
+    let noop = build(&f);
+    assert!(
+        stderr(&noop).contains("0 reused · 0 rebuilt"),
+        "{}",
+        stderr(&noop)
+    );
+    assert_eq!(decisions_so_far(&f), after_compile);
+    // The same holds after every unit was restored in another checkout.
+    second_checkout(&mut f, "second checkout");
+    build(&f);
+    let after_restore = decisions_so_far(&f);
+    let noop = build(&f);
+    assert!(
+        stderr(&noop).contains("0 reused · 0 rebuilt"),
+        "{}",
+        stderr(&noop)
+    );
+    assert_eq!(decisions_so_far(&f), after_restore);
+    assert_eq!(f.value("target"), "5");
+}

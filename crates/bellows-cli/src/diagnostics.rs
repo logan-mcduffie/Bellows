@@ -200,6 +200,8 @@ pub fn reason_code(kind: &str, detail: &str) -> &'static str {
         "not_stored" => {
             return if detail.contains("incremental") {
                 "incremental_session"
+            } else if detail.contains("blob size limit") {
+                "too_large_for_server"
             } else if detail.contains("native member") {
                 "native_inputs"
             } else if detail.contains("cardinality") {
@@ -472,6 +474,7 @@ fn reason_label(reason: &str) -> String {
         "checkout_pinned" => "pinned to checkout",
         "incremental_session" => "incremental session reuse",
         "too_many_outputs" => "too many outputs",
+        "too_large_for_server" => "too large for server",
         other => return other.replace('_', " "),
     }
     .into()

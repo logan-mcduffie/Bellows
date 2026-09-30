@@ -1593,6 +1593,14 @@ fn cache_or_compile(raw: &[OsString]) -> Result<ExitStatus> {
                     Some(&action_key),
                     &format!("published compiler result{scope}"),
                 ),
+                // A result larger than the server accepts stays local.
+                Err(error) if format!("{error:#}").contains("413") => record_event(
+                    "not_stored",
+                    &invocation.crate_name,
+                    Some(&identity.static_key),
+                    None,
+                    "compiled but not stored remotely: an output exceeds the server's blob size limit (kept in the local cache)",
+                ),
                 Err(error) => record_event(
                     "fallback",
                     &invocation.crate_name,

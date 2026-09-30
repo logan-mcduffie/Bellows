@@ -74,7 +74,18 @@ pub fn install_launcher(out_dir: &Path, unit_file: &str) -> Result<()> {
     let installed = fs::copy(&launcher, &script)
         .map(|_| ())
         .with_context(|| format!("install build-script launcher {}", script.display()));
+    // Cargo decides freshness from the script executable's mtime: keep the
+    // one rustc produced, or every dependent build looks stale.
+    let installed = installed.and_then(|()| {
+        let modified = fs::metadata(&real)?.modified()?;
+        fs::File::options()
+            .write(true)
+            .open(&script)?
+            .set_modified(modified)
+            .context("preserve build-script mtime")
+    });
     if let Err(error) = installed {
+        let _ = fs::remove_file(&script);
         let _ = fs::rename(&real, &script);
         return Err(error);
     }
@@ -734,7 +745,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let script = temp.path().join("build_script_build-abc");
         fs::write(&script, b"real script").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        fs::File::options()
+            .write(true)
+            .open(&script)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
         install_launcher(temp.path(), "build_script_build-abc").unwrap();
+        assert_eq!(fs::metadata(&script).unwrap().modified().unwrap(), old);
         // Writing through the installed launcher must not touch this
         // process's executable (an in-place linker write).
         fs::write(&script, b"relinked in place").unwrap();

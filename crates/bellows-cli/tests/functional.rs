@@ -989,3 +989,364 @@ fn waiting_build_reacquires_released_lease_without_timing_out() {
     assert!(!recorded.contains("\"kind\":\"fallback\""), "{recorded}");
     assert_eq!(f.value("target"), "42");
 }
+
+fn write_files(root: &std::path::Path, files: &[(&str, &str)]) {
+    for (path, contents) in files {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+}
+
+/// Copy the fixture's sources (not its target) into a sibling checkout.
+fn second_checkout(f: &mut Fixture, name: &str) {
+    fn copy(from: &std::path::Path, to: &std::path::Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            if name == "target" || name == ".bellows" {
+                continue;
+            }
+            if entry.file_type().unwrap().is_dir() {
+                copy(&entry.path(), &to.join(&name));
+            } else {
+                fs::copy(entry.path(), to.join(&name)).unwrap();
+            }
+        }
+    }
+    let other = f.temp.path().join(name);
+    copy(&f.workspace, &other);
+    f.workspace = other;
+}
+
+/// Cache decisions for one crate from wrapper status lines, e.g. "LOCAL HIT".
+fn decisions(output: &Output, crate_name: &str) -> Vec<String> {
+    stderr(output)
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let (label, rest) = line.split_once(&format!(" {crate_name} "))?;
+            let label = label.trim();
+            (!rest.is_empty() && label.chars().all(|c| c.is_ascii_uppercase() || c == ' '))
+                .then(|| label.to_owned())
+        })
+        .collect()
+}
+
+fn events(f: &Fixture) -> Vec<bellows_core::Event> {
+    fs::read_to_string(f.cache.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[test]
+fn test_harnesses_share_across_checkouts_unless_they_embed_a_checkout_path() {
+    let mut f = Fixture::new(
+        "pub fn value() -> u32 { 42 }\n#[cfg(test)] mod tests { #[test] fn unit() { assert_eq!(super::value(), 42); } }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    write_files(
+        &f.workspace,
+        &[
+            (
+                "tests/pure.rs",
+                "#[test] fn pure() { assert_eq!(fixture::value(), 42); assert!(file!().ends_with(\"pure.rs\")); }",
+            ),
+            (
+                "tests/baked.rs",
+                "#[test] fn baked() { let manifest = concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/Cargo.toml\"); assert!(std::fs::read_to_string(manifest).unwrap().contains(\"fixture\")); println!(\"BAKED={}\", env!(\"CARGO_MANIFEST_DIR\")); }",
+            ),
+        ],
+    );
+    f.lock();
+    let test = |f: &Fixture| {
+        checked(
+            f.local()
+                .args(["cargo", "test", "--offline", "--", "--nocapture"]),
+        )
+    };
+    let first = test(&f);
+    assert_eq!(
+        decisions(&first, "pure"),
+        ["CACHE MISS"],
+        "{}",
+        stderr(&first)
+    );
+    second_checkout(&mut f, "second checkout");
+    let second = test(&f);
+    let log = stderr(&second);
+    assert_eq!(decisions(&second, "pure"), ["LOCAL HIT"], "{log}");
+    assert_eq!(decisions(&second, "baked"), ["CACHE MISS"], "{log}");
+    assert!(
+        log.contains("environment changed: CARGO_MANIFEST_DIR"),
+        "{log}"
+    );
+    // The recompiled path-baking test reads this checkout's files.
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(
+        stdout.contains(&format!("BAKED={}", f.workspace.display())),
+        "{stdout}"
+    );
+    // Identical results: every harness passes in both checkouts.
+    let results = |output: &Output| {
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| line.starts_with("test ") && line.contains(" ... "))
+            .map(str::to_owned)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    assert_eq!(results(&first), results(&second));
+    assert_eq!(results(&second).len(), 3);
+    assert!(results(&second).iter().all(|line| line.ends_with("... ok")));
+
+    // A clean target in the same checkout restores even the pinned harness.
+    f.clean();
+    let warm = test(&f);
+    assert_eq!(
+        decisions(&warm, "baked"),
+        ["LOCAL HIT"],
+        "{}",
+        stderr(&warm)
+    );
+    if cfg!(windows) {
+        let deps = f.workspace.join("target/debug/deps");
+        let names = fs::read_dir(&deps)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        for suffix in [".exe", ".pdb"] {
+            assert!(
+                names
+                    .iter()
+                    .any(|name| name.starts_with("pure-") && name.ends_with(suffix)),
+                "restored {suffix} missing: {names:?}"
+            );
+        }
+    }
+}
+
+fn native_archive(f: &Fixture, value: i32) {
+    fs::create_dir_all(f.workspace.join("native")).unwrap();
+    fs::write(
+        f.workspace.join("native/value.c"),
+        format!("int native_value(void) {{ return {value}; }}"),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        checked(
+            f.command("cc")
+                .args(["-c", "native/value.c", "-o", "native/value.o"]),
+        );
+        let _ = fs::remove_file(f.workspace.join("native/libaudit_native.a"));
+        checked(
+            f.command("ar")
+                .args(["rcs", "native/libaudit_native.a", "native/value.o"]),
+        );
+    }
+    #[cfg(windows)]
+    {
+        let finder = PathBuf::from(std::env::var_os("ProgramFiles(x86)").unwrap())
+            .join("Microsoft Visual Studio/Installer/vswhere.exe");
+        let found = checked(f.command(finder).args([
+            "-latest",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-property",
+            "installationPath",
+        ]));
+        let installation = PathBuf::from(String::from_utf8(found.stdout).unwrap().trim());
+        let version = fs::read_to_string(
+            installation.join("VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt"),
+        )
+        .unwrap();
+        let tools = installation
+            .join("VC/Tools/MSVC")
+            .join(version.trim())
+            .join("bin/Hostx64/x64");
+        checked(f.command(tools.join("cl.exe")).args([
+            "/nologo",
+            "/c",
+            "native/value.c",
+            "/Fonative/value.obj",
+        ]));
+        checked(f.command(tools.join("lib.exe")).args([
+            "/nologo",
+            "/OUT:native/audit_native.lib",
+            "native/value.obj",
+        ]));
+    }
+}
+
+#[test]
+fn native_library_changes_invalidate_a_cached_link() {
+    let f = Fixture::new("", "");
+    fs::write(
+        f.workspace.join("src/app.rs"),
+        "unsafe extern \"C\" { fn native_value() -> i32; } fn main() { println!(\"{}\", unsafe { native_value() }); }",
+    )
+    .unwrap();
+    let link = || {
+        checked(f.local().arg(BELLOWS).args([
+            "rustc",
+            "src/app.rs",
+            "--edition=2024",
+            "--crate-name=app",
+            "--crate-type=bin",
+            "--emit=dep-info,link",
+            "-Cextra-filename=-audit",
+            "--out-dir=out",
+            "-L",
+            "native=native",
+            "-l",
+            "static=audit_native",
+        ]))
+    };
+    let run = || {
+        let output = checked(
+            &mut f.command(
+                f.workspace
+                    .join(format!("out/app-audit{}", std::env::consts::EXE_SUFFIX)),
+            ),
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    native_archive(&f, 1);
+    assert_eq!(decisions(&link(), "app"), ["CACHE MISS"]);
+    assert_eq!(run(), "1");
+    fs::remove_dir_all(f.workspace.join("out")).unwrap();
+    let restored = link();
+    assert_eq!(
+        decisions(&restored, "app"),
+        ["LOCAL HIT"],
+        "{}",
+        stderr(&restored)
+    );
+    assert_eq!(run(), "1");
+    native_archive(&f, 2);
+    fs::remove_dir_all(f.workspace.join("out")).unwrap();
+    let relinked = link();
+    assert_eq!(
+        decisions(&relinked, "app"),
+        ["CACHE MISS"],
+        "{}",
+        stderr(&relinked)
+    );
+    assert!(
+        stderr(&relinked).contains("input changed"),
+        "{}",
+        stderr(&relinked)
+    );
+    assert_eq!(run(), "2");
+}
+
+#[test]
+fn incremental_compiles_publish_only_from_scratch_sessions() {
+    let mut f = Fixture::new(
+        "pub fn value() -> u32 { 1 }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    f.lock();
+    let build = |f: &Fixture| {
+        checked(
+            f.local()
+                .args(["cargo", "build", "--offline"])
+                .env("CARGO_INCREMENTAL", "1"),
+        )
+    };
+    let stored = |f: &Fixture| {
+        events(f)
+            .iter()
+            .filter(|e| e.kind == "store" && e.detail.contains("library output"))
+            .count()
+    };
+    build(&f);
+    assert_eq!(stored(&f), 1);
+    second_checkout(&mut f, "second checkout");
+    let restored = build(&f);
+    assert_eq!(decisions(&restored, "fixture"), ["LOCAL HIT", "LOCAL HIT"]);
+    // No session existed here: the first edit compiles from scratch.
+    fs::write(
+        f.workspace.join("src/lib.rs"),
+        "pub fn value() -> u32 { 2 }",
+    )
+    .unwrap();
+    build(&f);
+    assert_eq!(stored(&f), 2);
+    // The next edit reuses that session and stays in this checkout.
+    fs::write(
+        f.workspace.join("src/lib.rs"),
+        "pub fn value() -> u32 { 3 }",
+    )
+    .unwrap();
+    build(&f);
+    assert_eq!(stored(&f), 2);
+    assert!(
+        events(&f)
+            .iter()
+            .any(|e| e.kind == "not_stored" && e.detail.contains("reused an existing session"))
+    );
+    let binary = f.workspace.join(format!(
+        "target/debug/fixture{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    let output = checked(&mut f.command(binary));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "3");
+}
+
+#[test]
+fn proc_macro_consumers_share_across_checkouts() {
+    let mut f = Fixture::new(
+        "pub fn value() -> u32 { derive::answer!() }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    write_files(
+        &f.workspace,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[dependencies]\nderive={path=\"derive\"}\n[workspace]\nmembers=[\"derive\"]\n",
+            ),
+            (
+                "derive/Cargo.toml",
+                "[package]\nname=\"derive\"\nversion=\"0.1.0\"\nedition=\"2024\"\nbuild=\"build.rs\"\n[lib]\nproc-macro=true\n",
+            ),
+            // Like wit-bindgen: export the (empty) OUT_DIR and bake it in.
+            (
+                "derive/build.rs",
+                "fn main() { println!(\"cargo:rustc-env=MACRO_DEBUG_DIR={}\", std::env::var(\"OUT_DIR\").unwrap()); }",
+            ),
+            (
+                "derive/src/lib.rs",
+                "use proc_macro::TokenStream;\nconst DEBUG: &str = env!(\"MACRO_DEBUG_DIR\");\n#[proc_macro]\npub fn answer(_: TokenStream) -> TokenStream {\n    if std::env::var_os(\"FIXTURE_MACRO_DEBUG\").is_some() { std::fs::write(std::path::Path::new(DEBUG).join(\"expanded.rs\"), \"42\").unwrap(); }\n    \"42u32\".parse().unwrap()\n}\n",
+            ),
+        ],
+    );
+    f.lock();
+    f.build();
+    second_checkout(&mut f, "second checkout");
+    let restored = f.build();
+    let log = stderr(&restored);
+    assert_eq!(decisions(&restored, "derive"), ["LOCAL HIT"], "{log}");
+    assert_eq!(
+        decisions(&restored, "fixture"),
+        ["LOCAL HIT", "LOCAL HIT"],
+        "{log}"
+    );
+    assert!(log.contains("proc macros: derive"), "{log}");
+    assert_eq!(f.value("target"), "42");
+    // The substituted directory is real and writable for the macro.
+    f.clean();
+    checked(
+        f.local()
+            .args(["cargo", "build", "--release", "--offline"])
+            .env("FIXTURE_MACRO_DEBUG", "1")
+            .env("CARGO_INCREMENTAL", "0"),
+    );
+    assert_eq!(f.value("target"), "42");
+}

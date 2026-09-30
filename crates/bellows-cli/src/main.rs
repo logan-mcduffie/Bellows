@@ -2378,6 +2378,7 @@ fn compile_and_capture(
     // rustc writes the exact linker command to a file, leaving the stdout
     // Cargo reads untouched.
     let link_record = if invocation.kind == OutputKind::Linked {
+        fs::create_dir_all(&invocation.out_dir).context("create output directory")?;
         let record = tempfile::Builder::new()
             .prefix(".bellows-link-")
             .tempfile_in(&invocation.out_dir)

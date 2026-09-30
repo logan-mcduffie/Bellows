@@ -881,16 +881,19 @@ impl Invocation {
         let incremental = codegen_value(&args, "incremental").map(PathBuf::from);
         let (native_search, static_libraries) = native_inputs(&args)?;
         let out_dir = PathBuf::from(option_value(&args, "--out-dir").ok_or("missing --out-dir")?);
-        // Cargo omits the extra filename for executables on MSVC and wasm
-        // (their debug-info and output names must stay predictable); the
-        // unit is still unique within its output directory.
-        let executable_only = crate_types.iter().all(|kind| kind == "bin");
+        // Cargo omits the extra filename for packages that build a cdylib or
+        // dylib (users load them by name) and for MSVC/wasm executables
+        // (debug-info names must stay predictable). The unit is still unique
+        // within its output directory.
+        let predictable_name = crate_types
+            .iter()
+            .any(|kind| matches!(kind.as_str(), "bin" | "cdylib" | "dylib"));
         let extra_filename = match codegen_value(&args, "extra-filename") {
             Some(extra) if extra.is_empty() || extra.contains(['/', '\\']) => {
                 return Err("ambiguous extra filename".into());
             }
             Some(extra) => extra,
-            None if executable_only => String::new(),
+            None if predictable_name => String::new(),
             None => return Err("missing -C extra-filename".into()),
         };
         let source = args

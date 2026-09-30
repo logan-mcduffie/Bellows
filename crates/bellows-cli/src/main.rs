@@ -2563,8 +2563,11 @@ fn compile_and_capture(
         .context("start rustc")?;
     let stdout = child.stdout.take().context("capture rustc stdout")?;
     let stderr = child.stderr.take().context("capture rustc stderr")?;
-    let stdout_thread = thread::spawn(move || tee(stdout, std::io::stdout()));
-    let stderr_thread = thread::spawn(move || tee(stderr, std::io::stderr()));
+    let roots = virtual_roots(identity);
+    let stderr_roots = roots.clone();
+    let stdout_thread = thread::spawn(move || tee_devirtualized(stdout, std::io::stdout(), &roots));
+    let stderr_thread =
+        thread::spawn(move || tee_devirtualized(stderr, std::io::stderr(), &stderr_roots));
     let status = child.wait()?;
     let stdout = stdout_thread
         .join()
@@ -2989,6 +2992,104 @@ fn check_bundled_members(invocation: &Invocation, rlib: &[u8], workspace: &Path)
         )));
     }
     Ok(())
+}
+
+/// Remapping keeps checkout paths out of objects and debuginfo, but rustc
+/// also applies it to diagnostics. Messages are rewritten back to this
+/// checkout's real paths, so compiler output (and snapshot tests of it, such
+/// as trybuild) reads exactly as without Bellows. Stored streams are then
+/// normalized from the real paths and localized again on every replay.
+fn virtual_roots(identity: &Identity) -> Vec<(String, String)> {
+    [
+        ("$CHECKOUT", "/bellows/checkout"),
+        ("$WORKSPACE", "/bellows/workspace"),
+        ("$PROFILE", "/bellows/profile"),
+        ("$TARGET", "/bellows/target"),
+    ]
+    .into_iter()
+    .filter_map(|(token, virtual_root)| {
+        identity
+            .root_normalizer
+            .spellings(token)
+            .into_iter()
+            .find(|spelling| {
+                !spelling.starts_with(r"\\?\") && !(cfg!(windows) && spelling.contains('/'))
+            })
+            .map(|real| (virtual_root.to_owned(), real))
+    })
+    .collect()
+}
+
+fn devirtualize_line(line: &[u8], roots: &[(String, String)]) -> Vec<u8> {
+    let mentions = |bytes: &[u8]| {
+        roots
+            .iter()
+            .any(|(virtual_root, _)| memchr::memmem::find(bytes, virtual_root.as_bytes()).is_some())
+    };
+    if !mentions(line) {
+        return line.to_vec();
+    }
+    let replace = |text: &str| {
+        roots
+            .iter()
+            .fold(text.to_owned(), |text, (virtual_root, real)| {
+                text.replace(virtual_root, real)
+            })
+    };
+    fn visit(value: &mut serde_json::Value, replace: &dyn Fn(&str) -> String) {
+        match value {
+            serde_json::Value::String(text) => *text = replace(text),
+            serde_json::Value::Array(values) => values.iter_mut().for_each(|v| visit(v, replace)),
+            serde_json::Value::Object(values) => {
+                values.values_mut().for_each(|v| visit(v, replace))
+            }
+            _ => {}
+        }
+    }
+    let body = line.strip_suffix(b"\n").unwrap_or(line);
+    let body = body.strip_suffix(b"\r").unwrap_or(body);
+    let ending = &line[body.len()..];
+    if let Ok(mut value @ serde_json::Value::Object(_)) = serde_json::from_slice(body) {
+        visit(&mut value, &replace);
+        let mut result = serde_json::to_vec(&value).expect("serialize compiler JSON");
+        result.extend_from_slice(ending);
+        return result;
+    }
+    match std::str::from_utf8(line) {
+        Ok(text) => replace(text).into_bytes(),
+        Err(_) => line.to_vec(),
+    }
+}
+
+fn tee_devirtualized(
+    mut reader: impl Read,
+    mut writer: impl Write,
+    roots: &[(String, String)],
+) -> Result<Vec<u8>> {
+    let mut captured = Vec::new();
+    let mut pending = Vec::new();
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        pending.extend_from_slice(&buffer[..count]);
+        while let Some(end) = pending.iter().position(|b| *b == b'\n') {
+            let line = devirtualize_line(&pending[..=end], roots);
+            writer.write_all(&line)?;
+            captured.extend_from_slice(&line);
+            pending.drain(..=end);
+        }
+        writer.flush()?;
+    }
+    if !pending.is_empty() {
+        let line = devirtualize_line(&pending, roots);
+        writer.write_all(&line)?;
+        writer.flush()?;
+        captured.extend_from_slice(&line);
+    }
+    Ok(captured)
 }
 
 fn tee(mut reader: impl Read, mut writer: impl Write) -> Result<Vec<u8>> {
@@ -4832,6 +4933,40 @@ mod tests {
         )
         .unwrap();
         assert!(invocation.explicit_inputs.contains(&std));
+    }
+
+    #[test]
+    fn diagnostics_name_this_checkouts_real_paths() {
+        let roots = vec![
+            (
+                "/bellows/workspace".to_owned(),
+                "/home/dev/checkout a".to_owned(),
+            ),
+            (
+                "/bellows/target".to_owned(),
+                "/home/dev/checkout a/target".to_owned(),
+            ),
+        ];
+        assert_eq!(
+            devirtualize_line(
+                b"error: --> /bellows/workspace/tests/ui/fail.rs:3:5\n",
+                &roots
+            ),
+            b"error: --> /home/dev/checkout a/tests/ui/fail.rs:3:5\n"
+        );
+        let json = br#"{"rendered":"--> /bellows/workspace/src/lib.rs","spans":[{"file_name":"/bellows/target/out/gen.rs"}]}"#;
+        let mut line = json.to_vec();
+        line.extend_from_slice(b"\r\n");
+        let converted = devirtualize_line(&line, &roots);
+        assert!(converted.ends_with(b"\r\n"));
+        let value: serde_json::Value =
+            serde_json::from_slice(&converted[..converted.len() - 2]).unwrap();
+        assert_eq!(value["rendered"], "--> /home/dev/checkout a/src/lib.rs");
+        assert_eq!(
+            value["spans"][0]["file_name"],
+            "/home/dev/checkout a/target/out/gen.rs"
+        );
+        assert_eq!(devirtualize_line(b"unrelated\n", &roots), b"unrelated\n");
     }
 
     #[test]

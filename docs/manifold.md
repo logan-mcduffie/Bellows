@@ -95,10 +95,13 @@ canonical lanes:
 
 # Exact-diagnostics tests
 
-Compiler-output snapshot tools such as `trybuild` and `macrotest` must run with
-`RUSTC_WRAPPER` disabled. Bellows remaps dependency metadata paths for portable
-cache hits; rustc cannot reopen those virtual paths to render dependency source
-snippets required by exact diagnostic fixtures.
+Compiler messages name real paths: Bellows remaps paths in objects and
+debuginfo for portable results, and rewrites rustc's diagnostics back to the
+receiving checkout's paths, live and on replay. Compiler-output snapshot tools
+such as `trybuild` therefore pass through the wrapper. A diagnostic that
+quotes a *dependency's* source snippet can still differ, because rustc cannot
+reopen a restored dependency's virtual path; keep `macrotest`-style fixtures
+that snapshot dependency snippets wrapper-free.
 
 GPU/browser execution boundaries remain unchanged throughout: compilation and
 archives may move, but RTX 5080 golden/pixel tests execute on the GPU runner.

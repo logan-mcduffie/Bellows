@@ -189,8 +189,9 @@ explicitly can use `bellows action run`, whose input/output manifest and
 isolated offline sandbox become the correctness boundary. A bypass is visible,
 not a silent correctness bet.
 
-Injected `--remap-path-prefix` flags make library metadata checkout-independent
-but also cause rendered compiler diagnostics to use `/bellows/workspace` paths.
+Injected `--remap-path-prefix` flags make outputs checkout-independent. rustc
+also applies them to diagnostics, so Bellows rewrites messages back to the
+receiving checkout's real paths, live and when a cached result replays.
 Cargo metadata can itself encode path-dependency package IDs, so fleets should
 still use consistent checkout layouts for the best hit rate.
 

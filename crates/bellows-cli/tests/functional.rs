@@ -1584,3 +1584,44 @@ fn repeated_builds_stay_cargo_no_ops_after_compiles_and_restores() {
     assert_eq!(decisions_so_far(&f), after_restore);
     assert_eq!(f.value("target"), "5");
 }
+
+#[test]
+fn diagnostics_show_real_paths_for_snapshot_tests() {
+    let f = Fixture::new("", "");
+    let source = f.workspace.join("ui/warn.rs");
+    fs::create_dir_all(source.parent().unwrap()).unwrap();
+    fs::write(&source, "fn main() { let unused = 1; }").unwrap();
+    let compile = |path: &std::path::Path| {
+        f.local()
+            .arg(BELLOWS)
+            .arg("rustc")
+            .arg(path)
+            .args([
+                "--edition=2024",
+                "--crate-name=warn",
+                "--crate-type=bin",
+                "--emit=dep-info,link",
+                "-Cextra-filename=-ui",
+                "--out-dir=out",
+            ])
+            .output()
+            .unwrap()
+    };
+    // trybuild compiles files by absolute path and snapshots the messages.
+    let expected = format!("{}", source.display());
+    for attempt in ["miss", "hit"] {
+        let output = compile(&source);
+        let log = stderr(&output);
+        assert!(output.status.success(), "{log}");
+        assert!(log.contains(&expected), "{attempt}: {log}");
+        assert!(!log.contains("/bellows/"), "{attempt}: {log}");
+        fs::remove_dir_all(f.workspace.join("out")).unwrap();
+    }
+    let failing = f.workspace.join("ui/fail.rs");
+    fs::write(&failing, "fn main() { let x: u32 = \"no\"; }").unwrap();
+    let output = compile(&failing);
+    assert!(!output.status.success());
+    let log = stderr(&output);
+    assert!(log.contains(&format!("{}", failing.display())), "{log}");
+    assert!(!log.contains("/bellows/"), "{log}");
+}

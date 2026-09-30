@@ -98,6 +98,7 @@ fn identity(path: &Path, metadata: &fs::Metadata) -> String {
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map_or(0, |duration| duration.as_nanos())
     };
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut fields = format!(
         "v1\0{}\0{}\0{}\0{}",
         path.display(),

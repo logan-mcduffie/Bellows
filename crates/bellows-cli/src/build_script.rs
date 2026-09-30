@@ -67,8 +67,12 @@ pub fn install_launcher(out_dir: &Path, unit_file: &str) -> Result<()> {
     let launcher = env::current_exe()?;
     fs::rename(&script, &real)
         .with_context(|| format!("move build script {}", script.display()))?;
-    let installed = fs::hard_link(&launcher, &script)
-        .or_else(|_| fs::copy(&launcher, &script).map(|_| ()))
+    // Always a private copy, never a hard link: MSVC's link.exe (and linkers
+    // such as mold) rewrite an existing output file in place, which through
+    // a hard link would overwrite the Bellows executable itself. On btrfs
+    // and XFS the copy is a reflink.
+    let installed = fs::copy(&launcher, &script)
+        .map(|_| ())
         .with_context(|| format!("install build-script launcher {}", script.display()));
     if let Err(error) = installed {
         let _ = fs::rename(&real, &script);
@@ -78,6 +82,17 @@ pub fn install_launcher(out_dir: &Path, unit_file: &str) -> Result<()> {
         &out_dir.join(RECORD),
         &serde_json::to_vec(&LauncherRecord { real: real_name })?,
     )
+}
+
+/// Before rustc writes a build-script executable, remove a previous
+/// launcher, its real binary and its record so the new output is a fresh
+/// file and a stale record can never name an outdated script.
+pub fn remove_launcher(out_dir: &Path, unit_file: &str) {
+    if out_dir.join(RECORD).exists() {
+        let _ = fs::remove_file(out_dir.join(RECORD));
+        let _ = fs::remove_file(out_dir.join(unit_file));
+        let _ = fs::remove_file(out_dir.join(format!("{REAL_PREFIX}{unit_file}")));
+    }
 }
 
 /// The real script, when this process was started by Cargo as a launcher.
@@ -710,6 +725,34 @@ mod tests {
         forged.extend(br#"{"path":"../escape","len":1,"executable":false}"#);
         forged.extend(b"\nx");
         assert!(unpack_tree(&forged).is_err());
+    }
+
+    #[test]
+    fn launchers_are_private_copies_and_removed_before_recompiling() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("build_script_build-abc");
+        fs::write(&script, b"real script").unwrap();
+        install_launcher(temp.path(), "build_script_build-abc").unwrap();
+        // Writing through the installed launcher must not touch this
+        // process's executable (an in-place linker write).
+        fs::write(&script, b"relinked in place").unwrap();
+        assert_ne!(
+            fs::read(env::current_exe().unwrap()).unwrap(),
+            b"relinked in place"
+        );
+        assert_eq!(
+            fs::read(temp.path().join(".bellows-real-build_script_build-abc")).unwrap(),
+            b"real script"
+        );
+        remove_launcher(temp.path(), "build_script_build-abc");
+        assert!(!script.exists());
+        assert!(!temp.path().join(RECORD).exists());
+        assert!(
+            !temp
+                .path()
+                .join(".bellows-real-build_script_build-abc")
+                .exists()
+        );
     }
 
     #[test]

@@ -1189,6 +1189,9 @@ impl std::error::Error for NotStored {}
 
 fn rustc_wrapper(raw: &[OsString]) -> Result<ExitStatus> {
     let started = Instant::now();
+    if let Some((out_dir, unit_file)) = build_script_unit(raw) {
+        build_script::remove_launcher(&out_dir, &unit_file);
+    }
     let result = match cache_or_compile(raw) {
         Ok(status) => Ok(status),
         Err(error) => {
@@ -1205,6 +1208,7 @@ fn rustc_wrapper(raw: &[OsString]) -> Result<ExitStatus> {
     };
     if result.as_ref().is_ok_and(ExitStatus::success)
         && let Some((out_dir, unit_file)) = build_script_unit(raw)
+        && out_dir.join(&unit_file).is_file()
         && let Err(error) = build_script::install_launcher(&out_dir, &unit_file)
     {
         record_event(
@@ -1243,8 +1247,7 @@ fn build_script_unit(raw: &[OsString]) -> Option<(PathBuf, String)> {
         return None;
     }
     let extra = codegen_value(&args, "extra-filename").unwrap_or_default();
-    let unit = build_script::unit_file(&crate_name, &extra);
-    out_dir.join(&unit).is_file().then_some((out_dir, unit))
+    Some((out_dir, build_script::unit_file(&crate_name, &extra)))
 }
 
 fn wrapper_crate_name(raw: &[OsString]) -> &str {

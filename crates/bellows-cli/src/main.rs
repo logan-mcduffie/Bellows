@@ -881,11 +881,18 @@ impl Invocation {
         let incremental = codegen_value(&args, "incremental").map(PathBuf::from);
         let (native_search, static_libraries) = native_inputs(&args)?;
         let out_dir = PathBuf::from(option_value(&args, "--out-dir").ok_or("missing --out-dir")?);
-        let extra_filename =
-            codegen_value(&args, "extra-filename").ok_or("missing -C extra-filename")?;
-        if extra_filename.is_empty() || extra_filename.contains(['/', '\\']) {
-            return Err("ambiguous extra filename".into());
-        }
+        // Cargo omits the extra filename for executables on MSVC and wasm
+        // (their debug-info and output names must stay predictable); the
+        // unit is still unique within its output directory.
+        let executable_only = crate_types.iter().all(|kind| kind == "bin");
+        let extra_filename = match codegen_value(&args, "extra-filename") {
+            Some(extra) if extra.is_empty() || extra.contains(['/', '\\']) => {
+                return Err("ambiguous extra filename".into());
+            }
+            Some(extra) => extra,
+            None if executable_only => String::new(),
+            None => return Err("missing -C extra-filename".into()),
+        };
         let source = args
             .iter()
             .find(|arg| arg.ends_with(".rs") && Path::new(arg.as_str()).exists())
@@ -2352,14 +2359,21 @@ fn compile_and_capture(
             args.push(arg.clone());
         }
     }
-    args.push("--remap-path-prefix".into());
-    args.push(format!(
-        "{}=/bellows/workspace",
-        identity.workspace.display()
-    ));
-    if let Some(target) = target_root(&identity.workspace, &invocation.out_dir) {
-        args.push("--remap-path-prefix".into());
-        args.push(format!("{}=/bellows/target", target.display()));
+    // Remap every spelling of each root: on Windows the canonical workspace
+    // is a verbatim `\\?\C:\…` path that never prefixes rustc's own paths.
+    // rustc applies the last matching mapping, so the target (often inside
+    // the workspace) comes last.
+    for (token, virtual_root) in [
+        ("$WORKSPACE", "/bellows/workspace"),
+        ("$TARGET", "/bellows/target"),
+    ] {
+        for spelling in identity.root_normalizer.spellings(token) {
+            if spelling.starts_with(r"\\?\") {
+                continue;
+            }
+            args.push("--remap-path-prefix".into());
+            args.push(format!("{spelling}={virtual_root}"));
+        }
     }
     // rustc writes the exact linker command to a file, leaving the stdout
     // Cargo reads untouched.
@@ -2676,7 +2690,6 @@ fn capture_outputs(
             record(&resolved, true)?;
         }
     }
-    drop(record);
     files.sort_by(|a, b| a.path.cmp(&b.path));
     files.dedup_by(|a, b| a.path == b.path);
     host_files.sort_by(|a, b| a.path.cmp(&b.path));

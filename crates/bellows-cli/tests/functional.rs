@@ -1350,3 +1350,44 @@ fn proc_macro_consumers_share_across_checkouts() {
     );
     assert_eq!(f.value("target"), "42");
 }
+
+#[test]
+fn restore_replaces_an_executable_that_is_still_running() {
+    let f = Fixture::new("", "");
+    fs::write(
+        f.workspace.join("src/app.rs"),
+        "fn main() { if std::env::args().nth(1).is_some() { std::thread::sleep(std::time::Duration::from_secs(20)); } println!(\"ready\"); }",
+    )
+    .unwrap();
+    let link = || {
+        checked(f.local().arg(BELLOWS).args([
+            "rustc",
+            "src/app.rs",
+            "--edition=2024",
+            "--crate-name=app",
+            "--crate-type=bin",
+            "--emit=dep-info,link",
+            "-Cextra-filename=-running",
+            "--out-dir=out",
+        ]))
+    };
+    assert_eq!(decisions(&link(), "app"), ["CACHE MISS"]);
+    let binary = f
+        .workspace
+        .join(format!("out/app-running{}", std::env::consts::EXE_SUFFIX));
+    // A test binary still executing (Windows locks its image) while Cargo
+    // asks for the same unit again.
+    let mut running = f.command(&binary).arg("wait").spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let restored = link();
+    assert_eq!(
+        decisions(&restored, "app"),
+        ["LOCAL HIT"],
+        "{}",
+        stderr(&restored)
+    );
+    let output = checked(&mut f.command(&binary));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ready");
+    running.kill().unwrap();
+    let _ = running.wait();
+}

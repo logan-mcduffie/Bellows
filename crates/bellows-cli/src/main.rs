@@ -24,6 +24,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod archive;
+mod build_script;
 mod diagnostics;
 mod digests;
 mod leak;
@@ -198,6 +199,8 @@ fn main() -> ExitCode {
     let args: Vec<OsString> = env::args_os().collect();
     let result = if env::var_os(bellows_core::execution::REMAP_ENV).is_some() {
         bellows_core::execution::remap_compiler(&args[1..]).map(|status| status.code().unwrap_or(1))
+    } else if let Some(real) = build_script::launched_as(&args) {
+        build_script::run(&real, &args[1..]).map(|status| status.code().unwrap_or(1))
     } else if is_wrapper_invocation(&args) {
         rustc_wrapper(&args[1..]).map(|status| status.code().unwrap_or(1))
     } else {
@@ -1200,6 +1203,18 @@ fn rustc_wrapper(raw: &[OsString]) -> Result<ExitStatus> {
             passthrough(raw)
         }
     };
+    if result.as_ref().is_ok_and(ExitStatus::success)
+        && let Some((out_dir, unit_file)) = build_script_unit(raw)
+        && let Err(error) = build_script::install_launcher(&out_dir, &unit_file)
+    {
+        record_event(
+            "fallback",
+            wrapper_crate_name(raw),
+            None,
+            None,
+            &format!("build-script launcher not installed; the script runs uncached: {error:#}"),
+        );
+    }
     record_event_duration(
         "compiler_timing",
         wrapper_crate_name(raw),
@@ -1209,6 +1224,27 @@ fn rustc_wrapper(raw: &[OsString]) -> Result<ExitStatus> {
         Some(started.elapsed().as_millis() as u64),
     );
     result
+}
+
+/// The output directory and executable name of a build-script compile.
+fn build_script_unit(raw: &[OsString]) -> Option<(PathBuf, String)> {
+    let args = raw
+        .iter()
+        .skip(1)
+        .map(|arg| arg.to_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()?;
+    let crate_name = option_value(&args, "--crate-name")?;
+    let out_dir = PathBuf::from(option_value(&args, "--out-dir")?);
+    if !build_script::is_build_script_compile(&crate_name, &out_dir)
+        || !multi_option_values(&args, "--emit")
+            .iter()
+            .any(|emit| emit.split(',').any(|kind| kind == "link"))
+    {
+        return None;
+    }
+    let extra = codegen_value(&args, "extra-filename").unwrap_or_default();
+    let unit = build_script::unit_file(&crate_name, &extra);
+    out_dir.join(&unit).is_file().then_some((out_dir, unit))
 }
 
 fn wrapper_crate_name(raw: &[OsString]) -> &str {
@@ -3040,7 +3076,10 @@ fn record_event_duration(
     if let Err(error) = diagnostics::append(&event_log_path(), &event) {
         eprintln!("Bellows diagnostics unavailable: {error:#}");
     }
-    if terminal::Output::from_env().prints(kind) {
+    // Cargo captures a build script's stderr; decisions are recorded only.
+    if !build_script::SILENT.load(std::sync::atomic::Ordering::Relaxed)
+        && terminal::Output::from_env().prints(kind)
+    {
         eprintln!(
             "{}",
             terminal::status(terminal::stderr_color(), kind, crate_name, detail)

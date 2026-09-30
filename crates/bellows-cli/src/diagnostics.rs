@@ -178,7 +178,9 @@ const LEGACY_ENTRY_GONE: &str = "previously observed identity";
 pub fn reason_code(kind: &str, detail: &str) -> &'static str {
     match kind {
         "hit" | "l1_hit" | "single_flight" => {
-            return if detail.contains("linked output") {
+            return if detail.contains("build-script run") {
+                "build_script"
+            } else if detail.contains("linked output") {
                 "linked"
             } else if detail.contains("library output") {
                 "library"
@@ -465,6 +467,7 @@ fn reason_label(reason: &str) -> String {
         "compiler_probe" => "compiler probes",
         "library" => "libraries",
         "linked" => "linked outputs",
+        "build_script" => "build-script runs",
         "shareable" => "shareable",
         "checkout_pinned" => "pinned to checkout",
         "incremental_session" => "incremental session reuse",

@@ -1451,3 +1451,59 @@ fn read_only_clients_restore_but_never_publish() {
     assert_eq!(decisions(&restored, "fixture"), ["LOCAL HIT", "LOCAL HIT"]);
     assert_eq!(f.value("target"), "42");
 }
+
+#[test]
+fn build_script_runs_are_restored_and_track_declared_inputs() {
+    let mut f = Fixture::new(
+        "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    write_files(
+        &f.workspace,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\nbuild=\"build.rs\"\n[workspace]\n",
+            ),
+            ("data.txt", "7"),
+            (
+                "build.rs",
+                "fn main() {\n    println!(\"cargo:rerun-if-changed=data.txt\");\n    let value = std::fs::read_to_string(\"data.txt\").unwrap();\n    let out = std::env::var(\"OUT_DIR\").unwrap();\n    std::fs::write(format!(\"{out}/generated.rs\"), format!(\"pub fn value() -> u32 {{ {} }}\", value.trim())).unwrap();\n    println!(\"cargo:rustc-cfg=generated\");\n}\n",
+            ),
+        ],
+    );
+    f.lock();
+    let script = |f: &Fixture| {
+        events(f)
+            .into_iter()
+            .filter(|e| e.crate_name == "build-script:fixture")
+            .map(|e| e.kind)
+            .collect::<Vec<_>>()
+    };
+    f.build();
+    assert_eq!(script(&f), ["miss", "store"]);
+    assert_eq!(f.value("target"), "7");
+    second_checkout(&mut f, "second checkout");
+    let restored = f.build();
+    let log = stderr(&restored);
+    assert_eq!(script(&f), ["miss", "store", "l1_hit"], "{log}");
+    assert_eq!(
+        decisions(&restored, "fixture"),
+        ["LOCAL HIT", "LOCAL HIT"],
+        "{log}"
+    );
+    assert_eq!(f.value("target"), "7");
+    // A declared input changes: the script runs again and so does the crate.
+    fs::write(f.workspace.join("data.txt"), "9").unwrap();
+    f.build();
+    // The rerun starts over the restored OUT_DIR, so it stays local.
+    assert_eq!(
+        script(&f),
+        ["miss", "store", "l1_hit", "miss", "not_stored"]
+    );
+    assert_eq!(f.value("target"), "9");
+    // Plain Cargo in the same target directory still runs the real script.
+    fs::write(f.workspace.join("data.txt"), "11").unwrap();
+    checked(f.command("cargo").args(["build", "--release", "--offline"]));
+    assert_eq!(f.value("target"), "11");
+}

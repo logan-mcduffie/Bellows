@@ -164,6 +164,7 @@ pub fn validate_content_key(key: &str) -> Result<()> {
 pub fn validate_normalized_input_path(value: &str) -> Result<()> {
     const ROOTS: &[&str] = &[
         "$WORKSPACE",
+        "$PROFILE",
         "$TARGET",
         "$CARGO_HOME",
         "$RUSTUP_HOME",

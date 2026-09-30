@@ -1391,3 +1391,33 @@ fn restore_replaces_an_executable_that_is_still_running() {
     running.kill().unwrap();
     let _ = running.wait();
 }
+
+#[test]
+fn profiles_with_identical_compiler_arguments_share_results() {
+    let f = Fixture::new(
+        "pub fn value() -> u32 { 42 }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    let manifest = fs::read_to_string(f.workspace.join("Cargo.toml")).unwrap();
+    fs::write(
+        f.workspace.join("Cargo.toml"),
+        format!("{manifest}[profile.fast]\ninherits=\"release\"\n"),
+    )
+    .unwrap();
+    f.build();
+    let fast = checked(
+        f.local()
+            .args(["cargo", "build", "--profile", "fast", "--offline"]),
+    );
+    assert_eq!(
+        decisions(&fast, "fixture"),
+        ["LOCAL HIT", "LOCAL HIT"],
+        "{}",
+        stderr(&fast)
+    );
+    let output = checked(&mut f.command(f.workspace.join(format!(
+        "target/fast/fixture{}",
+        std::env::consts::EXE_SUFFIX
+    ))));
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
+}

@@ -1580,12 +1580,34 @@ fn root_bases(workspace: &Path, out_dir: &Path) -> Vec<(String, PathBuf)> {
         }
     }
     if let Some(target) = target {
+        // Profiles that pass identical rustc arguments (for example
+        // `release` and a `test-fast` inheriting it) differ only in their
+        // `<target>/<profile>` directory. Naming it separately lets one
+        // verified result serve every such profile.
+        if let Some(profile) = profile_root(&target, out_dir) {
+            bases.push(("$PROFILE".into(), canonical_base(profile.clone())));
+            bases.push(("$PROFILE".into(), profile));
+        }
         bases.push(("$TARGET".into(), canonical_base(target.clone())));
         // Retain the caller's spelling too: Windows temp directories may use
         // 8.3 names that canonicalize() expands to a different path string.
         bases.push(("$TARGET".into(), target));
     }
     bases
+}
+
+/// `<target>[/<triple>]/<profile>` for Cargo's `deps`, `build/<unit>` and
+/// `examples` output directories.
+fn profile_root(target: &Path, out_dir: &Path) -> Option<PathBuf> {
+    out_dir
+        .ancestors()
+        .find(|dir| {
+            dir.file_name()
+                .is_some_and(|name| name == "deps" || name == "build" || name == "examples")
+        })
+        .and_then(Path::parent)
+        .filter(|profile| profile.starts_with(target) && *profile != target)
+        .map(Path::to_path_buf)
 }
 
 fn canonical_base(path: PathBuf) -> PathBuf {
@@ -1736,7 +1758,11 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
     for arg in &normalized_args {
         hash_field(&mut hasher, "arg", arg.as_bytes());
     }
-    hash_field(&mut hasher, "remap", b"$WORKSPACE=/bellows/workspace");
+    hash_field(
+        &mut hasher,
+        "remap",
+        b"$WORKSPACE=/bellows/workspace;$TARGET=/bellows/target;$PROFILE=/bellows/profile",
+    );
     for (name, value) in relevant_environment(&normalizer) {
         hash_field(&mut hasher, &format!("env:{name}"), value.as_bytes());
         components.insert(
@@ -1824,7 +1850,7 @@ fn stable_empty_directories(
             continue;
         }
         let normalized = root_normalizer.normalize(&value);
-        if !normalized.starts_with("$TARGET") || normalized == value {
+        if !(normalized.starts_with("$TARGET") || normalized.starts_with("$PROFILE")) {
             continue;
         }
         let empty = fs::read_dir(&value).is_ok_and(|mut entries| entries.next().is_none());
@@ -2366,6 +2392,7 @@ fn compile_and_capture(
     for (token, virtual_root) in [
         ("$WORKSPACE", "/bellows/workspace"),
         ("$TARGET", "/bellows/target"),
+        ("$PROFILE", "/bellows/profile"),
     ] {
         for spelling in identity.root_normalizer.spellings(token) {
             if spelling.starts_with(r"\\?\") {
@@ -2716,9 +2743,13 @@ fn capture_outputs(
                 Some(value) => {
                     let normalized = identity.root_normalizer.normalize(&value);
                     // Compare normalized only when no output embeds a root
-                    // this value names.
-                    if normalized != value && !leaked.iter().any(|token| normalized.contains(token))
-                    {
+                    // this value names (the profile directory is inside the
+                    // target directory).
+                    let names_leaked_root = leaked.iter().any(|token| {
+                        normalized.contains(token)
+                            || (*token == "$TARGET" && normalized.contains("$PROFILE"))
+                    });
+                    if normalized != value && !names_leaked_root {
                         EnvInput::capture_normalized(&name, &normalized)
                     } else {
                         EnvInput::capture(&name, Some(&value))

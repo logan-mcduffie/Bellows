@@ -1677,3 +1677,69 @@ fn repeated_clippy_runs_stay_no_ops_with_intact_dependency_info() {
         }
     }
 }
+
+#[test]
+fn diagnostics_quote_restored_dependency_sources_like_plain_cargo() {
+    let f = Fixture::new("", "");
+    // Like trybuild: a separate package (compiled from its own directory as
+    // a path dependency) whose bound is quoted in a consumer's error.
+    write_files(
+        &f.workspace,
+        &[
+            (
+                "engine/Cargo.toml",
+                "[package]\nname=\"engine\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[workspace]\n",
+            ),
+            (
+                "engine/src/lib.rs",
+                "pub struct Server;\npub trait Side {}\nimpl Side for Server {}\npub fn register<S: Side>() {}\n",
+            ),
+            (
+                "ui/Cargo.toml",
+                "[package]\nname=\"ui\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[dependencies]\nengine={path=\"../engine\"}\n[workspace]\n",
+            ),
+            (
+                "ui/src/lib.rs",
+                "pub fn wrong() { engine::register::<u8>(); }\n",
+            ),
+        ],
+    );
+    let manifest = |f: &Fixture| f.workspace.join("ui/Cargo.toml");
+    let bellows = |f: &Fixture| {
+        f.local()
+            .args(["cargo", "build", "--offline", "--manifest-path"])
+            .arg(manifest(f))
+            .env("CARGO_TARGET_DIR", f.workspace.join("target"))
+            .output()
+            .unwrap()
+    };
+    let diagnostic = |output: &Output| {
+        let text = stderr(output);
+        let start = text.find("error[E0277]").expect(&text);
+        let end = text[start..]
+            .find("\n\n")
+            .map_or(text.len(), |end| start + end);
+        text[start..end].to_owned()
+    };
+    assert!(!bellows(&f).status.success());
+    // Restore the dependency into a clean target. (Across checkouts Cargo
+    // itself gives an out-of-workspace path dependency a different
+    // `-C metadata`, so it is rebuilt there.)
+    f.clean();
+    let cached = bellows(&f);
+    let log = stderr(&cached);
+    assert_eq!(decisions(&cached, "engine"), ["LOCAL HIT"], "{log}");
+    let plain = f
+        .command("cargo")
+        .args(["build", "--offline", "--manifest-path"])
+        .arg(manifest(&f))
+        .env("CARGO_TARGET_DIR", f.workspace.join("plain-target"))
+        .output()
+        .unwrap();
+    assert_eq!(diagnostic(&cached), diagnostic(&plain));
+    assert!(
+        diagnostic(&cached).contains("pub fn register<S: Side>()"),
+        "{log}"
+    );
+    assert!(!log.contains("/bellows/"), "{log}");
+}

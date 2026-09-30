@@ -1860,7 +1860,7 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
     hash_field(
         &mut hasher,
         "remap",
-        b"$CHECKOUT=/bellows/checkout;$WORKSPACE=/bellows/workspace;$TARGET=/bellows/target;$PROFILE=/bellows/profile",
+        b"remap-v2:$CARGO_HOME=/bellows/cargo-home;$CHECKOUT=/bellows/checkout;$WORKSPACE=<checkout- or cargo-home-relative>;$TARGET=/bellows/target;$PROFILE=/bellows/profile",
     );
     for (name, value) in relevant_environment(&normalizer) {
         hash_field(&mut hasher, &format!("env:{name}"), value.as_bytes());
@@ -2535,20 +2535,8 @@ fn compile_and_capture(
             args.push(arg.clone());
         }
     }
-    // Remap every spelling of each root: on Windows the canonical workspace
-    // is a verbatim `\\?\C:\…` path that never prefixes rustc's own paths.
-    // rustc applies the last matching mapping, so the target (often inside
-    // the workspace) comes last.
-    for (token, virtual_root) in [
-        ("$CHECKOUT", "/bellows/checkout"),
-        ("$WORKSPACE", "/bellows/workspace"),
-        ("$TARGET", "/bellows/target"),
-        ("$PROFILE", "/bellows/profile"),
-    ] {
-        for spelling in identity.root_normalizer.spellings(token) {
-            if spelling.starts_with(r"\\?\") {
-                continue;
-            }
+    for (spellings, virtual_root) in remap_plan(identity) {
+        for spelling in spellings {
             args.push("--remap-path-prefix".into());
             args.push(format!("{spelling}={virtual_root}"));
         }
@@ -3008,30 +2996,96 @@ fn check_bundled_members(invocation: &Invocation, rlib: &[u8], workspace: &Path)
     Ok(())
 }
 
+/// Each root's spellings and the checkout-independent path rustc embeds in
+/// their place, least specific first (rustc applies the last matching
+/// mapping; on Windows the canonical form is a verbatim `\\?\C:\…` path that
+/// never prefixes rustc's own paths, so every spelling is listed).
+///
+/// A virtual path must mean the same directory in every compile of a
+/// session: a dependency's metadata is read by its consumers, which reverse
+/// the mapping to render source snippets. Cargo runs rustc from a path
+/// dependency's own directory, so the working directory is remapped through
+/// its place in the session checkout (`/bellows/checkout/crates/x`) or in
+/// Cargo's home (`/bellows/cargo-home/registry/…`) rather than one shared
+/// `/bellows/workspace`.
+fn remap_plan(identity: &Identity) -> Vec<(Vec<String>, String)> {
+    let usable = |spellings: Vec<String>| {
+        spellings
+            .into_iter()
+            .filter(|spelling| !spelling.starts_with(r"\\?\"))
+            .collect::<Vec<_>>()
+    };
+    let canonical = |spellings: &[String]| {
+        spellings
+            .iter()
+            .find_map(|spelling| Path::new(spelling).canonicalize().ok())
+    };
+    let relative = |path: &Path, root: &Path| {
+        path.strip_prefix(root).ok().map(|rest| {
+            rest.components()
+                .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        })
+    };
+    let under = |base: &str, parts: Vec<String>| {
+        std::iter::once(base.to_owned())
+            .chain(parts)
+            .collect::<Vec<_>>()
+            .join("/")
+    };
+    let cargo_home = identity.normalizer.spellings("$CARGO_HOME");
+    let checkout = identity.root_normalizer.spellings("$CHECKOUT");
+    let workspace_spellings = identity.root_normalizer.spellings("$WORKSPACE");
+    let workspace = &identity.workspace;
+    let workspace_virtual = match (canonical(&checkout), canonical(&cargo_home)) {
+        (Some(root), _) if relative(workspace, &root).is_some() => {
+            under("/bellows/checkout", relative(workspace, &root).unwrap())
+        }
+        (_, Some(root)) if relative(workspace, &root).is_some() => {
+            under("/bellows/cargo-home", relative(workspace, &root).unwrap())
+        }
+        // Without a session checkout the working directory is the checkout.
+        (None, _) => "/bellows/checkout".to_owned(),
+        _ => "/bellows/workspace".to_owned(),
+    };
+    vec![
+        (usable(cargo_home), "/bellows/cargo-home".to_owned()),
+        (usable(checkout), "/bellows/checkout".to_owned()),
+        (usable(workspace_spellings), workspace_virtual),
+        (
+            usable(identity.root_normalizer.spellings("$TARGET")),
+            "/bellows/target".to_owned(),
+        ),
+        (
+            usable(identity.root_normalizer.spellings("$PROFILE")),
+            "/bellows/profile".to_owned(),
+        ),
+    ]
+    .into_iter()
+    .filter(|(spellings, _)| !spellings.is_empty())
+    .collect()
+}
+
 /// Remapping keeps checkout paths out of objects and debuginfo, but rustc
 /// also applies it to diagnostics. Messages are rewritten back to this
 /// checkout's real paths, so compiler output (and snapshot tests of it, such
 /// as trybuild) reads exactly as without Bellows. Stored streams are then
 /// normalized from the real paths and localized again on every replay.
 fn virtual_roots(identity: &Identity) -> Vec<(String, String)> {
-    [
-        ("$CHECKOUT", "/bellows/checkout"),
-        ("$WORKSPACE", "/bellows/workspace"),
-        ("$PROFILE", "/bellows/profile"),
-        ("$TARGET", "/bellows/target"),
-    ]
-    .into_iter()
-    .filter_map(|(token, virtual_root)| {
-        identity
-            .root_normalizer
-            .spellings(token)
-            .into_iter()
-            .find(|spelling| {
-                !spelling.starts_with(r"\\?\") && !(cfg!(windows) && spelling.contains('/'))
-            })
-            .map(|real| (virtual_root.to_owned(), real))
-    })
-    .collect()
+    let mut roots = remap_plan(identity)
+        .into_iter()
+        .filter_map(|(spellings, virtual_root)| {
+            spellings
+                .into_iter()
+                .find(|spelling| !(cfg!(windows) && spelling.contains('/')))
+                .map(|real| (virtual_root, real))
+        })
+        .collect::<Vec<_>>();
+    // Longest virtual prefix first: `/bellows/checkout/crates/x` before
+    // `/bellows/checkout`.
+    roots.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    roots.dedup_by(|a, b| a.0 == b.0);
+    roots
 }
 
 fn devirtualize_line(line: &[u8], roots: &[(String, String)]) -> Vec<u8> {

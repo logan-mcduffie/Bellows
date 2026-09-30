@@ -98,10 +98,10 @@ canonical lanes:
 Compiler messages name real paths: Bellows remaps paths in objects and
 debuginfo for portable results, and rewrites rustc's diagnostics back to the
 receiving checkout's paths, live and on replay. Compiler-output snapshot tools
-such as `trybuild` therefore pass through the wrapper. A diagnostic that
-quotes a *dependency's* source snippet can still differ, because rustc cannot
-reopen a restored dependency's virtual path; keep `macrotest`-style fixtures
-that snapshot dependency snippets wrapper-free.
+such as `trybuild` therefore pass through the wrapper, including notes that
+quote a restored dependency's source: every virtual path names one directory
+for the whole session (`/bellows/checkout/crates/x`, `/bellows/cargo-home/…`),
+so rustc maps it back to the local file.
 
 GPU/browser execution boundaries remain unchanged throughout: compilation and
 archives may move, but RTX 5080 golden/pixel tests execute on the GPU runner.

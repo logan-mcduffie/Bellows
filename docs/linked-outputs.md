@@ -200,6 +200,21 @@ Each one keeps the guarantees above.
   already describe are kept in the key instead of bypassing.
 - **`BELLOWS_READ_ONLY=1`** restores verified results without publishing, for
   CI jobs that share a developer's service.
+- **Unambiguous virtual paths and real-path diagnostics.** Cargo runs rustc
+  from a path dependency's own directory, so one flat `/bellows/workspace`
+  meant different directories in different compiles. rustc then could not
+  reopen a restored dependency's source for a diagnostic snippet, which a
+  Manifold trybuild test caught. A package directory is now remapped through
+  its place in the session checkout (`/bellows/checkout/crates/x`) or Cargo's
+  home (`/bellows/cargo-home/…`). rustc's messages are rewritten to the
+  receiving checkout's real paths live and on replay, because remapping also
+  applies to diagnostics.
+- **clippy-driver linked units are compiled directly.** With
+  `--print link-args`, clippy-driver writes corrupted `# env-dep:` names,
+  which made Cargo rebuild on every clippy run.
+- **Build-script mtimes.** A launcher keeps the real script's mtime; Cargo
+  otherwise treats the script as older than its build-dependencies and
+  rebuilds everything downstream.
 - **Memoized digests.** Files Bellows writes are recorded in the digest memo
   under their post-write identity, so link validation in a fresh worktree does
   not rehash every restored rlib. `rustc -vV` is memoized per concrete compiler

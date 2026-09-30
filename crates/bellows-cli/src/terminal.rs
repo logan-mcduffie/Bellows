@@ -102,6 +102,7 @@ impl Output {
                     | "wait"
                     | "single_flight"
                     | "corrupt"
+                    | "not_stored"
             ),
             Self::Summary => matches!(kind, "fallback" | "corrupt"),
             Self::Quiet => false,
@@ -134,6 +135,7 @@ fn event_label(kind: &str) -> (&'static str, &'static str) {
         "single_flight" => ("SHARED HIT", GREEN),
         "corrupt" | "candidate_rejected" => ("REJECTED", RED),
         "store" => ("STORED", BLUE),
+        "not_stored" => ("KEPT LOCAL", CYAN),
         "running" => ("RUNNING", CYAN),
         "published" => ("PUBLISHED", GREEN),
         "restored" => ("RESTORED", GREEN),

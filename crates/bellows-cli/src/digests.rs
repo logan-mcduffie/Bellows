@@ -59,6 +59,24 @@ impl Digests {
         }
         Ok(digest)
     }
+
+    /// Record the digest of a large file Bellows itself just wrote from bytes
+    /// it verified, so downstream link validation in a fresh checkout does
+    /// not rehash every restored rlib. The memo is keyed on the identity
+    /// observed after the write; any later rewrite changes it.
+    pub fn remember(&self, path: &Path, digest: &str) {
+        let Some(root) = &self.root else {
+            return;
+        };
+        let Ok(metadata) = fs::metadata(path) else {
+            return;
+        };
+        if metadata.len() < SMALL || validate_content_key(digest).is_err() {
+            return;
+        }
+        let key = identity(path, &metadata);
+        let _ = atomic_write(&root.join(&key[..2]).join(&key), digest.as_bytes());
+    }
 }
 
 fn changed(metadata: &fs::Metadata) -> SystemTime {
@@ -167,5 +185,21 @@ mod tests {
             .unwrap();
         fs::rename(&replacement, &file).unwrap();
         assert_eq!(digests.file(&file).unwrap(), digest_bytes(&second));
+    }
+
+    #[test]
+    fn remembered_digests_apply_only_to_the_written_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let digests = Digests::new(temp.path());
+        let file = temp.path().join("restored.rlib");
+        let bytes = vec![7u8; SMALL as usize + 1];
+        fs::write(&file, &bytes).unwrap();
+        digests.remember(&file, &digest_bytes(&bytes));
+        assert_eq!(digests.file(&file).unwrap(), digest_bytes(&bytes));
+        let other = vec![8u8; SMALL as usize + 1];
+        let replacement = temp.path().join("replacement");
+        fs::write(&replacement, &other).unwrap();
+        fs::rename(&replacement, &file).unwrap();
+        assert_eq!(digests.file(&file).unwrap(), digest_bytes(&other));
     }
 }

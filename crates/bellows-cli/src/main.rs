@@ -1754,10 +1754,7 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
     let normalizer = normalizer(&workspace, &invocation.out_dir);
     let root_normalizer = PathNormalizer::new(root_bases(&workspace, &invocation.out_dir));
     let digests = digests::Digests::new(&state_dir(&workspace));
-    let compiler = Command::new(&invocation.rustc).arg("-vV").output()?;
-    if !compiler.status.success() {
-        bail!("rustc -vV failed")
-    }
+    let compiler = compiler_identity(&invocation.rustc, &state_dir(&workspace))?;
     let normalized_args = normalized_compiler_arguments(invocation, &normalizer);
     let mut components = diagnostics::argument_components(&normalized_args, str::to_owned);
     components.insert(
@@ -1918,6 +1915,50 @@ fn user_cache_root() -> Option<PathBuf> {
         return Some(PathBuf::from(root).join("Bellows"));
     }
     env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache/bellows"))
+}
+
+struct CompilerIdentity {
+    stdout: Vec<u8>,
+}
+
+/// `rustc -vV` output, memoized per concrete compiler binary. A rustup proxy
+/// resolves its toolchain from overrides and environment on every call, so
+/// only binaries that are not proxies are memoized.
+fn compiler_identity(rustc: &Path, state: &Path) -> Result<CompilerIdentity> {
+    let proxy = rustc.parent().is_none_or(|dir| {
+        dir.join(format!("rustup{}", env::consts::EXE_SUFFIX))
+            .exists()
+    });
+    let memo = (!proxy && rustc.is_absolute())
+        .then(|| fs::metadata(rustc).ok())
+        .flatten()
+        .map(|metadata| {
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |time| time.as_nanos());
+            let key = digest_bytes(
+                format!("{}\0{}\0{modified}", rustc.display(), metadata.len()).as_bytes(),
+            );
+            state.join("compilers-v1").join(key)
+        });
+    if let Some(memo) = &memo
+        && let Ok(stdout) = fs::read(memo)
+        && !stdout.is_empty()
+    {
+        return Ok(CompilerIdentity { stdout });
+    }
+    let output = Command::new(rustc).arg("-vV").output()?;
+    if !output.status.success() {
+        bail!("rustc -vV failed")
+    }
+    if let Some(memo) = memo {
+        let _ = atomic_write(&memo, &output.stdout);
+    }
+    Ok(CompilerIdentity {
+        stdout: output.stdout,
+    })
 }
 
 /// Files a library compile bundles for `-l static=NAME`: every candidate in
@@ -2321,6 +2362,9 @@ fn restore_with(
         let destination = invocation.out_dir.join(&artifact.file_name);
         install_output(&destination, &bytes)?;
         set_file_executable(&destination, artifact.executable)?;
+        if !artifact.file_name.ends_with(".d") {
+            identity.digests.remember(&destination, &artifact.digest);
+        }
     }
     let stdout = transform_compiler_stream(&stdout_blob, &identity.normalizer, true);
     let stderr = transform_compiler_stream(&stderr_blob, &identity.normalizer, true);
@@ -2697,6 +2741,9 @@ fn capture_outputs(
             raw
         };
         let digest = digest_bytes(&stored);
+        if !name.ends_with(".d") {
+            identity.digests.remember(&path, &digest);
+        }
         let executable = is_executable(&path)?;
         blobs.insert(digest.clone(), stored);
         artifacts.push(Artifact {

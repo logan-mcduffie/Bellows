@@ -44,7 +44,8 @@ The namespace map remains unchanged:
 | Pinned-nightly threaded WASM | `threaded` |
 
 The action retains `CARGO_INCREMENTAL=0` and target-root separation. Manifold's
-workflow owns any project-specific profile overrides.
+workflow owns any project-specific profile overrides. Local `bellows run`
+leaves Cargo's incremental setting alone.
 
 ## Expected first-phase result
 
@@ -54,9 +55,12 @@ workflow owns any project-specific profile overrides.
   Bellows leases instead of compiling the same library independently.
 - Stable and pinned-nightly, native and WASM, features, flags, and target triples
   remain distinct because their actual rustc invocations differ.
-- Final test binaries and links still execute locally in this MVP.
-- Crates loading procedural macros bypass until their arbitrary expansion inputs
-  can be sandboxed or declared.
+- Test harnesses, final links and build-script runs are restored when every
+  input matches. Tests that bake `env!("CARGO_MANIFEST_DIR")` (golden images,
+  fixtures) are pinned to their checkout; reading the variable at run time
+  makes them shareable across worktrees.
+- Crates loading procedural macros are cached. The macro artifacts' digests
+  and their tracked expansion inputs are part of the key.
 - GPU and browser pixel gates still execute on the RTX 5080; only eligible
   compiler products are restored there.
 
@@ -76,9 +80,11 @@ canonical lanes:
   selected manifest, reachable crates, toolchain files, WIT, and deterministic
   output paths are declared. The action sandbox has no ambient Cargo
   credentials and requires locked/offline or vendored dependencies.
-- Final link or nested component-build experiments can use the same declared
-  action boundary while the transparent rustc wrapper continues to bypass
-  unsafe link/proc-macro actions.
+- `flagship-game-bundle`'s nested WASM build is restored as a build-script run;
+  its nested Cargo target directory is scratch and is not stored.
+- The self-hosted GPU job runs its own `bellowsd`. It can consume the
+  developer service on the same machine with `BELLOWS_READ_ONLY=1`, so results
+  from pull-request code are never published into it.
 - A trusted canary worker may enable `bellowsd --enable-execution --auth-token
   ...`; the server rejects clients whose exact rustc/Cargo/host identity differs
   and single-flights identical requests. This demonstrator is not suitable for

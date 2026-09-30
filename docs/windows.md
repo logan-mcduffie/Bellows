@@ -31,7 +31,8 @@ bellows stats --local --latest
 ```
 
 Start with local caching. It needs no network access. Cargo's existing incremental
-development builds continue working, and Bellows bypasses them just as on Linux.
+development builds continue working, with the same incremental policy as on
+Linux: lookups hit, and only from-scratch results are published.
 Do not delete your normal target directory to chase hits: Cargo's no-op is faster.
 
 A shared cache is optional: it lets compatible teammates reuse compiler artifacts.
@@ -97,9 +98,12 @@ compiler, flags, feature set, and source revision. Keep exact-diagnostic contrac
 lanes wrapper-free as required by Manifold. Compare test outcomes and runtime
 behavior, not only cache-hit totals.
 
-For dev-profile cache testing, set `CARGO_INCREMENTAL=0` in the test shell;
-incremental invocations intentionally bypass Bellows. Final executables and
-procedural macro consumers also bypass where their inputs are not modeled.
+Final executables are restored with their `.pdb` and, for DLLs, `.dll.lib` and
+`.dll.exp`. An executable that is still running (a test binary, for example)
+is renamed aside before replacement, because Windows refuses to overwrite a
+mapped image. Program databases record the linker's own working directory,
+command line and module paths; those records are linker bookkeeping and do not
+pin a result, but any other checkout path in a `.pdb` does.
 Run `bellows.exe explain --local --latest --json` from the workspace to inspect
 miss reasons. Prefer a local NTFS cache; this pass does not qualify SMB locking
 or antivirus-specific behavior on your machine.

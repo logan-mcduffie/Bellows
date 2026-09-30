@@ -17,6 +17,17 @@ the same bytes differently.
 Backward compatibility can be added later through explicit decoders and
 migration tests. It must never be inferred from similar JSON shapes.
 
+## Protocol 6
+
+Protocol 6 adds linked outputs, build-script runs, checkout pins, normalized
+path-valued environment inputs, host inputs, and the `$CHECKOUT` and
+`$PROFILE` roots to compiler records. Static keys now include the output kind
+and exclude the incremental session directory. Local mode uses `store-v6` and
+runner-local L1 uses `l1-v6`; `store-v5`/`l1-v5` are left untouched and are not
+read. A `bellowsd` data directory used by protocol 5 must not be reused:
+start protocol 6 servers with a fresh directory and update CI's immutable
+Bellows pin together. The first build in the new namespace is cold.
+
 ## Version 0.2.1 / protocol 5
 
 Protocol 4 invalidated compiler records captured with path-normalized macro

@@ -39,18 +39,30 @@ omit `--latest` to inspect those, or wrap the Cargo command with `bellows run`.
 
 ```text
 This workspace
-  reused             1218
-  rebuilt             206  not cached yet 90 · environment differs 100 · evicted or never saved 16
-  not cacheable       856  by design: linked outputs 249 · proc macros 246 · unmodeled outputs 174
+  reused             1386  libraries 940 · linked outputs 344 · build-script runs 102
+  rebuilt              40  environment differs 40
+  not cacheable         3  by design: compiler probes 3
   problems              0  none
-  stored              206
+  stored               40  pinned to checkout 40
+  not stored            2  compiled, kept local: incremental session reuse 2
 ```
 
-*Rebuilt* work was compiled because no usable entry existed; its causes use the
-reason codes below. *Not cacheable* work is outside the transparent cache's
-correctness boundary by design (see bypasses below) and never indicates a
-fault. *Problems* are fallbacks and corrupt entries, the only decisions that
-call for action. Examples follow for rebuilt work and problems.
+*Reused* work is grouped by what was restored: rlib/rmeta libraries, linked
+outputs (executables, test harnesses, `cdylib`/`dylib`, procedural-macro
+crates and build-script executables), and build-script runs. *Rebuilt* work
+was compiled because no usable entry existed; its causes use the reason codes
+below. *Not cacheable* work is outside the transparent cache's correctness
+boundary by design (see bypasses below) and never indicates a fault.
+*Problems* are fallbacks and corrupt entries, the only decisions that call
+for action. *Stored* results are either **shareable** across checkouts or
+**pinned to checkout**, because their bytes embed the workspace, target, or
+session checkout path (for example a test that bakes
+`env!("CARGO_MANIFEST_DIR")`). A pinned result is reused only at the same
+path. *Not stored* work compiled normally but was deliberately kept local:
+an incremental compile that reused a session, a build script that ran over an
+existing `OUT_DIR`, a library that bundles a native archive from a `#[link]`
+attribute, or an output Bellows cannot represent (a directory, or too many
+files). Examples follow for rebuilt work, problems, and not-stored work.
 
 `BELLOWS_OUTPUT` controls the live stream: `events` (default) prints one line per
 decision, `summary` prints only problems plus each wrapped build's closing line,
@@ -74,7 +86,7 @@ identity`; both forms map to the same reason codes.
 |---|---|
 | `input_changed` | Names the dependency or explicit compiler input whose digest changed. |
 | `input_missing` | Names a previously recorded input that can no longer be read. |
-| `environment_changed` | Names the changed environment variable; literal rustc-reported `env!` values are validated, including embedded absolute paths. |
+| `environment_changed` | Names the changed environment variable. A path-valued `env!` dependency compares normalized (`$TARGET/…`) only when no output embeds the path; otherwise literally. `@bellows:root:$WORKSPACE`, `$TARGET` or `$CHECKOUT` means the cached output embeds another checkout's path. |
 | `compiler_changed` | The exact compiler version identity changed. |
 | `identity_changed` | Lists protocol or argument-group differences with old/new hash prefixes. |
 | `cold_identity` | No earlier diagnostic identity exists for this crate/source locally. Bellows cannot attribute the miss to a particular edit yet. |
@@ -105,9 +117,25 @@ are not logged again on every wait poll. A `wait_timeout` fallback identifies
 an owner that did not supply a usable result or release its lease within the
 configured wait budget.
 
-Bypasses are distinct from misses. Reasons include `incremental`, `proc_macro`,
-`native_inputs`, `linked_output`, `compiler_probe`, and `unsupported_outputs`.
+Bypasses are distinct from misses. Reasons include `native_inputs` (`-L all=`,
+`crate=` or bare `-L` search paths, which can supply crates, and unknown `-l`
+kinds), `linked_output` (`staticlib`), `unstable_flags` (`-Z` flags other than
+`unstable-options`, `force-unstable-if-unmarked`, `share-generics`, `threads`,
+`macro-backtrace`), `compiler_probe`, and `unsupported_outputs`. Earlier logs
+may also contain `incremental` and `proc_macro`, which are no longer bypasses.
 They describe work outside the transparent cache's correctness boundary.
+
+Hit details name the output kind and, for crates that load them directly, the
+procedural macros used: `restored runner-local compiler result (library
+output; proc macros: serde_derive, thiserror_impl)`. Build-script decisions
+appear under the crate name `build-script:<package>`.
+
+| Not stored | Meaning |
+|---|---|
+| `incremental_session` | The compile reused an incremental session, so it stays in this checkout. |
+| `native_inputs` | The rlib bundles native members that no `-l static` library supplied. |
+| `unsupported_outputs` | rustc produced a directory output (split debuginfo), or a build script ran over an existing `OUT_DIR` or produced a symlink. |
+| `too_many_outputs` | The output set exceeds the candidate limits. |
 `symlink_input` identifies a compiler input whose resolution is not yet modeled;
 if discovered in dep-info after compilation, capture is skipped safely.
 

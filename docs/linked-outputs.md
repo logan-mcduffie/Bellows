@@ -117,10 +117,10 @@ key.
 - **Hit:** outputs are restored. rustc's incremental session is untouched and
   remains self-consistent.
 - **Miss:** rustc runs *with* incremental. The result is published only when no
-  session for that crate name existed before the compile, meaning a
-  from-scratch compile with no prior state. Edit-loop recompiles that reuse a
-  session are never published, so incremental state from one checkout cannot
-  reach another.
+  session existed before the compile, meaning a from-scratch compile with no
+  prior state. Edit-loop recompiles that reuse a session are never published,
+  so incremental state from one checkout cannot reach another. (Implemented
+  with a per-unit session directory; see below.)
 
 ## Proc-macro consumers (owner decision, 2026-09-30)
 
@@ -148,3 +148,54 @@ Anything the model cannot describe stays a visible bypass or capture fallback:
 an unresolvable `-l`, a directory output, a response file, `-L all=`, profile
 or plugin inputs, `save-temps`, a custom sysroot or target JSON, or
 `target-cpu=native`.
+
+## Changes made during implementation
+
+Measurements on Manifold and the Windows desktop changed several details.
+Each one keeps the guarantees above.
+
+- **Per-unit incremental directories.** A crate's lib, test harness and
+  binaries share Cargo's incremental directory and the `{crate}-` prefix, so a
+  "session exists" check wrongly withheld 219 results in a fresh Manifold
+  worktree. Each unit now gets `{crate}-bellows{extra}` beneath Cargo's
+  directory, which makes "from scratch" exact and race-free.
+- **Pin only the root that leaked.** For registry crates the "workspace" is the
+  registry package directory, identical in every worktree. Pinning the
+  target directory alongside it forced needless per-worktree rebuilds, for
+  example `zstd-sys`.
+- **`$CHECKOUT` root.** `flagship-game-bundle`'s nested Cargo build runs rustc
+  from a subdirectory while inheriting the outer `OUT_DIR` and library paths.
+  The directory where `bellows run/local` started is normalized, remapped,
+  scanned and pinned like the other roots.
+- **`$PROFILE` root.** `release` and Manifold's `test-fast` (which inherits it)
+  give dependencies byte-identical rustc arguments; only
+  `<target>/<profile>` differs. That directory is normalized and remapped to
+  `/bellows/profile`, so both profiles share results.
+- **Stable empty directories for procedural macros.** wit-bindgen's macro bakes
+  its build script's (empty) `OUT_DIR` through `env!("DEBUG_OUTPUT_DIR")`. Its
+  crate hash then differed per worktree and cascaded into every consumer.
+  While compiling a proc-macro crate, a non-Cargo variable naming an empty
+  directory inside the target directory is given a machine-wide empty
+  directory instead. That is observably equivalent at compile time, the only
+  time a macro runs.
+- **Windows.** The canonical workspace is a verbatim `\\?\C:\…` path that never
+  prefixed rustc's paths, so the protocol-5 workspace remap silently did
+  nothing on Windows. Every spelling of each root is now remapped. Linker
+  bookkeeping in `.pdb`, `.exp` and import `.lib` files (working directory,
+  command line, module and output paths) does not pin a result; any other
+  checkout path there does. Cargo omits `-C extra-filename` for MSVC
+  executables and for `cdylib`/`dylib` packages, whose unhashed names are
+  accepted.
+- **Build-script runs** use the same candidate machinery through a launcher
+  (see [local builds](local-builds.md#build-script-runs)). Nested Cargo target
+  directories, marked by `CACHEDIR.TAG`, are excluded from stored `OUT_DIR`
+  trees.
+- **Descriptive `-Z` flags.** `-Zbuild-std` passes `-Zunstable-options` to every
+  crate. That flag and a few others that only change what the arguments
+  already describe are kept in the key instead of bypassing.
+- **`BELLOWS_READ_ONLY=1`** restores verified results without publishing, for
+  CI jobs that share a developer's service.
+- **Memoized digests.** Files Bellows writes are recorded in the digest memo
+  under their post-write identity, so link validation in a fresh worktree does
+  not rehash every restored rlib. `rustc -vV` is memoized per concrete compiler
+  binary, never for a rustup proxy.

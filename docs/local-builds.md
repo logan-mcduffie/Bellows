@@ -22,17 +22,55 @@ Nested Cargo commands inherit the wrapper and local-only environment.
 Bellows complements Cargo rather than replacing its local fingerprints:
 
 - Cargo skips artifacts already present in the selected `target/`.
-- Bellows restores eligible rlibs, metadata, and dep-info when Cargo invokes
-  rustc after a clean, branch switch, worktree change, or target-dir change.
+- Bellows restores rlibs, metadata, and dep-info when Cargo invokes rustc after
+  a clean, branch switch, worktree change, or target-dir change. That includes
+  crates that load procedural macros, crates that receive Cargo's propagated
+  `-L native=` search paths, and crates built with `-C linker=`.
+- Final links are restored too: binaries, `--test` harnesses, examples,
+  `cdylib`/`dylib`, procedural-macro crates, and build-script executables. Their
+  identity includes every file the linker reads (see
+  [linked outputs](linked-outputs.md)).
+- Build-script runs are restored: their `OUT_DIR` tree and Cargo directives.
+- Profiles that pass rustc identical arguments share results, for example
+  `release` and a `test-fast` profile that inherits it.
 - Exact declared actions restore complete output trees.
-- Final binaries, procedural-macro consumers, native/external codegen inputs,
-  and incremental rustc sessions remain conservative bypasses.
 
-Consequently, changing `flagship` itself still requires its final compile and
-link. The largest gains come from recovering its unchanged dependency graph and
-the eligible libraries compiled by `flagship-game-bundle`'s nested release
-WASM build. That build script retains `RUSTC_WRAPPER`, so no Manifold-specific
-integration is required.
+A result is shared between worktrees unless its bytes embed a checkout path.
+For example, a test that bakes `env!("CARGO_MANIFEST_DIR")` to find fixtures is
+restored only in the checkout that produced it. `bellows stats` reports stored
+results as *shareable* or *pinned to checkout*. Reading `CARGO_MANIFEST_DIR`
+at run time (Cargo and nextest set it for test processes) makes such a test
+shareable.
+
+## Incremental edit loops
+
+`bellows run` no longer forces `CARGO_INCREMENTAL=0`. An incremental rustc
+invocation is looked up with its session directory removed from the key, so a
+fresh worktree restores workspace members like any other crate. On a miss rustc
+compiles with incremental enabled, in a per-unit session directory beneath
+Cargo's own (`{crate}-bellows{extra}`, still removed by `cargo clean -p`).
+Only a compile that started without a session is published. Edit-loop
+recompiles that reuse a session stay in their checkout.
+
+## Build-script runs
+
+After a build script is compiled or restored, a Bellows launcher takes its
+place and Cargo runs that instead. The launcher restores a verified earlier
+run, or runs the real script and records it. Identity follows Cargo's rerun
+model: the script binary, `$RUSTC -vV`, the resolved C/C++ drivers, the
+relevant environment, and the declared `rerun-if-changed` paths (the whole
+package when none are declared) and `rerun-if-env-changed` values. Nested
+Cargo target directories inside `OUT_DIR` (marked by `CACHEDIR.TAG`) are
+scratch and are not stored. Only runs that began with an empty `OUT_DIR` are
+published. Other host tools a script invokes are a trusted boundary, as for
+declared actions. Set `BELLOWS_BUILD_SCRIPTS=0` to run scripts directly.
+Without a Bellows session, the launcher simply runs the real script.
+
+## Sharing a service with CI
+
+`BELLOWS_READ_ONLY=1` restores verified results but never publishes. A CI job
+on a developer's machine can consume the local service this way without
+writing results produced by pull-request code into it.
 
 ## Storage
 
@@ -52,8 +90,9 @@ bellows gc --local --max-mb 20000
 bellows explain --local --latest --summary
 ```
 
-Version 0.2.1 stores cache objects in `store-v5` below this state directory, leaving
-older caches intact. Each wrapped build has an ID; `--latest`, `--session ID`,
+This version stores cache objects in `store-v6` below this state directory,
+leaving older caches intact. Large file digests are memoized by file identity
+in `digests-v1`, and entries unused for 14 days are pruned. Each wrapped build has an ID; `--latest`, `--session ID`,
 and `--crate NAME` select relevant diagnostics. Logs rotate at 16 MiB with two
 backups. See [diagnosing builds](diagnostics.md) for precise miss reasons and JSON.
 

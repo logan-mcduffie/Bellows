@@ -229,6 +229,8 @@ pub fn reason_code(kind: &str, detail: &str) -> &'static str {
         "remote_unavailable"
     } else if detail.contains("symlinked compiler input") {
         "symlink_input"
+    } else if detail.contains("unstable compiler flag") {
+        "unstable_flags"
     } else if detail.contains("host-native CPU") {
         "host_cpu"
     } else if detail.contains("custom sysroot") || detail.contains("custom target specification") {

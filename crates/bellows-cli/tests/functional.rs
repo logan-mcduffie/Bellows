@@ -1421,3 +1421,33 @@ fn profiles_with_identical_compiler_arguments_share_results() {
     ))));
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
 }
+
+#[test]
+fn read_only_clients_restore_but_never_publish() {
+    let f = Fixture::new(
+        "pub fn value() -> u32 { 42 }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    let read_only = || {
+        checked(
+            f.local()
+                .args(["cargo", "build", "--release", "--offline"])
+                .env("BELLOWS_READ_ONLY", "1"),
+        )
+    };
+    read_only();
+    assert!(!events(&f).iter().any(|e| e.kind == "store"));
+    f.clean();
+    let still_cold = read_only();
+    assert!(
+        !stderr(&still_cold).contains("HIT"),
+        "{}",
+        stderr(&still_cold)
+    );
+    f.clean();
+    f.build();
+    f.clean();
+    let restored = read_only();
+    assert_eq!(decisions(&restored, "fixture"), ["LOCAL HIT", "LOCAL HIT"]);
+    assert_eq!(f.value("target"), "42");
+}

@@ -854,8 +854,8 @@ impl Invocation {
         {
             return Err("compiler temporary outputs are not modeled".into());
         }
-        if args.iter().any(|arg| arg == "-Z" || arg.starts_with("-Z")) {
-            return Err("unstable compiler flags are not modeled".into());
+        if let Some(flag) = unmodeled_unstable_flag(&args) {
+            return Err(format!("unstable compiler flag -Z {flag} is not modeled"));
         }
         let crate_name = option_value(&args, "--crate-name").ok_or("missing --crate-name")?;
         let test_harness = args.iter().any(|arg| arg == "--test");
@@ -1053,6 +1053,31 @@ fn native_inputs(
         }
     }
     Ok((search, libraries))
+}
+
+/// Unstable flags whose effect is fully described by the arguments (kept in
+/// the key) and whose inputs arrive through dep-info. `-Zbuild-std` passes
+/// the first two to every crate; the rust-src sources are tracked files and
+/// the nightly compiler is part of the identity. Anything else that could
+/// write extra files or read untracked inputs stays unmodeled.
+const MODELED_UNSTABLE_FLAGS: &[&str] = &[
+    "unstable-options",
+    "force-unstable-if-unmarked",
+    "share-generics",
+    "threads",
+    "macro-backtrace",
+];
+
+fn unmodeled_unstable_flag(args: &[String]) -> Option<String> {
+    args.iter().enumerate().find_map(|(index, arg)| {
+        let value = if arg == "-Z" {
+            args.get(index + 1).map(String::as_str).unwrap_or_default()
+        } else {
+            arg.strip_prefix("-Z")?
+        };
+        let name = value.split('=').next().unwrap_or(value);
+        (!MODELED_UNSTABLE_FLAGS.contains(&name)).then(|| name.to_owned())
+    })
 }
 
 /// Codegen inputs that remain outside the model for any output kind.
@@ -1478,6 +1503,9 @@ fn cache_or_compile(raw: &[OsString]) -> Result<ExitStatus> {
         }
         return Ok(status);
     }
+    // A read-only client (for example CI jobs sharing a developer's local
+    // service) restores verified results but never publishes its own.
+    let captured = captured.filter(|_| env::var("BELLOWS_READ_ONLY").as_deref() != Ok("1"));
     if let Some(captured) = captured {
         let scope = if captured.pinned {
             format!(
@@ -1988,6 +2016,7 @@ fn is_relevant_environment_name(name: &str) -> bool {
     ];
     const BELLOWS_CONTROL: &[&str] = &[
         "BELLOWS_AUTH_TOKEN",
+        "BELLOWS_READ_ONLY",
         "BELLOWS_DEMO_COMPILE_DELAY_MS",
         "BELLOWS_EVENT_LOG",
         "BELLOWS_LOCAL_ONLY",
@@ -4651,6 +4680,44 @@ mod tests {
             "-C".into(),
             "link-arg=-fuse-ld=lld".into()
         ]));
+    }
+
+    #[test]
+    fn only_descriptive_unstable_flags_are_modeled() {
+        let args = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            unmodeled_unstable_flag(&args(&[
+                "-Zunstable-options",
+                "-Z",
+                "force-unstable-if-unmarked",
+                "-Zthreads=8"
+            ])),
+            None
+        );
+        assert_eq!(
+            unmodeled_unstable_flag(&args(&["-Z", "self-profile"])).as_deref(),
+            Some("self-profile")
+        );
+        assert_eq!(
+            unmodeled_unstable_flag(&args(&["-Zdump-mir=all"])).as_deref(),
+            Some("dump-mir")
+        );
+        let temp = tempfile::tempdir().unwrap();
+        let std = temp.path().join("libstd-abc.rlib");
+        fs::write(&std, b"rlib").unwrap();
+        let external = format!("noprelude:std={}", std.display());
+        let invocation = analyze_with(
+            temp.path(),
+            &[
+                "--crate-type=rlib",
+                "--emit=dep-info,metadata,link",
+                "-Zunstable-options",
+                "--extern",
+                &external,
+            ],
+        )
+        .unwrap();
+        assert!(invocation.explicit_inputs.contains(&std));
     }
 
     #[test]

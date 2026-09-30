@@ -154,6 +154,11 @@ or plugin inputs, `save-temps`, a custom sysroot or target JSON, or
 Measurements on Manifold and the Windows desktop changed several details.
 Each one keeps the guarantees above.
 
+- **Linker identity by content, after linking.** Instead of a `--version`
+  banner computed before every compile, the programs the link command
+  actually uses are verified inputs: the driver, GCC's `collect2`, and the
+  `ld`/`lld`/`mold` selected by `-fuse-ld=` and `-B` (or the driver's default),
+  plus `link.exe` on MSVC. The static key keeps the arguments and `PATH`.
 - **Per-unit incremental directories.** A crate's lib, test harness and
   binaries share Cargo's incremental directory and the `{crate}-` prefix, so a
   "session exists" check wrongly withheld 219 results in a fresh Manifold

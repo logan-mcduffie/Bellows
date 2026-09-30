@@ -235,7 +235,9 @@ fn cached_run(
     let detail = reasons
         .first()
         .map(|reason| format!("build-script run: {reason}"))
-        .unwrap_or_else(|| "build-script run: not cached yet".into());
+        .unwrap_or_else(|| {
+            "not cached yet: first build of this crate seen here (build-script run)".into()
+        });
     record_event(
         "miss",
         crate_name,

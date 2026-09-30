@@ -3083,13 +3083,53 @@ fn remap_plan(identity: &Identity) -> Vec<(Vec<String>, String)> {
 /// as trybuild) reads exactly as without Bellows. Stored streams are then
 /// normalized from the real paths and localized again on every replay.
 fn virtual_roots(identity: &Identity) -> Vec<(String, String)> {
+    // Rewrite to the spelling rustc saw, which is Cargo's, not the canonical
+    // one: Windows temp directories, for example, are often reached through
+    // an 8.3 name (`RUNNER~1`). rustc's working directory is exactly the
+    // wrapper's, and the checkout is the matching ancestor of it.
+    let cwd = env::current_dir().ok();
+    let checkout_display = identity
+        .root_normalizer
+        .spellings("$CHECKOUT")
+        .iter()
+        .find_map(|spelling| {
+            let root = Path::new(spelling).canonicalize().ok()?;
+            let depth = identity
+                .workspace
+                .strip_prefix(&root)
+                .ok()?
+                .components()
+                .count();
+            cwd.as_ref()?.ancestors().nth(depth).map(Path::to_path_buf)
+        });
+    let as_given = |spellings: &[String]| {
+        spellings
+            .iter()
+            .find(|spelling| {
+                Path::new(spelling)
+                    .canonicalize()
+                    .is_ok_and(|canonical| canonical != Path::new(spelling))
+            })
+            .or_else(|| spellings.first())
+            .cloned()
+    };
+    let workspace = identity.root_normalizer.spellings("$WORKSPACE");
     let mut roots = remap_plan(identity)
         .into_iter()
         .filter_map(|(spellings, virtual_root)| {
-            spellings
-                .into_iter()
-                .find(|spelling| !(cfg!(windows) && spelling.contains('/')))
-                .map(|real| (virtual_root, real))
+            let display = if spellings.iter().any(|s| workspace.contains(s))
+                && virtual_root != "/bellows/checkout"
+                && let Some(cwd) = &cwd
+            {
+                Some(cwd.to_string_lossy().into_owned())
+            } else if virtual_root == "/bellows/checkout"
+                && let Some(checkout) = &checkout_display
+            {
+                Some(checkout.to_string_lossy().into_owned())
+            } else {
+                as_given(&spellings)
+            };
+            display.map(|real| (virtual_root, real))
         })
         .collect::<Vec<_>>();
     // Longest virtual prefix first: `/bellows/checkout/crates/x` before

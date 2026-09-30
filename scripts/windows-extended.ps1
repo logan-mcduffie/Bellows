@@ -116,7 +116,8 @@ try{
       $combined='';foreach($client in $clients){$combined+=EndClient $client;Assert ((Call "$report/$($client.name)/release/forge-cli$suffix" @()) -match '42') 'Concurrent remote output wrong'}
       Assert ($combined -match 'SHARED HIT') 'No shared single-flight hit'
       $events=Get-Content "$env:BELLOWS_STATE_DIR/events.jsonl" | ForEach-Object {$_ | ConvertFrom-Json}
-      Assert (@($events | Where-Object {$_.kind -eq 'store' -and $_.crate_name -eq 'forge_core'}).Count -eq 1) 'Identical library published more than once'
+      # Local-only builds above also record stores; count remote publications.
+      Assert (@($events | Where-Object {$_.kind -eq 'store' -and $_.crate_name -eq 'forge_core' -and $_.detail -like 'published*'}).Count -eq 1) 'Identical library published more than once'
     }finally{$env:BELLOWS_DEMO_COMPILE_DELAY_MS=$null;$env:BELLOWS_L1='1'}
   }
   Case 'source-dependency-and-branch-return' {

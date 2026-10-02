@@ -36,9 +36,8 @@ only when `lease status` shows no holders: a restart ends every lease.
 lost before the command ran.
 
 `--advisory` (or `LEASE_ADVISORY=1`) never waits: on a busy machine, or with
-the daemon down, the
-command runs anyway, unleased, and an abandoned request stays in the log. It
-exists for a trial rollout next to manual scheduling.
+the daemon down, the command runs anyway, unleased, and an abandoned request
+stays in the log. It exists for a trial rollout next to manual scheduling.
 
 ## Sessions
 

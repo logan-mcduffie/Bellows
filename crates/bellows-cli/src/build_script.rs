@@ -385,6 +385,7 @@ fn identity(real: &Path, args: &[OsString], out_dir: &Path, crate_name: &str) ->
             pins.push((format!("{PIN_PREFIX}{token}"), root.clone()));
         }
     }
+    let checkout = super::checkout_root(&workspace);
     Ok(Identity {
         static_key: static_key.clone(),
         normalizer,
@@ -398,6 +399,7 @@ fn identity(real: &Path, args: &[OsString], out_dir: &Path, crate_name: &str) ->
         digests,
         pins,
         virtual_env: BTreeMap::new(),
+        checkout,
     })
 }
 
@@ -579,8 +581,16 @@ fn capture(
     let mut host_files = Vec::new();
     for path in paths {
         let absolute = path.canonicalize().unwrap_or(path);
-        let digest = identity.digests.file(&absolute)?;
         let normalized = identity.normalizer.normalize(&absolute.to_string_lossy());
+        if super::outside_checkout_roots(&normalized)
+            && super::foreign_checkout(&absolute, identity.checkout.as_deref())
+        {
+            return Err(anyhow::Error::new(NotStored(format!(
+                "reads {} from another checkout",
+                absolute.display()
+            ))));
+        }
+        let digest = identity.digests.file(&absolute)?;
         if bellows_core::validate_normalized_input_path(&normalized).is_ok() {
             files.push(FileInput {
                 path: normalized,

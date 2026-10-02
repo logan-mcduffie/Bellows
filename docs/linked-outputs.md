@@ -215,6 +215,16 @@ Each one keeps the guarantees above.
 - **Build-script mtimes.** A launcher keeps the real script's mtime; Cargo
   otherwise treats the script as older than its build-dependencies and
   rebuilds everything downstream.
+- **Checkout root from the source tree (0.3.1).** The checkout root was the
+  directory `bellows run` was launched from. A session launched in a crate
+  subdirectory therefore cached a build-script output carrying absolute paths
+  into its checkout (manifold-mod-macros' WIT table) without a pin, with
+  inputs recorded at that checkout's absolute paths. Another worktree then
+  validated those inputs against the first worktree's unchanged files and
+  restored stale bindings. The checkout is now the git root (a worktree's
+  `.git` file or a clone's `.git` directory) containing rustc's working
+  directory. A cached input inside a *different* git checkout rejects the
+  record, and such inputs are never stored.
 - **Memoized digests.** Files Bellows writes are recorded in the digest memo
   under their post-write identity, so link validation in a fresh worktree does
   not rehash every restored rlib. `rustc -vV` is memoized per concrete compiler

@@ -85,6 +85,7 @@ identity`; both forms map to the same reason codes.
 | Reason | Evidence and next step |
 |---|---|
 | `input_changed` | Names the dependency or explicit compiler input whose digest changed. |
+| `input_changed` (another checkout) | `… belongs to another checkout`: the record read files in a different git worktree, so it never serves this one. |
 | `input_missing` | Names a previously recorded input that can no longer be read. |
 | `environment_changed` | Names the changed environment variable. A path-valued `env!` dependency compares normalized (`$TARGET/…`) only when no output embeds the path; otherwise literally. `@bellows:root:$WORKSPACE`, `$TARGET` or `$CHECKOUT` means the cached output embeds another checkout's path. |
 | `compiler_changed` | The exact compiler version identity changed. |

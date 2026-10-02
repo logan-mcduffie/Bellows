@@ -1743,3 +1743,64 @@ fn diagnostics_quote_restored_dependency_sources_like_plain_cargo() {
     );
     assert!(!log.contains("/bellows/"), "{log}");
 }
+
+#[test]
+fn sessions_launched_from_subdirectories_never_share_another_checkouts_inputs() {
+    // Like manifold-mod-macros: a build script bakes the absolute path of a
+    // sibling data tree (its WIT files), and the macro reads that path while
+    // expanding. A session launched from a crate subdirectory must still
+    // treat the whole git checkout as this checkout.
+    let mut f = Fixture::new(
+        "pub fn value() -> &'static str { macros::data!() }",
+        "fn main() { println!(\"{}\", fixture::value().trim()); }",
+    );
+    write_files(
+        &f.workspace,
+        &[
+            (".git/HEAD", "ref: refs/heads/main\n"),
+            (
+                "Cargo.toml",
+                "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[dependencies]\nmacros={path=\"macros\"}\n[workspace]\nmembers=[\"macros\"]\n",
+            ),
+            (
+                "macros/Cargo.toml",
+                "[package]\nname=\"macros\"\nversion=\"0.1.0\"\nedition=\"2024\"\nbuild=\"build.rs\"\n[lib]\nproc-macro=true\n",
+            ),
+            (
+                "macros/build.rs",
+                "fn main() {\n    let data = std::path::Path::new(\"../data\").canonicalize().unwrap().join(\"value.txt\");\n    println!(\"cargo:rerun-if-changed=../data\");\n    let out = std::env::var(\"OUT_DIR\").unwrap();\n    std::fs::write(format!(\"{out}/paths.rs\"), format!(\"const DATA: &str = {:?};\", data.display().to_string())).unwrap();\n}\n",
+            ),
+            (
+                "macros/src/lib.rs",
+                "use proc_macro::TokenStream;\ninclude!(concat!(env!(\"OUT_DIR\"), \"/paths.rs\"));\n#[proc_macro]\npub fn data(_: TokenStream) -> TokenStream { format!(\"include_str!({DATA:?})\").parse().unwrap() }\n",
+            ),
+            ("data/value.txt", "one"),
+            ("sub/README", "launch directory"),
+        ],
+    );
+    f.lock();
+    let build = |f: &Fixture| {
+        let mut command = f.local();
+        command
+            .args([
+                "cargo",
+                "build",
+                "--release",
+                "--offline",
+                "--manifest-path",
+            ])
+            .arg(f.workspace.join("Cargo.toml"))
+            .current_dir(f.workspace.join("sub"));
+        checked(&mut command)
+    };
+    build(&f);
+    assert_eq!(f.value("target"), "one");
+    second_checkout(&mut f, "second checkout");
+    fs::write(f.workspace.join("data/value.txt"), "two").unwrap();
+    build(&f);
+    assert_eq!(f.value("target"), "two");
+    // A changed input in this checkout invalidates every dependent result.
+    fs::write(f.workspace.join("data/value.txt"), "three").unwrap();
+    build(&f);
+    assert_eq!(f.value("target"), "three");
+}

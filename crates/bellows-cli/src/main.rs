@@ -1170,6 +1170,8 @@ struct Identity {
     pins: Vec<(String, String)>,
     /// Environment overrides given to rustc (see `stable_empty_directories`).
     virtual_env: BTreeMap<String, String>,
+    /// The canonical git checkout containing this compile, if any.
+    checkout: Option<PathBuf>,
 }
 
 impl Identity {
@@ -1658,14 +1660,17 @@ fn normalizer(workspace: &Path, out_dir: &Path) -> PathNormalizer {
 fn root_bases(workspace: &Path, out_dir: &Path) -> Vec<(String, PathBuf)> {
     let target = target_root(workspace, out_dir);
     let mut bases = vec![("$WORKSPACE".into(), workspace.to_path_buf())];
-    // The directory a `bellows run/local` session started in. A nested Cargo
-    // build (a build script compiling another workspace) runs rustc from a
-    // subdirectory but inherits paths such as OUT_DIR from the outer build.
-    if let Some(checkout) = env::var_os("BELLOWS_WORKSPACE").map(PathBuf::from)
-        && checkout.is_absolute()
+    // The source checkout containing this compile. Nested Cargo builds and
+    // path dependencies run rustc from a subdirectory while reading (and
+    // baking) paths elsewhere in the checkout. It is found from the source
+    // tree, never from where `bellows run` happened to be launched: a session
+    // started in a crate subdirectory must not shrink the checkout.
+    if let Some(checkout) = checkout_root(workspace)
         && checkout != workspace
     {
-        bases.push(("$CHECKOUT".into(), canonical_base(checkout.clone())));
+        if let Some(given) = given_spelling(workspace, &checkout) {
+            bases.push(("$CHECKOUT".into(), given));
+        }
         bases.push(("$CHECKOUT".into(), checkout));
     }
     // Cargo's manifest directory may retain an 8.3 spelling even when the
@@ -1696,6 +1701,73 @@ fn root_bases(workspace: &Path, out_dir: &Path) -> Vec<(String, PathBuf)> {
         bases.push(("$TARGET".into(), target));
     }
     bases
+}
+
+/// The git checkout containing `dir` (a worktree's `.git` file or a clone's
+/// `.git` directory); otherwise the session's launch directory when it
+/// contains `dir`. Sources under Cargo's or rustup's home are never part of
+/// a checkout.
+fn checkout_root(dir: &Path) -> Option<PathBuf> {
+    let dir = canonical_base(dir.to_path_buf());
+    let cargo_home = env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| bellows_core::user_home().map(|home| home.join(".cargo")));
+    if cargo_home
+        .into_iter()
+        .chain([rustup_home()])
+        .any(|managed| dir.starts_with(canonical_base(managed)))
+    {
+        return None;
+    }
+    git_root(&dir).or_else(|| {
+        env::var_os("BELLOWS_WORKSPACE")
+            .map(PathBuf::from)
+            .filter(|launch| launch.is_absolute())
+            .map(canonical_base)
+            .filter(|launch| dir.starts_with(launch))
+    })
+}
+
+fn git_root(dir: &Path) -> Option<PathBuf> {
+    dir.ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
+/// Cargo's spelling of `root`, an ancestor of the canonical `workspace`: the
+/// same number of levels above the process working directory.
+fn given_spelling(workspace: &Path, root: &Path) -> Option<PathBuf> {
+    let depth = workspace.strip_prefix(root).ok()?.components().count();
+    env::current_dir()
+        .ok()?
+        .ancestors()
+        .nth(depth)
+        .map(Path::to_path_buf)
+}
+
+/// An input inside a different git checkout than this compile's: its path
+/// names another worktree, so the same record must not serve this one.
+fn foreign_checkout(path: &Path, checkout: Option<&Path>) -> bool {
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    match git_root(resolved.parent().unwrap_or(&resolved)) {
+        Some(root) => checkout != Some(root.as_path()),
+        None => false,
+    }
+}
+
+/// Inputs that no per-checkout root covers (`$HOME/…` or absolute host
+/// paths); toolchain and Cargo-home sources are shared by every checkout.
+fn outside_checkout_roots(normalized: &str) -> bool {
+    ![
+        "$CHECKOUT",
+        "$WORKSPACE",
+        "$TARGET",
+        "$PROFILE",
+        "$CARGO_HOME",
+        "$RUSTUP_HOME",
+    ]
+    .iter()
+    .any(|root| normalized.starts_with(root))
 }
 
 /// `<target>[/<triple>]/<profile>` for Cargo's `deps`, `build/<unit>` and
@@ -1914,6 +1986,7 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
     }
     let virtual_env = stable_empty_directories(invocation, &root_normalizer);
     Ok(Identity {
+        checkout: checkout_root(&workspace),
         virtual_env,
         fingerprint: diagnostics::Fingerprint {
             key: static_key.clone(),
@@ -2200,6 +2273,14 @@ fn validate_candidate(
     for input in &candidate.files {
         let localized = identity.normalizer.localize(&input.path);
         let path = absolute_path(Path::new(&localized), &identity.workspace);
+        if outside_checkout_roots(&input.path)
+            && foreign_checkout(&path, identity.checkout.as_deref())
+        {
+            return Err(format!(
+                "input changed: {} belongs to another checkout",
+                input.path
+            ));
+        }
         let actual = identity
             .digests
             .file(&path)
@@ -2209,6 +2290,12 @@ fn validate_candidate(
         }
     }
     for input in &candidate.host_files {
+        if foreign_checkout(Path::new(&input.path), identity.checkout.as_deref()) {
+            return Err(format!(
+                "input changed: {} belongs to another checkout",
+                input.path
+            ));
+        }
         let actual = identity
             .digests
             .file(Path::new(&input.path))
@@ -2812,8 +2899,16 @@ fn capture_outputs(
     let mut files = Vec::new();
     let mut host_files = Vec::new();
     let mut record = |absolute: &Path, host: bool| -> Result<()> {
-        let digest = identity.digests.file(absolute)?;
         let normalized = identity.normalizer.normalize(&absolute.to_string_lossy());
+        if outside_checkout_roots(&normalized)
+            && foreign_checkout(absolute, identity.checkout.as_deref())
+        {
+            return Err(not_stored(format!(
+                "reads {} from another checkout",
+                absolute.display()
+            )));
+        }
+        let digest = identity.digests.file(absolute)?;
         if bellows_core::validate_normalized_input_path(&normalized).is_ok() {
             files.push(FileInput {
                 path: normalized,
@@ -4570,6 +4665,7 @@ mod tests {
                 workspace.to_string_lossy().into_owned(),
             )],
             virtual_env: BTreeMap::new(),
+            checkout: None,
         }
     }
 
@@ -5052,6 +5148,47 @@ mod tests {
         )
         .unwrap();
         assert!(invocation.explicit_inputs.contains(&std));
+    }
+
+    #[test]
+    fn checkouts_come_from_git_roots_not_launch_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        // A worktree has a `.git` file; a clone has a `.git` directory.
+        let worktree = root.join("worktree");
+        fs::create_dir_all(worktree.join("crates/macros/src")).unwrap();
+        fs::write(worktree.join(".git"), "gitdir: /elsewhere\n").unwrap();
+        let clone = root.join("clone");
+        fs::create_dir_all(clone.join(".git")).unwrap();
+        fs::create_dir_all(clone.join("crates/x")).unwrap();
+        assert_eq!(
+            checkout_root(&worktree.join("crates/macros")),
+            Some(worktree.clone())
+        );
+        assert_eq!(checkout_root(&clone.join("crates/x")), Some(clone.clone()));
+        assert_eq!(git_root(&root), None);
+
+        // A record whose input lives in another checkout (a poisoned record
+        // from before this check) never validates here.
+        let foreign = clone.join("crates/x/value.wit");
+        fs::write(&foreign, "old").unwrap();
+        let mut identity = test_identity(&worktree);
+        identity.checkout = Some(worktree.clone());
+        let mut candidate = empty_candidate(&identity, PROTOCOL_VERSION);
+        candidate.host_files = vec![FileInput {
+            path: foreign.to_string_lossy().into_owned(),
+            digest: digest_bytes(b"old"),
+        }];
+        candidate.action_key =
+            compiler_action_key(&candidate.static_key, &[], &candidate.host_files, &[]);
+        let reason = validate_candidate(&candidate, &identity).unwrap_err();
+        assert!(reason.contains("another checkout"), "{reason}");
+        // The same input is valid in its own checkout.
+        identity.checkout = Some(clone.clone());
+        assert!(validate_candidate(&candidate, &identity).is_ok());
+        assert!(!foreign_checkout(&foreign, Some(&clone)));
+        assert!(outside_checkout_roots("$HOME/Documents/other/x.wit"));
+        assert!(!outside_checkout_roots("$CHECKOUT/crates/x.wit"));
     }
 
     #[test]

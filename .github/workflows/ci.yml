@@ -49,6 +49,8 @@ jobs:
           path: |
             target/release/bellows
             target/release/bellowsd
+            target/release/leased
+            target/release/lease
           retention-days: 7
       - run: sudo apt-get update && sudo apt-get install -y socat jq
       - run: scripts/local-demo.sh

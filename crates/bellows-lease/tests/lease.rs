@@ -213,3 +213,112 @@ fn an_exit_code_passes_through() {
     let mut client = run_shell(&daemon, "fails", "exit 7");
     assert_eq!(client.wait().unwrap().code(), Some(7));
 }
+
+#[test]
+fn advisory_runs_never_wait() {
+    let daemon = Daemon::start();
+    let started_file = daemon.dir.path().join("holder");
+    let mut holder = run_shell(
+        &daemon,
+        "holder",
+        &format!("touch {}; sleep 30", started_file.display()),
+    );
+    wait_until("the holder to start", || started_file.exists());
+    let started = Instant::now();
+    let out = daemon
+        .lease()
+        .args([
+            "run",
+            "laptop",
+            "--est",
+            "1m",
+            "--label",
+            "advisory",
+            "--advisory",
+            "--",
+            "sh",
+            "-c",
+            "echo ran",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "advisory waited"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ran");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("running anyway"));
+    wait_until("the advisory request to be withdrawn", || {
+        daemon.log().contains("abandon")
+    });
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+
+    // With the daemon down, an advisory run still runs.
+    let socket = daemon.dir.path().join("nowhere.sock");
+    let out = daemon
+        .lease()
+        .env("LEASE_SOCKET", &socket)
+        .env("LEASE_ADVISORY", "1")
+        .args([
+            "run", "laptop", "--est", "1m", "--label", "down", "--", "true",
+        ])
+        .status()
+        .unwrap();
+    assert!(out.success());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn status_flags_unleased_compilers() {
+    let daemon = Daemon::start();
+    let fake = daemon.dir.path().join("rustc");
+    std::os::unix::fs::symlink("/bin/sleep", &fake).unwrap();
+    let unleased_dir = daemon.dir.path().join("unleased");
+    let leased_dir = daemon.dir.path().join("leased");
+    std::fs::create_dir_all(&unleased_dir).unwrap();
+    std::fs::create_dir_all(&leased_dir).unwrap();
+    // Orphaned (reparented away from this test), as under a GitHub runner
+    // this test's own ancestry includes Runner.Worker, which counts as CI.
+    let pid_file = daemon.dir.path().join("unleased.pid");
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "\"{}\" 30 & echo $! > \"{}\"",
+            fake.display(),
+            pid_file.display()
+        ))
+        .current_dir(&unleased_dir)
+        .env_remove("LEASE_ID")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let unleased: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let mut leased = daemon
+        .lease()
+        .args(["run", "laptop", "--est", "1m", "--label", "leased", "--"])
+        .arg(&fake)
+        .arg("30")
+        .current_dir(&leased_dir)
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until("the leased compiler to start", || {
+        daemon.log().contains("\"grant\"")
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    let out = daemon.lease().arg("status").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains(&unleased_dir.display().to_string()), "{text}");
+    assert!(!text.contains(&leased_dir.display().to_string()), "{text}");
+    // SAFETY: plain kill of the orphan this test started.
+    unsafe {
+        libc::kill(unleased, libc::SIGKILL);
+    }
+    leased.kill().unwrap();
+    leased.wait().unwrap();
+}

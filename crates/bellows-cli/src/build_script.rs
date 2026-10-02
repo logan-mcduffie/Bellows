@@ -224,6 +224,12 @@ fn cached_run(
                     if remote && let Some(store) = &stores.l1 {
                         let _ = store.put_candidate(candidate.clone(), 8);
                     }
+                    if !remote && let Some(store) = &stores.l1 {
+                        let _ = store.record_use(&candidate.static_key, &candidate.action_key);
+                    }
+                    if let Some(client) = &stores.remote {
+                        client.record_use(candidate);
+                    }
                     record_event(
                         if remote { "hit" } else { "l1_hit" },
                         crate_name,
@@ -400,6 +406,7 @@ fn identity(real: &Path, args: &[OsString], out_dir: &Path, crate_name: &str) ->
         pins,
         virtual_env: BTreeMap::new(),
         checkout,
+        diagnostic_width: None,
     })
 }
 

@@ -209,7 +209,7 @@ still use consistent checkout layouts for the best hit rate.
 | `bellows action run` | Cache a declared local Cargo/rustc action and final outputs |
 | `bellows remote run` | Schedule the same declared action on an authenticated executor |
 | `bellows analyze snapshot/compare` | Explain advisory source/API and downstream impact |
-| `bellows gc [--local]` | Evict old records and unreferenced blobs to a storage budget |
+| `bellows gc [--local] [--dry-run]` | Evict least recently used records and their unreferenced blobs to a storage budget |
 | `bellowsd` | Run the durable HTTP CAS/action-cache service |
 
 Configuration is available as flags or `BELLOWS_SERVER`, `BELLOWS_AUTH_TOKEN`,

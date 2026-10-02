@@ -1,12 +1,12 @@
 use anyhow::{Context, Result, anyhow, bail};
 use bellows_core::{
     ActionCandidate, ArchiveManifest, Artifact, CandidateIndex, DeclaredActionRecord, EnvInput,
-    Event, ExecuteRequest, ExecuteResponse, FileInput, GcReport, GcRequest, HealthResponse,
-    LeaseRequest, LeaseResponse, PIN_PREFIX, PROTOCOL_VERSION, PathNormalizer, PlatformIdentity,
-    ServerStats, Store, StreamArtifact, atomic_write, compiler_action_key, declared_action_key,
-    digest_bytes, now_ms, parse_dep_info, rustup_home, tree_digest, validate_archive_manifest,
-    validate_candidate_manifest, validate_declared_command, validate_declared_record,
-    validate_relative_path,
+    Event, ExecuteRequest, ExecuteResponse, FileInput, GcOptions, GcReport, GcRequest,
+    HealthResponse, LeaseRequest, LeaseResponse, PIN_PREFIX, PROTOCOL_VERSION, PathNormalizer,
+    PlatformIdentity, ServerStats, Store, StreamArtifact, atomic_write, compiler_action_key,
+    declared_action_key, digest_bytes, now_ms, parse_dep_info, rustup_home, tree_digest,
+    validate_archive_manifest, validate_candidate_manifest, validate_declared_command,
+    validate_declared_record, validate_relative_path,
 };
 use clap::{Args, Parser, Subcommand};
 use reqwest::StatusCode;
@@ -115,13 +115,28 @@ enum Commands {
     },
     /// Run a quiescent, reference-aware remote cache collection.
     Gc {
+        /// Evict least recently used records until blobs fit in this budget.
         #[arg(long)]
         max_mb: u64,
+        /// Report what a collection would evict without changing the store.
+        #[arg(long)]
+        dry_run: bool,
+        /// Also evict every compiler record older than this protocol.
+        #[arg(long)]
+        min_protocol: Option<u32>,
+        /// Print the full report as JSON.
+        #[arg(long)]
+        json: bool,
         /// Collect the daemonless local cache instead of a server.
         #[arg(long)]
         local: bool,
         #[arg(long, requires = "local")]
         cache_dir: Option<PathBuf>,
+        /// Collect a store directory directly, such as a stopped server's
+        /// data directory. A running server's directory accepts only
+        /// `--dry-run`; collect it through `--server` instead.
+        #[arg(long, conflicts_with = "local")]
+        store_dir: Option<PathBuf>,
         #[command(flatten)]
         connection: ConnectionArgs,
     },
@@ -298,34 +313,180 @@ fn run_cli() -> Result<i32> {
         }
         Commands::Gc {
             max_mb,
+            dry_run,
+            min_protocol,
+            json,
             local,
             cache_dir,
+            store_dir,
             connection,
         } => {
-            let report = if local {
-                local_store(cache_dir.as_deref(), true)?.gc(max_mb.saturating_mul(1024 * 1024))?
-            } else {
-                Remote::new(&connection.server, connection.token)?
-                    .gc(max_mb.saturating_mul(1024 * 1024))?
+            let options = GcOptions {
+                max_bytes: max_mb.saturating_mul(1024 * 1024),
+                dry_run,
+                min_protocol,
             };
-            println!(
-                "{}",
-                terminal::status(
-                    terminal::stdout_color(),
-                    "gc",
-                    &format!(
-                        "{} → {}",
-                        human_bytes(report.bytes_before),
-                        human_bytes(report.bytes_after)
-                    ),
-                    &format!(
-                        "{} records · {} blobs evicted",
-                        report.records_evicted, report.blobs_evicted
-                    ),
-                )
-            );
+            let report = if let Some(directory) = store_dir {
+                collect_store_directory(&directory, &options)?
+            } else if local {
+                // A dry run only reads: no maintenance on open.
+                local_store(cache_dir.as_deref(), !dry_run)?.collect_locally(&options)?
+            } else {
+                Remote::new(&connection.server, connection.token)?.gc(&GcRequest {
+                    max_bytes: options.max_bytes,
+                    dry_run,
+                    min_protocol,
+                })?
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print_gc_report(&report);
+            }
             Ok(0)
         }
+    }
+}
+
+/// Opens a store directory for collection. A directory a running server owns
+/// is only read: the server's own collection coordinates with its uploads.
+fn collect_store_directory(directory: &Path, options: &GcOptions) -> Result<GcReport> {
+    if !directory.join("blobs").is_dir() || !directory.join("actions").is_dir() {
+        bail!(
+            "{} is not a Bellows store (no blobs/ and actions/)",
+            directory.display()
+        )
+    }
+    let server_lock = directory.join(".server.lock");
+    let served = server_lock.exists()
+        && fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&server_lock)
+            .map(|file| {
+                let locked = fs2::FileExt::try_lock_exclusive(&file).is_err();
+                if !locked {
+                    let _ = fs2::FileExt::unlock(&file);
+                }
+                locked
+            })
+            .unwrap_or(true);
+    if served && !options.dry_run {
+        bail!(
+            "{} is owned by a running bellowsd; collect it with --server, or pass --dry-run",
+            directory.display()
+        )
+    }
+    let store = if options.dry_run {
+        Store::open_for_access(directory)?
+    } else {
+        Store::open(directory)?
+    };
+    store.collect_locally(options)
+}
+
+fn print_gc_report(report: &GcReport) {
+    let color = terminal::stdout_color();
+    let verb = if report.dry_run {
+        "would evict"
+    } else {
+        "evicted"
+    };
+    println!(
+        "{}",
+        terminal::status(
+            color,
+            "gc",
+            &format!(
+                "{} → {}{}",
+                human_bytes(report.bytes_before),
+                human_bytes(report.bytes_after),
+                if report.dry_run { " (dry run)" } else { "" }
+            ),
+            &format!(
+                "{verb} {} of {} records · {} blobs",
+                report.records_evicted, report.records, report.blobs_evicted
+            ),
+        )
+    );
+    if report.records == 0 && report.blobs == 0 {
+        return;
+    }
+    println!(
+        "{}",
+        terminal::key_value(color, "budget", human_bytes(report.max_bytes))
+    );
+    println!(
+        "{}",
+        terminal::key_value(
+            color,
+            "freed by eviction",
+            human_bytes(report.evicted_bytes)
+        )
+    );
+    println!(
+        "{}",
+        terminal::key_value(
+            color,
+            "unreferenced",
+            format!(
+                "{} in {} blobs ({} recent blobs kept for uploads in flight)",
+                human_bytes(report.unreferenced_bytes),
+                report.unreferenced_blobs,
+                report.protected_blobs
+            )
+        )
+    );
+    if report.skipped_blobs > 0 {
+        println!(
+            "{}",
+            terminal::key_value(
+                color,
+                "kept",
+                format!("{} blobs reused during collection", report.skipped_blobs)
+            )
+        );
+    }
+    let now = now_ms();
+    let age = |ms: u64| {
+        let hours = now.saturating_sub(ms) / (60 * 60 * 1000);
+        if hours < 48 {
+            format!("{hours} h ago")
+        } else {
+            format!("{} days ago", hours / 24)
+        }
+    };
+    if let Some(ms) = report.newest_evicted_ms {
+        println!(
+            "{}",
+            terminal::key_value(color, "newest evicted use", age(ms))
+        );
+    }
+    if let Some(ms) = report.oldest_kept_ms {
+        println!("{}", terminal::key_value(color, "oldest kept use", age(ms)));
+    }
+    println!(
+        "{}",
+        terminal::key_value(
+            color,
+            "access journal",
+            format!("{} recorded uses", report.journal_entries)
+        )
+    );
+    let mut group = "";
+    for bucket in &report.breakdown {
+        if bucket.group != group {
+            group = bucket.group.as_str();
+            println!("{}", terminal::section(color, &format!("By {group}")));
+        }
+        println!(
+            "  {:<32} {:>8} records  {:>10} exclusive  {verb} {:>7} records / {:>10}",
+            bucket.label,
+            bucket.records,
+            human_bytes(bucket.exclusive_bytes),
+            bucket.evicted_records,
+            human_bytes(bucket.evicted_bytes)
+        );
     }
 }
 
@@ -644,13 +805,28 @@ impl Remote {
             .json()?)
     }
 
-    fn gc(&self, max_bytes: u64) -> Result<GcReport> {
+    fn gc(&self, request: &GcRequest) -> Result<GcReport> {
         Ok(self
             .auth(self.client.post(format!("{}/v1/admin/gc", self.base)))
-            .json(&GcRequest { max_bytes })
+            // A full collection reads every record; it outlasts the
+            // per-request timeout sized for cache traffic.
+            .timeout(Duration::from_secs(60 * 60))
+            .json(request)
             .send()?
             .error_for_status()?
             .json()?)
+    }
+
+    /// Tells the server a candidate was reused, so its collection keeps
+    /// recently used records. Best effort: older servers lack the endpoint.
+    fn record_use(&self, candidate: &ActionCandidate) {
+        let _ = self
+            .auth(self.client.post(format!(
+                "{}/v1/actions/{}/{}/used",
+                self.base, candidate.static_key, candidate.action_key
+            )))
+            .timeout(Duration::from_secs(2))
+            .send();
     }
 
     fn put_candidate(&self, candidate: &ActionCandidate) -> Result<()> {
@@ -1172,9 +1348,22 @@ struct Identity {
     virtual_env: BTreeMap<String, String>,
     /// The canonical git checkout containing this compile, if any.
     checkout: Option<PathBuf>,
+    /// The `--diagnostic-width` rustc was given, if any.
+    diagnostic_width: Option<String>,
 }
 
+/// Synthetic input recording the terminal width a candidate's diagnostics
+/// were rendered for: the width, `*` for a candidate with no diagnostics, or
+/// `absent` for a compile given no width. Candidates from before this input
+/// existed were all compiled without a width.
+const DIAGNOSTIC_WIDTH_INPUT: &str = "@bellows:diagnostic-width";
+const ANY_DIAGNOSTIC_WIDTH: &str = "*";
+
 impl Identity {
+    fn diagnostic_width(&self) -> &str {
+        self.diagnostic_width.as_deref().unwrap_or("absent")
+    }
+
     /// The value rustc sees for an environment variable.
     fn env_value(&self, name: &str) -> Option<String> {
         self.virtual_env
@@ -1351,7 +1540,13 @@ fn cache_or_compile(raw: &[OsString]) -> Result<ExitStatus> {
         match store.read_candidates(&identity.static_key) {
             Ok(index) => {
                 local_index = index;
-                match try_l1_candidates(store, &invocation, &identity, &local_index) {
+                match try_l1_candidates(
+                    store,
+                    remote.as_ref(),
+                    &invocation,
+                    &identity,
+                    &local_index,
+                ) {
                     Ok(Some(status)) => return Ok(status),
                     Ok(None) => {}
                     Err(error) => record_event(
@@ -1834,6 +2029,25 @@ fn canonical_compiler_input(path: &Path) -> Result<PathBuf> {
     Ok(path.canonicalize()?)
 }
 
+fn diagnostic_width(args: &[String]) -> Option<String> {
+    args.iter().enumerate().find_map(|(index, arg)| {
+        if arg == "--diagnostic-width" {
+            args.get(index + 1).cloned()
+        } else {
+            arg.strip_prefix("--diagnostic-width=").map(str::to_owned)
+        }
+    })
+}
+
+/// Whether a compile printed anything whose rendering depends on the
+/// terminal width. Cargo's JSON artifact notifications do not.
+fn has_rendered_diagnostics(stream: &[u8]) -> bool {
+    stream.split(|byte| *byte == b'\n').any(|line| {
+        let line = line.trim_ascii();
+        !line.is_empty() && !line.starts_with(br#"{"$message_type":"artifact""#)
+    })
+}
+
 fn normalized_compiler_arguments(
     invocation: &Invocation,
     normalizer: &PathNormalizer,
@@ -1862,6 +2076,16 @@ fn normalized_compiler_arguments(
             continue;
         }
         if arg.starts_with("-Cincremental=") {
+            continue;
+        }
+        // Terminal width only reflows rendered diagnostics. It is checked
+        // against a candidate only when that candidate has diagnostics to
+        // replay (see DIAGNOSTIC_WIDTH_INPUT).
+        if arg == "--diagnostic-width" {
+            skip_next = true;
+            continue;
+        }
+        if arg.starts_with("--diagnostic-width=") {
             continue;
         }
         let is_path = path_value
@@ -1986,6 +2210,7 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
     }
     let virtual_env = stable_empty_directories(invocation, &root_normalizer);
     Ok(Identity {
+        diagnostic_width: diagnostic_width(&invocation.args),
         checkout: checkout_root(&workspace),
         virtual_env,
         fingerprint: diagnostics::Fingerprint {
@@ -2232,12 +2457,31 @@ fn validate_candidate(
     identity: &Identity,
 ) -> std::result::Result<(), String> {
     validate_candidate_manifest(candidate).map_err(|error| error.to_string())?;
+    let width = candidate
+        .env
+        .iter()
+        .find(|input| input.name == DIAGNOSTIC_WIDTH_INPUT);
+    let width_matches = match width {
+        Some(input) => [ANY_DIAGNOSTIC_WIDTH, identity.diagnostic_width()]
+            .iter()
+            .any(|value| {
+                input.value_digest.as_deref() == Some(digest_bytes(value.as_bytes()).as_str())
+            }),
+        None => identity.diagnostic_width.is_none(),
+    };
+    if !width_matches {
+        return Err(
+            "environment changed: diagnostic width (cached diagnostics were rendered for another terminal width)"
+                .into(),
+        );
+    }
     // Environment first: it is free, and a checkout pin rejects before any
     // large link input is read. Named variables before pins, so a miss names
     // the variable whose embedded path differs.
     let (pins, named): (Vec<_>, Vec<_>) = candidate
         .env
         .iter()
+        .filter(|input| input.name != DIAGNOSTIC_WIDTH_INPUT)
         .partition(|input| input.name.starts_with(PIN_PREFIX));
     for input in named.into_iter().chain(pins) {
         let actual = if input.name.starts_with(PIN_PREFIX) {
@@ -2342,6 +2586,7 @@ fn try_candidates(
                 if let Some(store) = l1 {
                     let _ = store.put_candidate(candidate.clone(), 8);
                 }
+                remote.record_use(candidate);
                 record_event(
                     "hit",
                     &invocation.crate_name,
@@ -2365,6 +2610,7 @@ fn try_candidates(
 
 fn try_l1_candidates(
     store: &Store,
+    remote: Option<&Remote>,
     invocation: &Invocation,
     identity: &Identity,
     index: &CandidateIndex,
@@ -2382,6 +2628,11 @@ fn try_l1_candidates(
         }
         match restore_l1(store, invocation, identity, candidate) {
             Ok(()) => {
+                // Both stores collect least recently used records first.
+                let _ = store.record_use(&candidate.static_key, &candidate.action_key);
+                if let Some(remote) = remote {
+                    remote.record_use(candidate);
+                }
                 record_event(
                     "l1_hit",
                     &invocation.crate_name,
@@ -3059,6 +3310,12 @@ fn capture_outputs(
             .filter(|(name, _)| leaked.iter().any(|token| name.ends_with(token)))
             .map(|(name, value)| EnvInput::capture(name, Some(value))),
     );
+    let width = if has_rendered_diagnostics(&stdout) || has_rendered_diagnostics(&stderr) {
+        identity.diagnostic_width()
+    } else {
+        ANY_DIAGNOSTIC_WIDTH
+    };
+    env_inputs.push(EnvInput::capture(DIAGNOSTIC_WIDTH_INPUT, Some(width)));
     env_inputs.sort_by(|a, b| a.name.cmp(&b.name));
     env_inputs.dedup_by(|a, b| a.name == b.name);
     let normalized_stdout = transform_compiler_stream(&stdout, &identity.normalizer, false);
@@ -4876,6 +5133,7 @@ mod tests {
             )],
             virtual_env: BTreeMap::new(),
             checkout: None,
+            diagnostic_width: None,
         }
     }
 
@@ -4952,6 +5210,67 @@ mod tests {
         unsafe { env::set_var(name, second.join("elsewhere")) };
         assert!(validate_candidate(&normalized, &other).is_err());
         unsafe { env::remove_var(name) };
+    }
+
+    #[test]
+    fn diagnostic_width_is_checked_only_for_candidates_with_diagnostics() {
+        let temp = tempfile::tempdir().unwrap();
+        let narrow = Identity {
+            diagnostic_width: Some("80".into()),
+            ..test_identity(temp.path())
+        };
+        let wide = Identity {
+            diagnostic_width: Some("200".into()),
+            ..test_identity(temp.path())
+        };
+        let unset = test_identity(temp.path());
+        let with_width = |value: &str| {
+            let mut candidate = empty_candidate(&unset, PROTOCOL_VERSION);
+            candidate.env = vec![EnvInput::capture(DIAGNOSTIC_WIDTH_INPUT, Some(value))];
+            candidate.action_key =
+                compiler_action_key(&candidate.static_key, &[], &[], &candidate.env);
+            candidate
+        };
+        let silent = with_width(ANY_DIAGNOSTIC_WIDTH);
+        for identity in [&narrow, &wide, &unset] {
+            assert!(validate_candidate(&silent, identity).is_ok());
+        }
+        let rendered = with_width("80");
+        assert!(validate_candidate(&rendered, &narrow).is_ok());
+        let reason = validate_candidate(&rendered, &wide).unwrap_err();
+        assert!(reason.contains("diagnostic width"), "{reason}");
+        assert!(validate_candidate(&rendered, &unset).is_err());
+        let rendered_unset = with_width("absent");
+        assert!(validate_candidate(&rendered_unset, &unset).is_ok());
+        assert!(validate_candidate(&rendered_unset, &narrow).is_err());
+        // Candidates from before the width input were compiled without one.
+        let legacy = empty_candidate(&unset, PROTOCOL_VERSION);
+        assert!(validate_candidate(&legacy, &unset).is_ok());
+        assert!(validate_candidate(&legacy, &narrow).is_err());
+
+        let args = [
+            "--crate-name",
+            "x",
+            "--diagnostic-width=120",
+            "--diagnostic-width",
+            "90",
+        ]
+        .map(str::to_owned);
+        assert_eq!(diagnostic_width(&args).as_deref(), Some("120"));
+        let mut invocation = test_invocation(temp.path(), &[], vec![]);
+        invocation.args = args.to_vec();
+        let normalizer = PathNormalizer::new(vec![]);
+        assert_eq!(
+            normalized_compiler_arguments(&invocation, &normalizer),
+            ["--crate-name", "x"]
+        );
+        assert!(!has_rendered_diagnostics(
+            b"{\"$message_type\":\"artifact\",\"artifact\":\"/t/libx.rmeta\",\"emit\":\"metadata\"}\n"
+        ));
+        assert!(has_rendered_diagnostics(
+            b"{\"$message_type\":\"diagnostic\",\"message\":\"unused variable\"}\n"
+        ));
+        assert!(!has_rendered_diagnostics(b"\n"));
     }
 
     #[test]

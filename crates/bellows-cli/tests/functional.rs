@@ -1804,3 +1804,65 @@ fn sessions_launched_from_subdirectories_never_share_another_checkouts_inputs() 
     build(&f);
     assert_eq!(f.value("target"), "three");
 }
+
+#[test]
+fn collection_dry_runs_change_nothing_and_reuse_is_journaled() {
+    let f = Fixture::new(
+        "pub fn value() -> u32 { 42 }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    let gc = |flags: &[&str]| -> Value {
+        let output = checked(
+            f.command(BELLOWS)
+                .args(["gc", "--local", "--cache-dir"])
+                .arg(&f.cache)
+                .args(flags)
+                .arg("--json"),
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+    f.build();
+    let published = gc(&["--max-mb", "0", "--dry-run"]);
+    assert_eq!(published["dry_run"], true);
+    assert!(published["records"].as_u64().unwrap() >= 2, "{published}");
+    assert_eq!(
+        published["records_evicted"], published["records"],
+        "{published}"
+    );
+    let publications = published["journal_entries"].as_u64().unwrap();
+    assert!(publications >= 2, "{published}");
+
+    // The dry run removed nothing: a clean build is restored, and each reuse
+    // is recorded for least-recently-used collection.
+    f.clean();
+    let restored = f.build();
+    assert_eq!(decisions(&restored, "fixture"), ["LOCAL HIT", "LOCAL HIT"]);
+    let reused = gc(&["--max-mb", "0", "--dry-run"]);
+    assert_eq!(
+        reused["journal_entries"].as_u64().unwrap(),
+        publications,
+        "a reuse refreshes an existing entry: {reused}"
+    );
+    assert!(
+        reused["breakdown"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|bucket| bucket["group"] == "kind" && bucket["label"] == "linked output"),
+        "{reused}"
+    );
+
+    // Within budget nothing is evicted; at zero every record goes, and the
+    // next build recompiles correctly.
+    let kept = gc(&["--max-mb", "100000"]);
+    assert_eq!(kept["records_evicted"], 0, "{kept}");
+    let collected = gc(&["--max-mb", "0"]);
+    assert_eq!(
+        collected["records_evicted"], collected["records"],
+        "{collected}"
+    );
+    f.clean();
+    let rebuilt = f.build();
+    assert!(!stderr(&rebuilt).contains("HIT"), "{}", stderr(&rebuilt));
+    assert_eq!(f.value("target"), "42");
+}

@@ -41,6 +41,15 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build --workspace --bins --release --locked
+      # Operators run a branch's read-only commands (such as `gc --dry-run`)
+      # against a live store without building on that machine.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-binaries
+          path: |
+            target/release/bellows
+            target/release/bellowsd
+          retention-days: 7
       - run: sudo apt-get update && sudo apt-get install -y socat jq
       - run: scripts/local-demo.sh
       - run: scripts/demo.sh

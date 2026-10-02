@@ -1170,6 +1170,8 @@ struct Identity {
     pins: Vec<(String, String)>,
     /// Environment overrides given to rustc (see `stable_empty_directories`).
     virtual_env: BTreeMap<String, String>,
+    /// The canonical git checkout containing this compile, if any.
+    checkout: Option<PathBuf>,
 }
 
 impl Identity {
@@ -1658,14 +1660,17 @@ fn normalizer(workspace: &Path, out_dir: &Path) -> PathNormalizer {
 fn root_bases(workspace: &Path, out_dir: &Path) -> Vec<(String, PathBuf)> {
     let target = target_root(workspace, out_dir);
     let mut bases = vec![("$WORKSPACE".into(), workspace.to_path_buf())];
-    // The directory a `bellows run/local` session started in. A nested Cargo
-    // build (a build script compiling another workspace) runs rustc from a
-    // subdirectory but inherits paths such as OUT_DIR from the outer build.
-    if let Some(checkout) = env::var_os("BELLOWS_WORKSPACE").map(PathBuf::from)
-        && checkout.is_absolute()
+    // The source checkout containing this compile. Nested Cargo builds and
+    // path dependencies run rustc from a subdirectory while reading (and
+    // baking) paths elsewhere in the checkout. It is found from the source
+    // tree, never from where `bellows run` happened to be launched: a session
+    // started in a crate subdirectory must not shrink the checkout.
+    if let Some(checkout) = checkout_root(workspace)
         && checkout != workspace
     {
-        bases.push(("$CHECKOUT".into(), canonical_base(checkout.clone())));
+        if let Some(given) = given_spelling(workspace, &checkout) {
+            bases.push(("$CHECKOUT".into(), given));
+        }
         bases.push(("$CHECKOUT".into(), checkout));
     }
     // Cargo's manifest directory may retain an 8.3 spelling even when the
@@ -1696,6 +1701,73 @@ fn root_bases(workspace: &Path, out_dir: &Path) -> Vec<(String, PathBuf)> {
         bases.push(("$TARGET".into(), target));
     }
     bases
+}
+
+/// The git checkout containing `dir` (a worktree's `.git` file or a clone's
+/// `.git` directory); otherwise the session's launch directory when it
+/// contains `dir`. Sources under Cargo's or rustup's home are never part of
+/// a checkout.
+fn checkout_root(dir: &Path) -> Option<PathBuf> {
+    let dir = canonical_base(dir.to_path_buf());
+    let cargo_home = env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| bellows_core::user_home().map(|home| home.join(".cargo")));
+    if cargo_home
+        .into_iter()
+        .chain([rustup_home()])
+        .any(|managed| dir.starts_with(canonical_base(managed)))
+    {
+        return None;
+    }
+    git_root(&dir).or_else(|| {
+        env::var_os("BELLOWS_WORKSPACE")
+            .map(PathBuf::from)
+            .filter(|launch| launch.is_absolute())
+            .map(canonical_base)
+            .filter(|launch| dir.starts_with(launch))
+    })
+}
+
+fn git_root(dir: &Path) -> Option<PathBuf> {
+    dir.ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
+/// Cargo's spelling of `root`, an ancestor of the canonical `workspace`: the
+/// same number of levels above the process working directory.
+fn given_spelling(workspace: &Path, root: &Path) -> Option<PathBuf> {
+    let depth = workspace.strip_prefix(root).ok()?.components().count();
+    env::current_dir()
+        .ok()?
+        .ancestors()
+        .nth(depth)
+        .map(Path::to_path_buf)
+}
+
+/// An input inside a different git checkout than this compile's: its path
+/// names another worktree, so the same record must not serve this one.
+fn foreign_checkout(path: &Path, checkout: Option<&Path>) -> bool {
+    let resolved = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    match git_root(resolved.parent().unwrap_or(&resolved)) {
+        Some(root) => checkout != Some(root.as_path()),
+        None => false,
+    }
+}
+
+/// Inputs that no per-checkout root covers (`$HOME/…` or absolute host
+/// paths); toolchain and Cargo-home sources are shared by every checkout.
+fn outside_checkout_roots(normalized: &str) -> bool {
+    ![
+        "$CHECKOUT",
+        "$WORKSPACE",
+        "$TARGET",
+        "$PROFILE",
+        "$CARGO_HOME",
+        "$RUSTUP_HOME",
+    ]
+    .iter()
+    .any(|root| normalized.starts_with(root))
 }
 
 /// `<target>[/<triple>]/<profile>` for Cargo's `deps`, `build/<unit>` and
@@ -1914,6 +1986,7 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
     }
     let virtual_env = stable_empty_directories(invocation, &root_normalizer);
     Ok(Identity {
+        checkout: checkout_root(&workspace),
         virtual_env,
         fingerprint: diagnostics::Fingerprint {
             key: static_key.clone(),
@@ -2200,6 +2273,14 @@ fn validate_candidate(
     for input in &candidate.files {
         let localized = identity.normalizer.localize(&input.path);
         let path = absolute_path(Path::new(&localized), &identity.workspace);
+        if outside_checkout_roots(&input.path)
+            && foreign_checkout(&path, identity.checkout.as_deref())
+        {
+            return Err(format!(
+                "input changed: {} belongs to another checkout",
+                input.path
+            ));
+        }
         let actual = identity
             .digests
             .file(&path)
@@ -2209,6 +2290,12 @@ fn validate_candidate(
         }
     }
     for input in &candidate.host_files {
+        if foreign_checkout(Path::new(&input.path), identity.checkout.as_deref()) {
+            return Err(format!(
+                "input changed: {} belongs to another checkout",
+                input.path
+            ));
+        }
         let actual = identity
             .digests
             .file(Path::new(&input.path))
@@ -2535,11 +2622,9 @@ fn compile_and_capture(
             args.push(arg.clone());
         }
     }
-    for (spellings, virtual_root) in remap_plan(identity) {
-        for spelling in spellings {
-            args.push("--remap-path-prefix".into());
-            args.push(format!("{spelling}={virtual_root}"));
-        }
+    for (spelling, virtual_root) in remap_plan(identity) {
+        args.push("--remap-path-prefix".into());
+        args.push(format!("{spelling}={virtual_root}"));
     }
     // rustc writes the exact linker command to a file, leaving the stdout
     // Cargo reads untouched.
@@ -2812,8 +2897,16 @@ fn capture_outputs(
     let mut files = Vec::new();
     let mut host_files = Vec::new();
     let mut record = |absolute: &Path, host: bool| -> Result<()> {
-        let digest = identity.digests.file(absolute)?;
         let normalized = identity.normalizer.normalize(&absolute.to_string_lossy());
+        if outside_checkout_roots(&normalized)
+            && foreign_checkout(absolute, identity.checkout.as_deref())
+        {
+            return Err(not_stored(format!(
+                "reads {} from another checkout",
+                absolute.display()
+            )));
+        }
+        let digest = identity.digests.file(absolute)?;
         if bellows_core::validate_normalized_input_path(&normalized).is_ok() {
             files.push(FileInput {
                 path: normalized,
@@ -2996,10 +3089,9 @@ fn check_bundled_members(invocation: &Invocation, rlib: &[u8], workspace: &Path)
     Ok(())
 }
 
-/// Each root's spellings and the checkout-independent path rustc embeds in
-/// their place, least specific first (rustc applies the last matching
-/// mapping; on Windows the canonical form is a verbatim `\\?\C:\…` path that
-/// never prefixes rustc's own paths, so every spelling is listed).
+/// Each root, spelled the way rustc sees it, and the checkout-independent
+/// path rustc embeds in its place, least specific first (rustc applies the
+/// last matching mapping).
 ///
 /// A virtual path must mean the same directory in every compile of a
 /// session: a dependency's metadata is read by its consumers, which reverse
@@ -3007,14 +3099,16 @@ fn check_bundled_members(invocation: &Invocation, rlib: &[u8], workspace: &Path)
 /// dependency's own directory, so the working directory is remapped through
 /// its place in the session checkout (`/bellows/checkout/crates/x`) or in
 /// Cargo's home (`/bellows/cargo-home/registry/…`) rather than one shared
-/// `/bellows/workspace`.
-fn remap_plan(identity: &Identity) -> Vec<(Vec<String>, String)> {
-    // rustc reverse-maps a virtual path (to reopen a dependency's source for
-    // a diagnostic snippet) only when exactly one mapping produces it, so
-    // list only spellings rustc can see: never the verbatim form, and on
-    // Windows never the forward-slash duplicate.
+/// `/bellows/workspace`. rustc reverses a mapping only when exactly one
+/// mapping produces the virtual path, so each root is remapped from a single
+/// spelling: Cargo's (rustc's working directory and its ancestors, or the
+/// as-given form), never the canonical one when they differ (Windows 8.3
+/// names such as `RUNNER~1`, symlinked directories). Other spellings stay in
+/// the normalizer and the leak scan, so an occurrence of them pins rather
+/// than shares.
+fn remap_plan(identity: &Identity) -> Vec<(String, String)> {
+    let cwd = env::current_dir().ok();
     let usable = |spellings: Vec<String>| {
-        let mut seen = BTreeSet::new();
         spellings
             .into_iter()
             .filter(|spelling| {
@@ -3022,8 +3116,18 @@ fn remap_plan(identity: &Identity) -> Vec<(Vec<String>, String)> {
                 let forward = cfg!(windows) && spelling.contains('/');
                 !(verbatim || forward)
             })
-            .filter(|spelling| seen.insert(spelling.clone()))
             .collect::<Vec<_>>()
+    };
+    let as_given = |spellings: &[String]| {
+        spellings
+            .iter()
+            .find(|spelling| {
+                Path::new(spelling)
+                    .canonicalize()
+                    .is_ok_and(|canonical| canonical != Path::new(spelling))
+            })
+            .or_else(|| spellings.first())
+            .cloned()
     };
     let canonical = |spellings: &[String]| {
         spellings
@@ -3044,13 +3148,13 @@ fn remap_plan(identity: &Identity) -> Vec<(Vec<String>, String)> {
             .collect::<Vec<_>>()
             .join(std::path::MAIN_SEPARATOR_STR)
     };
-    let cargo_home = identity.normalizer.spellings("$CARGO_HOME");
-    let checkout = identity.root_normalizer.spellings("$CHECKOUT");
-    let workspace_spellings = identity.root_normalizer.spellings("$WORKSPACE");
+    let cargo_home = usable(identity.normalizer.spellings("$CARGO_HOME"));
+    let checkout = usable(identity.root_normalizer.spellings("$CHECKOUT"));
     let workspace = &identity.workspace;
-    let workspace_virtual = match (canonical(&checkout), canonical(&cargo_home)) {
-        (Some(root), _) if relative(workspace, &root).is_some() => {
-            under("/bellows/checkout", relative(workspace, &root).unwrap())
+    let checkout_root = canonical(&checkout);
+    let workspace_virtual = match (&checkout_root, canonical(&cargo_home)) {
+        (Some(root), _) if relative(workspace, root).is_some() => {
+            under("/bellows/checkout", relative(workspace, root).unwrap())
         }
         (_, Some(root)) if relative(workspace, &root).is_some() => {
             under("/bellows/cargo-home", relative(workspace, &root).unwrap())
@@ -3059,78 +3163,45 @@ fn remap_plan(identity: &Identity) -> Vec<(Vec<String>, String)> {
         (None, _) => "/bellows/checkout".to_owned(),
         _ => "/bellows/workspace".to_owned(),
     };
+    // rustc's working directory is exactly the wrapper's; the checkout is the
+    // matching ancestor of it.
+    let workspace_spelling = cwd
+        .as_ref()
+        .map(|cwd| cwd.to_string_lossy().into_owned())
+        .or_else(|| as_given(&usable(identity.root_normalizer.spellings("$WORKSPACE"))));
+    let checkout_spelling = checkout_root
+        .as_ref()
+        .and_then(|root| given_spelling(workspace, root))
+        .map(|path| path.to_string_lossy().into_owned())
+        .or_else(|| as_given(&checkout));
     vec![
-        (usable(cargo_home), "/bellows/cargo-home".to_owned()),
-        (usable(checkout), "/bellows/checkout".to_owned()),
-        (usable(workspace_spellings), workspace_virtual),
+        (as_given(&cargo_home), "/bellows/cargo-home".to_owned()),
+        (checkout_spelling, "/bellows/checkout".to_owned()),
+        (workspace_spelling, workspace_virtual),
         (
-            usable(identity.root_normalizer.spellings("$TARGET")),
+            as_given(&usable(identity.root_normalizer.spellings("$TARGET"))),
             "/bellows/target".to_owned(),
         ),
         (
-            usable(identity.root_normalizer.spellings("$PROFILE")),
+            as_given(&usable(identity.root_normalizer.spellings("$PROFILE"))),
             "/bellows/profile".to_owned(),
         ),
     ]
     .into_iter()
-    .filter(|(spellings, _)| !spellings.is_empty())
+    .filter_map(|(spelling, virtual_root)| spelling.map(|spelling| (spelling, virtual_root)))
     .collect()
 }
 
 /// Remapping keeps checkout paths out of objects and debuginfo, but rustc
 /// also applies it to diagnostics. Messages are rewritten back to this
-/// checkout's real paths, so compiler output (and snapshot tests of it, such
-/// as trybuild) reads exactly as without Bellows. Stored streams are then
-/// normalized from the real paths and localized again on every replay.
+/// checkout's real paths, as rustc spells them, so compiler output (and
+/// snapshot tests of it, such as trybuild) reads exactly as without Bellows.
+/// Stored streams are then normalized from the real paths and localized
+/// again on every replay.
 fn virtual_roots(identity: &Identity) -> Vec<(String, String)> {
-    // Rewrite to the spelling rustc saw, which is Cargo's, not the canonical
-    // one: Windows temp directories, for example, are often reached through
-    // an 8.3 name (`RUNNER~1`). rustc's working directory is exactly the
-    // wrapper's, and the checkout is the matching ancestor of it.
-    let cwd = env::current_dir().ok();
-    let checkout_display = identity
-        .root_normalizer
-        .spellings("$CHECKOUT")
-        .iter()
-        .find_map(|spelling| {
-            let root = Path::new(spelling).canonicalize().ok()?;
-            let depth = identity
-                .workspace
-                .strip_prefix(&root)
-                .ok()?
-                .components()
-                .count();
-            cwd.as_ref()?.ancestors().nth(depth).map(Path::to_path_buf)
-        });
-    let as_given = |spellings: &[String]| {
-        spellings
-            .iter()
-            .find(|spelling| {
-                Path::new(spelling)
-                    .canonicalize()
-                    .is_ok_and(|canonical| canonical != Path::new(spelling))
-            })
-            .or_else(|| spellings.first())
-            .cloned()
-    };
-    let workspace = identity.root_normalizer.spellings("$WORKSPACE");
     let mut roots = remap_plan(identity)
         .into_iter()
-        .filter_map(|(spellings, virtual_root)| {
-            let display = if spellings.iter().any(|s| workspace.contains(s))
-                && virtual_root != "/bellows/checkout"
-                && let Some(cwd) = &cwd
-            {
-                Some(cwd.to_string_lossy().into_owned())
-            } else if virtual_root == "/bellows/checkout"
-                && let Some(checkout) = &checkout_display
-            {
-                Some(checkout.to_string_lossy().into_owned())
-            } else {
-                as_given(&spellings)
-            };
-            display.map(|real| (virtual_root, real))
-        })
+        .map(|(real, virtual_root)| (virtual_root, real))
         .collect::<Vec<_>>();
     // Longest virtual prefix first: `/bellows/checkout/crates/x` before
     // `/bellows/checkout`.
@@ -4570,6 +4641,7 @@ mod tests {
                 workspace.to_string_lossy().into_owned(),
             )],
             virtual_env: BTreeMap::new(),
+            checkout: None,
         }
     }
 
@@ -5052,6 +5124,47 @@ mod tests {
         )
         .unwrap();
         assert!(invocation.explicit_inputs.contains(&std));
+    }
+
+    #[test]
+    fn checkouts_come_from_git_roots_not_launch_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        // A worktree has a `.git` file; a clone has a `.git` directory.
+        let worktree = root.join("worktree");
+        fs::create_dir_all(worktree.join("crates/macros/src")).unwrap();
+        fs::write(worktree.join(".git"), "gitdir: /elsewhere\n").unwrap();
+        let clone = root.join("clone");
+        fs::create_dir_all(clone.join(".git")).unwrap();
+        fs::create_dir_all(clone.join("crates/x")).unwrap();
+        assert_eq!(
+            checkout_root(&worktree.join("crates/macros")),
+            Some(worktree.clone())
+        );
+        assert_eq!(checkout_root(&clone.join("crates/x")), Some(clone.clone()));
+        assert_eq!(git_root(&root), None);
+
+        // A record whose input lives in another checkout (a poisoned record
+        // from before this check) never validates here.
+        let foreign = clone.join("crates/x/value.wit");
+        fs::write(&foreign, "old").unwrap();
+        let mut identity = test_identity(&worktree);
+        identity.checkout = Some(worktree.clone());
+        let mut candidate = empty_candidate(&identity, PROTOCOL_VERSION);
+        candidate.host_files = vec![FileInput {
+            path: foreign.to_string_lossy().into_owned(),
+            digest: digest_bytes(b"old"),
+        }];
+        candidate.action_key =
+            compiler_action_key(&candidate.static_key, &[], &candidate.host_files, &[]);
+        let reason = validate_candidate(&candidate, &identity).unwrap_err();
+        assert!(reason.contains("another checkout"), "{reason}");
+        // The same input is valid in its own checkout.
+        identity.checkout = Some(clone.clone());
+        assert!(validate_candidate(&candidate, &identity).is_ok());
+        assert!(!foreign_checkout(&foreign, Some(&clone)));
+        assert!(outside_checkout_roots("$HOME/Documents/other/x.wit"));
+        assert!(!outside_checkout_roots("$CHECKOUT/crates/x.wit"));
     }
 
     #[test]

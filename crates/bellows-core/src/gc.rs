@@ -515,7 +515,7 @@ impl Plan {
                 store.with_mutation_lock(|| {
                     recent.refresh(store)?;
                     for (path, units) in batch {
-                        records_evicted += evict_from(store, path, units, &recent.uses)?;
+                        records_evicted += evict_from(path, units, &recent.uses)?;
                     }
                     Ok(())
                 })
@@ -568,12 +568,7 @@ impl Plan {
 
 /// Removes the planned units from one record file, unless they were used or
 /// replaced since the snapshot. Returns how many units were removed.
-fn evict_from(
-    store: &Store,
-    path: &Path,
-    units: &[&Unit],
-    recent: &HashSet<(String, String)>,
-) -> Result<u64> {
+fn evict_from(path: &Path, units: &[&Unit], recent: &HashSet<(String, String)>) -> Result<u64> {
     if units.iter().all(|unit| unit.candidate.is_none()) {
         return Ok(match fs::remove_file(path) {
             Ok(()) => 1,
@@ -1115,7 +1110,7 @@ mod tests {
         let candidate = fixture.publish("torn", 1, 1_000, PROTOCOL_VERSION);
         let path = fixture.root.join(JOURNAL_DIR).join(JOURNAL_FILE);
         let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
-        file.write_all(candidate.static_key[..20].as_bytes())
+        file.write_all(&candidate.static_key.as_bytes()[..20])
             .unwrap();
         let uses = read_journal(&fixture.root).unwrap();
         assert_eq!(uses.len(), 1);

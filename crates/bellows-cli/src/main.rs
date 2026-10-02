@@ -497,12 +497,27 @@ fn run_command(server: String, token: Option<String>, command: Vec<OsString>) ->
     if let Err(error) = fs::create_dir_all(&state_dir) {
         return run_without_cache(program, arguments, &error.into());
     }
+    // Every compile falls back to plain rustc when the server is down. Say so
+    // up front (and again at the end) instead of only in per-crate events.
+    let unreachable = Remote::new(&server, token.clone())
+        .and_then(|remote| remote.reachable())
+        .err()
+        .map(|error| unreachable_message(&server, &error));
+    if let Some(message) = &unreachable {
+        if env::var("BELLOWS_REQUIRE_SERVER").as_deref() == Ok("1") {
+            bail!("{message} (BELLOWS_REQUIRE_SERVER=1)")
+        }
+        eprintln!(
+            "{}",
+            terminal::attention(terminal::stderr_color(), "server unreachable", message)
+        );
+    }
     let wrapper = env::current_exe()?.canonicalize()?;
     let mut child = Command::new(program);
     child
         .args(arguments)
         .env("RUSTC_WRAPPER", &wrapper)
-        .env("BELLOWS_SERVER", server)
+        .env("BELLOWS_SERVER", &server)
         .env_remove("BELLOWS_LOCAL_ONLY")
         .env("BELLOWS_WORKSPACE", &workspace)
         .env("BELLOWS_STATE_DIR", &state_dir);
@@ -523,7 +538,20 @@ fn run_command(server: String, token: Option<String>, command: Vec<OsString>) ->
     session.configure(&mut child);
     let result = child.status().context("start wrapped command");
     session.finish(result.as_ref().ok().and_then(ExitStatus::code).unwrap_or(1));
+    if let Some(message) = &unreachable {
+        eprintln!(
+            "{}",
+            terminal::attention(terminal::stderr_color(), "server unreachable", message)
+        );
+    }
     Ok(result?.code().unwrap_or(1))
+}
+
+fn unreachable_message(server: &str, error: &anyhow::Error) -> String {
+    format!(
+        "{server}: {error:#}. Every compile in this build falls back to plain, uncached rustc. Start bellowsd \
+         (`bellows doctor` checks it), or use `bellows cargo ...` for the daemonless local cache"
+    )
 }
 
 fn run_local_command(cache_dir: Option<PathBuf>, command: Vec<OsString>) -> Result<i32> {
@@ -691,6 +719,15 @@ impl Remote {
             .send()?
             .error_for_status()?
             .json()?)
+    }
+
+    /// A quick liveness probe, bounded well below the cache-traffic timeout.
+    fn reachable(&self) -> Result<()> {
+        self.auth(self.client.get(format!("{}/v1/health", self.base)))
+            .timeout(Duration::from_secs(5))
+            .send()?
+            .error_for_status()?;
+        Ok(())
     }
 
     fn stats(&self) -> Result<ServerStats> {

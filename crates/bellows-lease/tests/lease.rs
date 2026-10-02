@@ -278,11 +278,25 @@ fn status_flags_unleased_compilers() {
     let leased_dir = daemon.dir.path().join("leased");
     std::fs::create_dir_all(&unleased_dir).unwrap();
     std::fs::create_dir_all(&leased_dir).unwrap();
-    let mut unleased = Command::new(&fake)
-        .arg("30")
+    // Orphaned (reparented away from this test), as under a GitHub runner
+    // this test's own ancestry includes Runner.Worker, which counts as CI.
+    let pid_file = daemon.dir.path().join("unleased.pid");
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "\"{}\" 30 & echo $! > \"{}\"",
+            fake.display(),
+            pid_file.display()
+        ))
         .current_dir(&unleased_dir)
         .env_remove("LEASE_ID")
-        .spawn()
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let unleased: i32 = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse()
         .unwrap();
     let mut leased = daemon
         .lease()
@@ -301,8 +315,10 @@ fn status_flags_unleased_compilers() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains(&unleased_dir.display().to_string()), "{text}");
     assert!(!text.contains(&leased_dir.display().to_string()), "{text}");
-    unleased.kill().unwrap();
-    unleased.wait().unwrap();
+    // SAFETY: plain kill of the orphan this test started.
+    unsafe {
+        libc::kill(unleased, libc::SIGKILL);
+    }
     leased.kill().unwrap();
     leased.wait().unwrap();
 }

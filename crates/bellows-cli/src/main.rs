@@ -3430,12 +3430,53 @@ fn check_bundled_members(invocation: &Invocation, rlib: &[u8], workspace: &Path)
             declared.extend(names);
         }
     }
-    if let Some(unknown) = foreign.iter().find(|name| !declared.contains(*name)) {
+    let undeclared = foreign
+        .iter()
+        .filter(|name| !declared.contains(*name))
+        .collect::<Vec<_>>();
+    // `#[link(kind = "raw-dylib")]` makes rustc synthesize import members
+    // named after the DLL from the crate's own source, which the key already
+    // covers. A bundled `kind = "static"` import library could carry the same
+    // names, but rustc must then read it from a native search directory, so a
+    // DLL-named member is accepted only when no archive there supplies it.
+    let is_dll = |name: &str| name.to_ascii_lowercase().ends_with(".dll");
+    let searched = if undeclared.iter().any(|name| is_dll(name)) {
+        searched_archive_members(&invocation.native_search)
+    } else {
+        BTreeSet::new()
+    };
+    if let Some(unknown) = undeclared
+        .into_iter()
+        .find(|name| !is_dll(name) || searched.contains(&name.to_ascii_lowercase()))
+    {
         return Err(not_stored(format!(
             "rlib bundles native member {unknown} that no -l static library supplies (#[link] in source)"
         )));
     }
     Ok(())
+}
+
+/// Lower-cased member names of every archive directly in the native search
+/// directories (unreadable entries are skipped: they cannot be bundled).
+fn searched_archive_members(dirs: &[PathBuf]) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for dir in dirs {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if let Ok(bytes) = fs::read(&path)
+                && let Ok(members) = archive::member_names(&bytes)
+            {
+                names.extend(members.into_iter().map(|name| name.to_ascii_lowercase()));
+            }
+        }
+    }
+    names
 }
 
 /// Each root, spelled the way rustc sees it, and the checkout-independent
@@ -5248,6 +5289,44 @@ mod tests {
         unsafe { env::set_var(name, second.join("elsewhere")) };
         assert!(validate_candidate(&normalized, &other).is_err());
         unsafe { env::remove_var(name) };
+    }
+
+    fn ar_archive(members: &[&str]) -> Vec<u8> {
+        let mut out = b"!<arch>\n".to_vec();
+        for name in members {
+            let header = format!(
+                "{:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+                format!("{name}/"),
+                0,
+                0,
+                0,
+                644,
+                2
+            );
+            out.extend_from_slice(header.as_bytes());
+            out.extend_from_slice(b"xx");
+        }
+        out
+    }
+
+    #[test]
+    fn raw_dylib_import_members_are_stored_unless_a_searched_archive_supplies_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut invocation = test_invocation(temp.path(), &[], vec![]);
+        let rlib = ar_archive(&["lib.rmeta", "x.rcgu.o", "kernel32.dll"]);
+        assert!(check_bundled_members(&invocation, &rlib, temp.path()).is_ok());
+
+        let unknown = ar_archive(&["lib.rmeta", "vendored.o"]);
+        assert!(check_bundled_members(&invocation, &unknown, temp.path()).is_err());
+
+        // An import library in a searched directory could be the bundled
+        // source of the same member: that stays unmodeled.
+        let search = temp.path().join("native");
+        fs::create_dir_all(&search).unwrap();
+        fs::write(search.join("kernel32.lib"), ar_archive(&["KERNEL32.dll"])).unwrap();
+        invocation.native_search = vec![search];
+        let error = check_bundled_members(&invocation, &rlib, temp.path()).unwrap_err();
+        assert!(error.to_string().contains("kernel32.dll"), "{error}");
     }
 
     #[test]

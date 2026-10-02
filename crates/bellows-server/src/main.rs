@@ -8,7 +8,7 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use bellows_core::{
     ActionCandidate, ArchiveManifest, Artifact, CandidateIndex, DeclaredActionRecord,
-    ExecuteRequest, ExecuteResponse, GcReport, GcRequest, HealthResponse, LeaseRequest,
+    ExecuteRequest, ExecuteResponse, GcOptions, GcReport, GcRequest, HealthResponse, LeaseRequest,
     LeaseResponse, PROTOCOL_VERSION, PathNormalizer, PlatformIdentity, ServerStats, Store,
     atomic_write, declared_action_key, digest_bytes, now_ms, rustup_home,
     validate_archive_manifest, validate_candidate_manifest, validate_declared_command,
@@ -55,6 +55,12 @@ struct Args {
     max_executors: usize,
     #[arg(long, env = "BELLOWS_MAX_REQUESTS", default_value_t = 128)]
     max_requests: usize,
+    /// Keep the store's blobs within this many GiB, collecting the least
+    /// recently used records in the background. Off unless set.
+    #[arg(long, env = "BELLOWS_MAX_STORE_GB")]
+    max_store_gb: Option<u64>,
+    #[arg(long, env = "BELLOWS_GC_INTERVAL_MINS", default_value_t = 30)]
+    gc_interval_mins: u64,
 }
 
 #[derive(Clone)]
@@ -68,6 +74,8 @@ struct AppState {
     enable_execution: bool,
     execution_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     executor_slots: Arc<Semaphore>,
+    /// One collection at a time, whether requested or scheduled.
+    collecting: Arc<AsyncMutex<()>>,
 }
 
 #[derive(Clone)]
@@ -140,6 +148,9 @@ async fn serve() -> Result<()> {
     if args.max_requests == 0 {
         bail!("--max-requests must be greater than zero")
     }
+    if args.gc_interval_mins == 0 {
+        bail!("--gc-interval-mins must be greater than zero")
+    }
     if args.auth_token.as_deref().is_some_and(str::is_empty) {
         bail!("--auth-token may not be empty")
     }
@@ -183,13 +194,25 @@ async fn serve() -> Result<()> {
         enable_execution: args.enable_execution,
         execution_locks: Arc::new(AsyncMutex::new(HashMap::new())),
         executor_slots: Arc::new(Semaphore::new(args.max_executors.max(1))),
+        collecting: Arc::new(AsyncMutex::new(())),
     };
+    if let Some(gigabytes) = args.max_store_gb {
+        tokio::spawn(collect_periodically(
+            state.clone(),
+            gigabytes.saturating_mul(1024 * 1024 * 1024),
+            std::time::Duration::from_secs(args.gc_interval_mins.saturating_mul(60)),
+        ));
+    }
     let api = Router::new()
         .route("/live", get(live))
         .route("/v1/health", get(health))
         .route("/v1/stats", get(stats))
         .route("/v1/actions/{static_key}", get(get_candidates))
         .route("/v1/actions/{static_key}/{action_key}", put(put_candidate))
+        .route(
+            "/v1/actions/{static_key}/{action_key}/used",
+            post(record_use),
+        )
         .route("/v1/declared/{key}", get(get_declared).put(put_declared))
         .route("/v1/archives/{name}", get(get_archive).put(put_archive))
         .route("/v1/execute", post(execute))
@@ -198,7 +221,10 @@ async fn serve() -> Result<()> {
         .route("/v1/leases/{static_key}/{token}", delete(release_lease))
         .layer(DefaultBodyLimit::max(MAX_JSON_BODY_BYTES));
     let blobs = Router::new()
-        .route("/v1/blobs/{digest}", get(get_blob).put(put_blob))
+        .route(
+            "/v1/blobs/{digest}",
+            get(get_blob).head(head_blob).put(put_blob),
+        )
         .layer(DefaultBodyLimit::max(
             args.max_blob_mb.saturating_mul(1024 * 1024),
         ));
@@ -272,6 +298,33 @@ async fn get_blob(
                 internal(error)
             }
         })
+    })
+    .await
+    .map_err(internal)?
+}
+
+/// Existence check before an upload. It refreshes the blob's time so a
+/// collection running now keeps it for the record about to reference it.
+async fn head_blob(
+    State(state): State<AppState>,
+    Path(digest): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<StatusCode> {
+    authorize(&state, &headers)?;
+    let store = state.store.clone();
+    tokio::task::spawn_blocking(move || {
+        let path = store
+            .blob_path(&digest)
+            .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
+        if !path.is_file() {
+            return Err(ApiError(StatusCode::NOT_FOUND, "blob not found".into()));
+        }
+        // A corrupt blob reads as absent, so the client uploads a good copy.
+        if store.read_blob(&digest).is_err() {
+            return Err(ApiError(StatusCode::NOT_FOUND, "blob is corrupt".into()));
+        }
+        store.touch_blob(&digest).map_err(internal)?;
+        Ok(StatusCode::OK)
     })
     .await
     .map_err(internal)?
@@ -361,6 +414,26 @@ async fn put_candidate(
         .put_candidate(candidate, state.max_candidates)
         .map_err(internal)?;
     Ok(StatusCode::CREATED)
+}
+
+async fn record_use(
+    State(state): State<AppState>,
+    Path((static_key, action_key)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> ApiResult<StatusCode> {
+    authorize(&state, &headers)?;
+    let store = state.store.clone();
+    tokio::task::spawn_blocking(move || {
+        bellows_core::validate_content_key(&static_key)
+            .and_then(|()| bellows_core::validate_content_key(&action_key))
+            .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
+        store
+            .record_use(&static_key, &action_key)
+            .map_err(internal)?;
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
+    .map_err(internal)?
 }
 
 async fn get_declared(
@@ -539,15 +612,52 @@ async fn gc(
     Json(request): Json<GcRequest>,
 ) -> ApiResult<Json<GcReport>> {
     authorize(&state, &headers)?;
+    let options = GcOptions {
+        max_bytes: request.max_bytes,
+        dry_run: request.dry_run,
+        min_protocol: request.min_protocol,
+    };
+    collect(&state, options).await.map(Json).map_err(internal)
+}
+
+async fn collect(state: &AppState, options: GcOptions) -> Result<GcReport> {
+    let _collecting = state.collecting.lock().await;
     let store = state.store.clone();
     let writes = state.writes.clone();
-    let report = tokio::task::spawn_blocking(move || {
-        let _guard = writes.lock().map_err(|_| internal("write lock poisoned"))?;
-        store.gc(request.max_bytes).map_err(internal)
+    tokio::task::spawn_blocking(move || {
+        // Each batch of deletions excludes publications, which verify their
+        // blobs exist and then write the record under the same lock.
+        let serialize = move |batch: &mut dyn FnMut() -> Result<()>| -> Result<()> {
+            let _guard = writes
+                .lock()
+                .map_err(|_| anyhow::anyhow!("write lock poisoned"))?;
+            batch()
+        };
+        store.collect(&options, &serialize)
     })
-    .await
-    .map_err(internal)??;
-    Ok(Json(report))
+    .await?
+}
+
+async fn collect_periodically(state: AppState, max_bytes: u64, every: std::time::Duration) {
+    let mut ticks = tokio::time::interval(every);
+    loop {
+        ticks.tick().await;
+        let options = GcOptions {
+            max_bytes,
+            ..GcOptions::default()
+        };
+        match collect(&state, options).await {
+            Ok(report) => eprintln!(
+                "bellowsd gc: {} -> {} bytes, {} records and {} blobs evicted in {} ms",
+                report.bytes_before,
+                report.bytes_after,
+                report.records_evicted,
+                report.blobs_evicted,
+                report.duration_ms
+            ),
+            Err(error) => eprintln!("bellowsd gc failed: {error:#}"),
+        }
+    }
 }
 
 fn verify_declared_record(store: &Store, record: &DeclaredActionRecord) -> ApiResult<()> {

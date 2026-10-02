@@ -69,11 +69,33 @@ artifact.
 
 ## Capacity and recovery
 
-Use `bellows stats` for blob bytes, record counts, candidates, and leases. Use
-`bellows gc --max-mb MEBIBYTES` to enforce a cache budget. Newly uploaded blobs
-receive a one-hour publication grace so concurrent GC cannot remove them
-between blob and record publication. A zero-byte target can therefore remain
-temporarily above target while uploads are active.
+Use `bellows stats` for blob bytes, record counts, candidates, and leases.
+
+Collection is least recently used. Every publication and every reuse appends
+one line to the store's access journal (`access/`); clients report reuse with
+`POST /v1/actions/{static}/{action}/used`, best effort. A candidate's last use
+is the later of its publication and its newest journal entry. Collection reads
+every record once, counts blob references, then evicts the least recently used
+records (a whole declared or archive record counts as one) until the blobs fit
+the budget. A blob is deleted only when no remaining record references it.
+
+- `bellows gc --max-mb MEBIBYTES --dry-run` reports the plan without changing
+  anything: totals, a breakdown by protocol, output kind, checkout pinning, age
+  of last use and crate, and what each would free. Always run it first.
+- `bellows gc --max-mb MEBIBYTES` collects a server (`--server`), the
+  daemonless cache (`--local`), or a store directory (`--store-dir`). A
+  directory a running `bellowsd` owns accepts only `--dry-run`.
+- `--min-protocol N` also evicts every compiler record older than protocol
+  `N`, whatever the budget. Current clients can never use them.
+- `bellowsd --max-store-gb GIB` (or `BELLOWS_MAX_STORE_GB`) collects to that
+  budget every `--gc-interval-mins` (default 30). It is off unless set.
+
+Collection applies its plan in batches of 256 under the store's mutation
+lock, so builds keep publishing while it runs. It never deletes a blob that
+was uploaded or offered again since it started, an unreferenced blob younger
+than the one-hour publication grace, or a blob of a record published or
+reused since it started. A zero-byte target can therefore remain above target
+while uploads are active.
 
 Compiler-cache failures are fail-open: the wrapper records the failure and
 runs official rustc. A CI job should still fail closed at setup by running

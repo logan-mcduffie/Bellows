@@ -1,4 +1,7 @@
 pub mod execution;
+mod gc;
+
+pub use gc::GcOptions;
 
 use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
@@ -346,13 +349,68 @@ pub struct ServerStats {
 pub struct GcReport {
     pub bytes_before: u64,
     pub bytes_after: u64,
+    /// Compiler candidates and declared/archive records evicted (planned, in
+    /// a dry run).
     pub records_evicted: u64,
     pub blobs_evicted: u64,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub max_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_protocol: Option<u32>,
+    /// Compiler candidates plus declared and archive records before collection.
+    #[serde(default)]
+    pub records: u64,
+    #[serde(default)]
+    pub candidates: u64,
+    #[serde(default)]
+    pub blobs: u64,
+    /// Bytes freed by evicting records (excluding already unreferenced blobs).
+    #[serde(default)]
+    pub evicted_bytes: u64,
+    #[serde(default)]
+    pub unreferenced_blobs: u64,
+    #[serde(default)]
+    pub unreferenced_bytes: u64,
+    /// Unreferenced blobs kept because their record may still be uploading.
+    #[serde(default)]
+    pub protected_blobs: u64,
+    /// Planned blob deletions skipped because they were reused mid-collection.
+    #[serde(default)]
+    pub skipped_blobs: u64,
+    #[serde(default)]
+    pub journal_entries: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_kept_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newest_evicted_ms: Option<u64>,
+    #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub breakdown: Vec<GcBucket>,
+}
+
+/// Totals for one label of one grouping (protocol, kind, scope, last use,
+/// crate) in a collection report.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GcBucket {
+    pub group: String,
+    pub label: String,
+    pub records: u64,
+    /// Bytes referenced only by records with this label.
+    pub exclusive_bytes: u64,
+    pub evicted_records: u64,
+    pub evicted_bytes: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GcRequest {
     pub max_bytes: u64,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_protocol: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -737,6 +795,8 @@ impl Store {
         let path = self.blob_path(expected)?;
         if path.exists() {
             if self.read_blob(expected).is_ok() {
+                // A running collection keeps a blob offered again just now.
+                self.touch_blob(expected)?;
                 return Ok(false);
             }
             fs::remove_file(&path).with_context(|| format!("remove corrupt blob {expected}"))?;
@@ -793,9 +853,11 @@ impl Store {
         index
             .candidates
             .retain(|c| c.action_key != candidate.action_key);
+        let (static_key, action_key) = (candidate.static_key.clone(), candidate.action_key.clone());
         index.candidates.insert(0, candidate);
         index.candidates.truncate(max_candidates.max(1));
-        atomic_write(&path, &serde_json::to_vec_pretty(&index)?)
+        atomic_write(&path, &serde_json::to_vec_pretty(&index)?)?;
+        self.record_use(&static_key, &action_key)
     }
 
     pub fn read_declared(&self, key: &str) -> Result<Option<DeclaredActionRecord>> {
@@ -875,67 +937,6 @@ impl Store {
         }
         atomic_write(&path, &serde_json::to_vec_pretty(manifest)?)?;
         Ok(true)
-    }
-
-    pub fn gc(&self, max_bytes: u64) -> Result<GcReport> {
-        self.with_mutation_lock(|| self.gc_unlocked(max_bytes))
-    }
-
-    fn gc_unlocked(&self, max_bytes: u64) -> Result<GcReport> {
-        let mut report = GcReport {
-            bytes_before: directory_bytes(&self.root.join("blobs"))?,
-            ..GcReport::default()
-        };
-        let mut records = Vec::new();
-        for directory in ["actions", "declared", "archives"] {
-            collect_paths(&self.root.join(directory), &mut records)?;
-        }
-        records.sort_by_key(|path| {
-            fs::metadata(path)
-                .and_then(|metadata| metadata.modified())
-                .unwrap_or(UNIX_EPOCH)
-        });
-        let protected_uploads = recent_unpublished_blobs(self)?;
-        remove_unreferenced_blobs(self, &protected_uploads, &mut report)?;
-        let mut current = directory_bytes(&self.root.join("blobs"))?;
-        for record in records {
-            if current <= max_bytes {
-                break;
-            }
-            if record.exists() {
-                fs::remove_file(&record)?;
-                report.records_evicted += 1;
-                remove_unreferenced_blobs(self, &protected_uploads, &mut report)?;
-                current = directory_bytes(&self.root.join("blobs"))?;
-            }
-        }
-        if current > max_bytes {
-            let mut blobs = Vec::new();
-            collect_paths(&self.root.join("blobs"), &mut blobs)?;
-            blobs.sort_by_key(|path| {
-                fs::metadata(path)
-                    .and_then(|metadata| metadata.modified())
-                    .unwrap_or(UNIX_EPOCH)
-            });
-            for blob in blobs {
-                if current <= max_bytes {
-                    break;
-                }
-                if blob
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| protected_uploads.contains(name))
-                {
-                    continue;
-                }
-                let len = fs::metadata(&blob)?.len();
-                fs::remove_file(blob)?;
-                report.blobs_evicted += 1;
-                current = current.saturating_sub(len);
-            }
-        }
-        report.bytes_after = directory_bytes(&self.root.join("blobs"))?;
-        Ok(report)
     }
 
     fn with_mutation_lock<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
@@ -1044,86 +1045,6 @@ fn cleanup_orphan_temps(root: &Path, minimum_age: Duration) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn recent_unpublished_blobs(store: &Store) -> Result<BTreeSet<String>> {
-    let referenced = referenced_blobs(store)?;
-    let now = SystemTime::now();
-    let mut blobs = Vec::new();
-    let mut recent = BTreeSet::new();
-    collect_paths(&store.root.join("blobs"), &mut blobs)?;
-    for blob in blobs {
-        let Some(name) = blob.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let is_recent = fs::metadata(&blob)
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age < UNPUBLISHED_BLOB_GRACE);
-        if is_recent && !referenced.contains(name) {
-            recent.insert(name.to_owned());
-        }
-    }
-    Ok(recent)
-}
-
-fn remove_unreferenced_blobs(
-    store: &Store,
-    protected: &BTreeSet<String>,
-    report: &mut GcReport,
-) -> Result<()> {
-    let referenced = referenced_blobs(store)?;
-    let mut blobs = Vec::new();
-    collect_paths(&store.root.join("blobs"), &mut blobs)?;
-    for blob in blobs {
-        let Some(name) = blob.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if !referenced.contains(name) && !protected.contains(name) {
-            fs::remove_file(blob)?;
-            report.blobs_evicted += 1;
-        }
-    }
-    Ok(())
-}
-
-fn referenced_blobs(store: &Store) -> Result<BTreeSet<String>> {
-    let mut referenced = BTreeSet::new();
-    let mut files = Vec::new();
-    collect_paths(&store.root.join("actions"), &mut files)?;
-    for path in files {
-        let index: CandidateIndex = serde_json::from_slice(&fs::read(&path)?)
-            .with_context(|| format!("decode action record {} during GC", path.display()))?;
-        for candidate in index.candidates {
-            referenced.extend(
-                candidate
-                    .artifacts
-                    .into_iter()
-                    .map(|artifact| artifact.digest),
-            );
-            referenced.insert(candidate.stdout.digest);
-            referenced.insert(candidate.stderr.digest);
-        }
-    }
-    files = Vec::new();
-    collect_paths(&store.root.join("declared"), &mut files)?;
-    for path in files {
-        let record: DeclaredActionRecord = serde_json::from_slice(&fs::read(&path)?)
-            .with_context(|| format!("decode declared record {} during GC", path.display()))?;
-        referenced.extend(record.inputs.into_iter().map(|artifact| artifact.digest));
-        referenced.extend(record.outputs.into_iter().map(|artifact| artifact.digest));
-        referenced.insert(record.stdout.digest);
-        referenced.insert(record.stderr.digest);
-    }
-    files = Vec::new();
-    collect_paths(&store.root.join("archives"), &mut files)?;
-    for path in files {
-        let manifest: ArchiveManifest = serde_json::from_slice(&fs::read(&path)?)
-            .with_context(|| format!("decode archive record {} during GC", path.display()))?;
-        referenced.extend(manifest.files.into_iter().map(|artifact| artifact.digest));
-    }
-    Ok(referenced)
 }
 
 fn collect_paths(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
@@ -1724,6 +1645,13 @@ mod tests {
                     executable: false,
                 }],
             })
+            .unwrap();
+        // Blobs touched in the last second are kept for a racing publication.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(store.blob_path(&digest).unwrap())
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(2 * 60 * 60))
             .unwrap();
         let report = store.gc(0).unwrap();
         assert_eq!(report.bytes_after, 0);

@@ -296,6 +296,76 @@ fn print_status(report: &StatusReport) {
             );
         }
     }
+    let unleased = unleased_rustc();
+    if !unleased.is_empty() {
+        println!(
+            "this host: {} rustc not started under `lease` or CI:",
+            unleased.values().sum::<usize>()
+        );
+        for (cwd, count) in unleased {
+            println!("  {count:>3} in {}", cwd.display());
+        }
+    }
+}
+
+/// Compilers running on this host outside any lease or CI job, by working
+/// directory. A leased job's environment carries `LEASE_ID`; a CI job runs
+/// under the runner's `Runner.Worker`.
+fn unleased_rustc() -> std::collections::BTreeMap<PathBuf, usize> {
+    let mut found = std::collections::BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if proc_comm(pid).as_deref() != Some("rustc") {
+            continue;
+        }
+        let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) else {
+            continue;
+        };
+        if environ
+            .split(|&b| b == 0)
+            .any(|var| var.starts_with(b"LEASE_ID="))
+        {
+            continue;
+        }
+        let mut ancestor = proc_ppid(pid);
+        let mut ci = false;
+        while let Some(parent) = ancestor.filter(|&p| p > 1) {
+            if proc_comm(parent).as_deref() == Some("Runner.Worker") {
+                ci = true;
+                break;
+            }
+            ancestor = proc_ppid(parent);
+        }
+        if !ci {
+            let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).unwrap_or_default();
+            *found.entry(cwd).or_default() += 1;
+        }
+    }
+    found
+}
+
+fn proc_comm(pid: u32) -> Option<String> {
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    Some(comm.trim_end().to_owned())
+}
+
+fn proc_ppid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `pid (comm) state ppid ...`; comm may contain spaces and parentheses.
+    stat[stat.rfind(')')? + 1..]
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
 }
 
 static SIGNAL: AtomicI32 = AtomicI32::new(0);
@@ -427,6 +497,7 @@ fn lease_and_run(socket: &Path, args: RunArgs, session: bool) -> Result<i32> {
     };
     let pgid = child.id() as i32;
     write_line(&mut stream, &ClientEvent::Spawned { pgid })?;
+    let terminal = ForegroundTerminal::hand_to(pgid);
 
     let revoked = Arc::new(AtomicBool::new(false));
     let lost = Arc::new(AtomicBool::new(false));
@@ -483,6 +554,7 @@ fn lease_and_run(socket: &Path, args: RunArgs, session: bool) -> Result<i32> {
         }
         std::thread::sleep(Duration::from_millis(100));
     };
+    drop(terminal);
     // Nothing the job left behind outlives the lease.
     kill_group(pgid, libc::SIGKILL);
     let code = status.code().unwrap_or_else(|| {
@@ -491,6 +563,39 @@ fn lease_and_run(socket: &Path, args: RunArgs, session: bool) -> Result<i32> {
     });
     let _ = write_line(&mut stream, &ClientEvent::Done { code });
     Ok(code)
+}
+
+/// The job runs in its own process group, so from an interactive shell it
+/// would be a background job: stopped as soon as it read the terminal. While
+/// it runs, its group owns the terminal instead (it gets ^C directly).
+struct ForegroundTerminal;
+
+impl ForegroundTerminal {
+    fn hand_to(pgid: i32) -> Option<Self> {
+        // SAFETY: plain terminal syscalls on stdin; SIGTTOU is ignored so this
+        // (soon background) process may take the terminal back later.
+        unsafe {
+            if libc::isatty(0) != 1 || libc::tcgetpgrp(0) != libc::getpgrp() {
+                return None;
+            }
+            libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+            if libc::tcsetpgrp(0, pgid) != 0 {
+                return None;
+            }
+            // In case the job already read the terminal and was stopped.
+            libc::kill(-pgid, libc::SIGCONT);
+        }
+        Some(Self)
+    }
+}
+
+impl Drop for ForegroundTerminal {
+    fn drop(&mut self) {
+        // SAFETY: as above.
+        unsafe {
+            libc::tcsetpgrp(0, libc::getpgrp());
+        }
+    }
 }
 
 /// Run the command as if no lease existed (advisory mode only).

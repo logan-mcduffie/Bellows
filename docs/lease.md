@@ -67,4 +67,12 @@ grant, release, overrun (past 1.5× the estimate), CI registration and
 administrative action is appended to `log.jsonl` in the same directory.
 
 Leases are cooperative for commands started outside `lease`: they run, but
-nothing schedules them.
+nothing schedules them. `lease status` lists, by working directory, any
+`rustc` on its own host that runs neither under a lease (`LEASE_ID` in its
+environment) nor under a CI runner (`Runner.Worker`).
+
+## Terminals
+
+The job runs in its own process group. Started from an interactive terminal,
+`lease run` hands that group the terminal while the job runs, so the job can
+read input and receives ^C directly, and takes it back afterwards.

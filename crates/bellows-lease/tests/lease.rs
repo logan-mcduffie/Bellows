@@ -267,3 +267,42 @@ fn advisory_runs_never_wait() {
         .unwrap();
     assert!(out.success());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn status_flags_unleased_compilers() {
+    let daemon = Daemon::start();
+    let fake = daemon.dir.path().join("rustc");
+    std::os::unix::fs::symlink("/bin/sleep", &fake).unwrap();
+    let unleased_dir = daemon.dir.path().join("unleased");
+    let leased_dir = daemon.dir.path().join("leased");
+    std::fs::create_dir_all(&unleased_dir).unwrap();
+    std::fs::create_dir_all(&leased_dir).unwrap();
+    let mut unleased = Command::new(&fake)
+        .arg("30")
+        .current_dir(&unleased_dir)
+        .env_remove("LEASE_ID")
+        .spawn()
+        .unwrap();
+    let mut leased = daemon
+        .lease()
+        .args(["run", "laptop", "--est", "1m", "--label", "leased", "--"])
+        .arg(&fake)
+        .arg("30")
+        .current_dir(&leased_dir)
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until("the leased compiler to start", || {
+        daemon.log().contains("\"grant\"")
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    let out = daemon.lease().arg("status").output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains(&unleased_dir.display().to_string()), "{text}");
+    assert!(!text.contains(&leased_dir.display().to_string()), "{text}");
+    unleased.kill().unwrap();
+    unleased.wait().unwrap();
+    leased.kill().unwrap();
+    leased.wait().unwrap();
+}

@@ -76,6 +76,10 @@ struct RunArgs {
     pr: Option<u32>,
     #[arg(long)]
     label: String,
+    /// Never wait: if the machine is busy or the daemon is down, run the
+    /// command anyway, unleased. For a trial rollout.
+    #[arg(long, env = "LEASE_ADVISORY", value_parser = clap::builder::BoolishValueParser::new())]
+    advisory: bool,
     #[arg(required = true, last = true)]
     command: Vec<String>,
 }
@@ -305,7 +309,14 @@ fn lease_and_run(socket: &Path, args: RunArgs, session: bool) -> Result<i32> {
     let token = (std::env::var("LEASE_MACHINE").ok().as_deref() == Some(args.machine.as_str()))
         .then(|| std::env::var("LEASE_TOKEN").ok())
         .flatten();
-    let mut stream = connect(socket)?;
+    let mut stream = match connect(socket) {
+        Ok(stream) => stream,
+        Err(error) if args.advisory => {
+            eprintln!("lease: advisory: {error:#}; running unleased");
+            return run_unleased(&args.command);
+        }
+        Err(error) => return Err(error),
+    };
     write_line(
         &mut stream,
         &Hello::Request(Request {
@@ -333,6 +344,24 @@ fn lease_and_run(socket: &Path, args: RunArgs, session: bool) -> Result<i32> {
             return Ok(EX_TEMPFAIL);
         }
         match serde_json::from_str::<Reply>(&line)? {
+            Reply::Queued {
+                id,
+                position,
+                holder,
+            } if args.advisory => {
+                eprintln!(
+                    "lease: #{id} advisory: {} is busy (position {}{}); running anyway, unleased",
+                    args.machine,
+                    position + 1,
+                    holder
+                        .map(|label| format!(", held by {label:?}"))
+                        .unwrap_or_default()
+                );
+                // Closing the connection withdraws the request.
+                drop(reader);
+                drop(stream);
+                return run_unleased(&args.command);
+            }
             Reply::Queued {
                 id,
                 position,
@@ -462,6 +491,22 @@ fn lease_and_run(socket: &Path, args: RunArgs, session: bool) -> Result<i32> {
     });
     let _ = write_line(&mut stream, &ClientEvent::Done { code });
     Ok(code)
+}
+
+/// Run the command as if no lease existed (advisory mode only).
+fn run_unleased(command: &[String]) -> Result<i32> {
+    // SAFETY: restoring default dispositions; signals now reach us as usual.
+    unsafe {
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            libc::signal(signal, libc::SIG_DFL);
+        }
+    }
+    let (program, rest) = command.split_first().context("missing command")?;
+    let status = Command::new(program)
+        .args(rest)
+        .status()
+        .with_context(|| format!("start {program}"))?;
+    Ok(status.code().unwrap_or(128))
 }
 
 fn kill_group(pgid: i32, signal: libc::c_int) {

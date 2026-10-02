@@ -213,3 +213,57 @@ fn an_exit_code_passes_through() {
     let mut client = run_shell(&daemon, "fails", "exit 7");
     assert_eq!(client.wait().unwrap().code(), Some(7));
 }
+
+#[test]
+fn advisory_runs_never_wait() {
+    let daemon = Daemon::start();
+    let started_file = daemon.dir.path().join("holder");
+    let mut holder = run_shell(
+        &daemon,
+        "holder",
+        &format!("touch {}; sleep 30", started_file.display()),
+    );
+    wait_until("the holder to start", || started_file.exists());
+    let started = Instant::now();
+    let out = daemon
+        .lease()
+        .args([
+            "run",
+            "laptop",
+            "--est",
+            "1m",
+            "--label",
+            "advisory",
+            "--advisory",
+            "--",
+            "sh",
+            "-c",
+            "echo ran",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "advisory waited"
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ran");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("running anyway"));
+    wait_until("the advisory request to be withdrawn", || {
+        daemon.log().contains("abandon")
+    });
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+
+    // With the daemon down, an advisory run still runs.
+    let socket = daemon.dir.path().join("nowhere.sock");
+    let out = daemon
+        .lease()
+        .env("LEASE_SOCKET", &socket)
+        .env("LEASE_ADVISORY", "1")
+        .args([
+            "run", "laptop", "--est", "1m", "--label", "down", "--", "true",
+        ])
+        .status()
+        .unwrap();
+    assert!(out.success());
+}

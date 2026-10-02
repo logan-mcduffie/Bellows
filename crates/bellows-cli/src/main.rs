@@ -2503,7 +2503,11 @@ fn restore_with(
     }
     for (artifact, stored) in downloaded {
         let bytes = if artifact.file_name.ends_with(".d") {
-            transform_dep_info(&stored, &identity.normalizer, true)
+            localize_env_deps(
+                &transform_dep_info(&stored, &identity.normalizer, true),
+                candidate,
+                identity,
+            )
         } else {
             stored
         };
@@ -2810,6 +2814,56 @@ fn discover_linked_outputs(
         }
     }
     Ok(names)
+}
+
+/// rustc records each `env!` value in dep-info. A result shared through a
+/// normalized (checkout-relative) value must carry this checkout's value, as
+/// rustc would have written it here, or Cargo would compare against the
+/// producer's path.
+fn localize_env_deps(dep_info: &[u8], candidate: &ActionCandidate, identity: &Identity) -> Vec<u8> {
+    let normalized = candidate
+        .env
+        .iter()
+        .filter(|input| input.normalized)
+        .map(|input| input.name.as_str())
+        .collect::<BTreeSet<_>>();
+    if normalized.is_empty() {
+        return dep_info.to_vec();
+    }
+    let Ok(text) = std::str::from_utf8(dep_info) else {
+        return dep_info.to_vec();
+    };
+    let mut result = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\r', '\n']);
+        let ending = &line[body.len()..];
+        let rewritten = body
+            .strip_prefix("# env-dep:")
+            .and_then(|rest| rest.split_once('='))
+            .filter(|(name, _)| normalized.contains(name))
+            .and_then(|(name, _)| {
+                identity
+                    .env_value(name)
+                    .map(|value| format!("# env-dep:{name}={}", escape_dep_env(&value)))
+            });
+        result.push_str(rewritten.as_deref().unwrap_or(body));
+        result.push_str(ending);
+    }
+    result.into_bytes()
+}
+
+/// rustc's escaping of `# env-dep:` values.
+fn escape_dep_env(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\\' => escaped.push_str("\\\\"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
 }
 
 fn capture_outputs(
@@ -3390,6 +3444,7 @@ fn record_event_duration(
 }
 
 fn doctor(server: &str, token: Option<&str>) -> Result<()> {
+    report_foreign_target_outputs(terminal::stdout_color());
     let remote = Remote::new(server, token.map(str::to_owned))?;
     let health = remote.health().context("connect to bellowsd")?;
     validate_protocol(health.protocol)?;
@@ -3439,6 +3494,185 @@ fn doctor(server: &str, token: Option<&str>) -> Result<()> {
         )
     );
     Ok(())
+}
+
+/// Records restored before checkouts were identified from git roots could
+/// leave build-script outputs and dep-info in a target directory that name
+/// another checkout's files. Cargo keeps such outputs fresh (it watches the
+/// other checkout), so report them with the remedy.
+fn report_foreign_target_outputs(color: bool) {
+    let Ok(cwd) = env::current_dir() else {
+        return;
+    };
+    let Some(checkout) = git_root(&canonical_base(cwd.clone())) else {
+        return;
+    };
+    let target = env::var_os("CARGO_TARGET_DIR")
+        .map(|dir| absolute_path(Path::new(&dir), &cwd))
+        .unwrap_or_else(|| checkout.join("target"));
+    let packages = foreign_target_outputs(&target, &checkout);
+    if packages.is_empty() {
+        println!(
+            "{}",
+            terminal::success(color, "target", "no outputs name another checkout")
+        );
+        return;
+    }
+    println!(
+        "{}",
+        terminal::attention(
+            color,
+            "target",
+            &format!(
+                "outputs name another checkout's files; rebuild them with `cargo clean -p {}`",
+                packages.into_iter().collect::<Vec<_>>().join(" -p ")
+            ),
+        )
+    );
+}
+
+/// Package names whose build-script output or dep-info in `target` depends
+/// on files in a different git checkout. Paths in this checkout's own git
+/// metadata (its worktree directory and the shared refs) are its own.
+fn foreign_target_outputs(target: &Path, checkout: &Path) -> BTreeSet<String> {
+    let git = GitLayout::of(checkout);
+    let names_other = |dependencies: &[String]| {
+        dependencies.iter().any(|dependency| {
+            let dependency = Path::new(dependency);
+            dependency.is_absolute()
+                && !git.owns(dependency)
+                && foreign_checkout(dependency, Some(checkout))
+                || git.other_worktree(dependency)
+        })
+    };
+    let mut foreign = BTreeSet::new();
+    let mut files = Vec::new();
+    let _ = collect_target_records(target, 0, &mut files);
+    for path in files {
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let name = path.file_name().and_then(OsStr::to_str).unwrap_or_default();
+        let (package, dependencies) = if name == "output" {
+            let package = path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(OsStr::to_str)
+                .map(strip_unit_hash)
+                .unwrap_or_default();
+            let dependencies = text
+                .lines()
+                .filter_map(|line| {
+                    line.strip_prefix("cargo::rerun-if-changed=")
+                        .or_else(|| line.strip_prefix("cargo:rerun-if-changed="))
+                })
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            (package, dependencies)
+        } else {
+            let package = strip_unit_hash(name.trim_end_matches(".d")).replace('_', "-");
+            (package, parse_dep_info(&text).0)
+        };
+        if names_other(&dependencies) {
+            foreign.insert(package);
+        }
+    }
+    foreign
+}
+
+/// Where a checkout's git metadata lives: a clone's `.git` directory, or a
+/// linked worktree's `<common>/worktrees/<name>` plus the shared `<common>`.
+struct GitLayout {
+    common: Option<PathBuf>,
+    own_worktree: Option<PathBuf>,
+}
+
+impl GitLayout {
+    fn of(checkout: &Path) -> Self {
+        let dot_git = checkout.join(".git");
+        if dot_git.is_dir() {
+            return Self {
+                common: Some(canonical_base(dot_git)),
+                own_worktree: None,
+            };
+        }
+        let gitdir = fs::read_to_string(&dot_git).ok().and_then(|text| {
+            text.trim()
+                .strip_prefix("gitdir:")
+                .map(|path| canonical_base(absolute_path(Path::new(path.trim()), checkout)))
+        });
+        Self {
+            common: gitdir
+                .as_ref()
+                .and_then(|g| g.parent()?.parent().map(Path::to_path_buf)),
+            own_worktree: gitdir,
+        }
+    }
+
+    fn worktrees(&self) -> Option<PathBuf> {
+        self.common.as_ref().map(|common| common.join("worktrees"))
+    }
+
+    /// Another linked worktree's metadata (its HEAD or index).
+    fn other_worktree(&self, path: &Path) -> bool {
+        self.worktrees()
+            .is_some_and(|worktrees| path.starts_with(worktrees))
+            && !self
+                .own_worktree
+                .as_ref()
+                .is_some_and(|own| path.starts_with(own))
+    }
+
+    /// This checkout's metadata, including refs shared by all worktrees.
+    fn owns(&self, path: &Path) -> bool {
+        self.common
+            .as_ref()
+            .is_some_and(|common| path.starts_with(common))
+            && !self.other_worktree(path)
+    }
+}
+
+/// `build/<unit>/output` and `deps/*.d` records below a Cargo target directory.
+fn collect_target_records(dir: &Path, depth: usize, files: &mut Vec<PathBuf>) -> Result<()> {
+    if depth > 6 {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        match path.file_name().and_then(OsStr::to_str) {
+            Some("deps") => {
+                for record in fs::read_dir(&path)?.flatten() {
+                    if record.path().extension().is_some_and(|ext| ext == "d") {
+                        files.push(record.path());
+                    }
+                }
+            }
+            Some("build") => {
+                for unit in fs::read_dir(&path)?.flatten() {
+                    let output = unit.path().join("output");
+                    if output.is_file() {
+                        files.push(output);
+                    }
+                }
+            }
+            Some("incremental" | "out" | "examples" | "doc") => {}
+            _ => collect_target_records(&path, depth + 1, files)?,
+        }
+    }
+    Ok(())
+}
+
+fn strip_unit_hash(name: &str) -> String {
+    match name.rsplit_once('-') {
+        Some((stem, hash)) if hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            stem.to_owned()
+        }
+        _ => name.to_owned(),
+    }
 }
 
 fn validate_protocol(server_protocol: u32) -> Result<()> {
@@ -5165,6 +5399,94 @@ mod tests {
         assert!(!foreign_checkout(&foreign, Some(&clone)));
         assert!(outside_checkout_roots("$HOME/Documents/other/x.wit"));
         assert!(!outside_checkout_roots("$CHECKOUT/crates/x.wit"));
+    }
+
+    #[test]
+    fn doctor_flags_target_outputs_that_name_another_checkout() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        // A main clone with two linked worktrees.
+        let main = root.join("main");
+        fs::create_dir_all(main.join(".git/worktrees/a")).unwrap();
+        fs::create_dir_all(main.join(".git/worktrees/b")).unwrap();
+        fs::create_dir_all(main.join(".git/refs/heads")).unwrap();
+        for name in ["a", "b"] {
+            let tree = root.join(name);
+            fs::create_dir_all(tree.join("src")).unwrap();
+            fs::write(
+                tree.join(".git"),
+                format!(
+                    "gitdir: {}\n",
+                    main.join(".git/worktrees").join(name).display()
+                ),
+            )
+            .unwrap();
+            fs::write(main.join(".git/worktrees").join(name).join("HEAD"), "ref").unwrap();
+            fs::write(tree.join("src/data.wit"), "wit").unwrap();
+        }
+        let a = root.join("a");
+        let target = a.join("target");
+        let unit = |name: &str| target.join("debug/build").join(name);
+        fs::create_dir_all(unit("own-0123456789abcdef")).unwrap();
+        fs::write(
+            unit("own-0123456789abcdef").join("output"),
+            format!(
+                "cargo:rerun-if-changed={}\ncargo:rerun-if-changed={}\n",
+                main.join(".git/worktrees/a/HEAD").display(),
+                main.join(".git/refs/heads/main").display()
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(unit("stale-host-0123456789abcdef")).unwrap();
+        fs::write(
+            unit("stale-host-0123456789abcdef").join("output"),
+            format!(
+                "cargo:rerun-if-changed={}\n",
+                main.join(".git/worktrees/b/HEAD").display()
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(target.join("debug/deps")).unwrap();
+        fs::write(
+            target.join("debug/deps/wasm_abi-0123456789abcdef.d"),
+            format!(
+                "x.rlib: {}\n# env-dep:OUT_DIR=/elsewhere\n",
+                root.join("b/src/data.wit").display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            target.join("debug/deps/fine-0123456789abcdef.d"),
+            format!("x.rlib: {}\n", a.join("src/data.wit").display()),
+        )
+        .unwrap();
+        assert_eq!(
+            foreign_target_outputs(&target, &a),
+            BTreeSet::from(["stale-host".to_owned(), "wasm-abi".to_owned()])
+        );
+    }
+
+    #[test]
+    fn restored_dep_info_names_this_checkouts_env_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let identity = test_identity(temp.path());
+        let name = "BELLOWS_TEST_ENV_DEP_LOCALIZED";
+        // SAFETY: only this test reads or writes this variable.
+        unsafe { env::set_var(name, "C:\\here\\out") };
+        let mut candidate = empty_candidate(&identity, PROTOCOL_VERSION);
+        candidate.env = vec![EnvInput::capture_normalized(name, "$TARGET/out")];
+        let dep_info = format!("a: b\n# env-dep:{name}=/producer/out\n# env-dep:KEEP=1\r\n");
+        let localized = String::from_utf8(localize_env_deps(
+            dep_info.as_bytes(),
+            &candidate,
+            &identity,
+        ))
+        .unwrap();
+        assert_eq!(
+            localized,
+            format!("a: b\n# env-dep:{name}=C:\\\\here\\\\out\n# env-dep:KEEP=1\r\n")
+        );
+        unsafe { env::remove_var(name) };
     }
 
     #[test]

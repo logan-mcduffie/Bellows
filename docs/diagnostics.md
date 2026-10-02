@@ -69,6 +69,15 @@ decision, `summary` prints only problems plus each wrapped build's closing line,
 and `quiet` prints errors only. All decisions are recorded regardless. CI logs
 are clearest with `summary` followed by `bellows stats`.
 
+`bellows doctor` also inspects the current checkout's Cargo target directory
+(`CARGO_TARGET_DIR`, or `target/` at the git root). It reports packages whose
+build-script `output` or dep-info depends on files in a *different* git
+checkout, including another worktree's git `HEAD`. Results restored by
+Bellows before 0.3.1 could leave such outputs behind. Cargo keeps them fresh
+because it watches the other checkout's files, so doctor names the
+`cargo clean -p <package>` that rebuilds them. A checkout's own git metadata,
+including refs shared between worktrees, is not reported.
+
 Configuration is not a miss cause. `bellows doctor` reports the local cache
 (`off (BELLOWS_L1=0)` or `on`) and the output level once; an individual miss
 names the local cache only when it failed to open, alongside that fallback.

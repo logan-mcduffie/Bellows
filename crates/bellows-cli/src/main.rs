@@ -1026,6 +1026,9 @@ struct Invocation {
     proc_macro_crate: bool,
     static_libraries: Vec<StaticLibrary>,
     native_search: Vec<PathBuf>,
+    /// Cargo passed the arguments in a response file (`@path`), because the
+    /// command line was too long for the platform; the compile does too.
+    response_file: bool,
 }
 
 /// Crates found in the sysroot; Cargo passes them to `--extern` without a
@@ -1049,9 +1052,8 @@ impl Invocation {
         {
             return Err("compiler probe".into());
         }
-        if args.iter().any(|arg| arg.starts_with('@')) {
-            return Err("rustc response files are not modeled".into());
-        }
+        let response_file = args.iter().any(|arg| arg.starts_with('@'));
+        let args = expand_response_files(args)?;
         if option_value(&args, "--sysroot").is_some() {
             return Err("custom sysroot contents are not modeled".into());
         }
@@ -1214,6 +1216,7 @@ impl Invocation {
             proc_macro_crate,
             static_libraries,
             native_search,
+            response_file,
         })
     }
 
@@ -1865,6 +1868,50 @@ fn cache_or_compile(raw: &[OsString]) -> Result<ExitStatus> {
         remote.release(&identity.static_key, token);
     }
     Ok(status)
+}
+
+/// Replaces each `@path` argument with the file's lines, as rustc does: one
+/// argument per line, no quoting, not recursive. Cargo writes such a file
+/// when a command line is too long for the platform (Windows, `-Zbuild-std`).
+/// The file's path is scratch and never part of the identity; its contents
+/// are. `@shell:` files use shell quoting and are not modeled.
+fn expand_response_files(args: Vec<String>) -> std::result::Result<Vec<String>, String> {
+    let mut expanded = Vec::with_capacity(args.len());
+    for arg in args {
+        let Some(path) = arg.strip_prefix('@') else {
+            expanded.push(arg);
+            continue;
+        };
+        if path.starts_with("shell:") {
+            return Err("shell-quoted rustc response files are not modeled".into());
+        }
+        let text = fs::read_to_string(path)
+            .map_err(|error| format!("read rustc response file {path}: {error}"))?;
+        expanded.extend(text.lines().map(str::to_owned));
+    }
+    Ok(expanded)
+}
+
+/// Starts rustc with `args`, through a response file when Cargo needed one.
+fn rustc_command(
+    invocation: &Invocation,
+    args: &[String],
+) -> Result<(Command, Option<tempfile::TempPath>)> {
+    let mut command = Command::new(&invocation.rustc);
+    if !invocation.response_file || args.iter().any(|arg| arg.contains('\n')) {
+        command.args(args);
+        return Ok((command, None));
+    }
+    fs::create_dir_all(&invocation.out_dir).context("create output directory")?;
+    let mut file = tempfile::Builder::new()
+        .prefix(".bellows-args-")
+        .tempfile_in(&invocation.out_dir)
+        .context("create rustc response file")?;
+    file.write_all(args.join("\n").as_bytes())
+        .context("write rustc response file")?;
+    let path = file.into_temp_path();
+    command.arg(format!("@{}", path.display()));
+    Ok((command, Some(path)))
 }
 
 fn passthrough(raw: &[OsString]) -> Result<ExitStatus> {
@@ -2933,8 +2980,8 @@ fn compile_and_capture(
         None
     };
     let started = std::time::SystemTime::now();
-    let mut child = Command::new(&invocation.rustc)
-        .args(&args)
+    let (mut command, _response_file) = rustc_command(invocation, &args)?;
+    let mut child = command
         .envs(&identity.virtual_env)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -5233,6 +5280,7 @@ mod tests {
             proc_macro_crate: false,
             static_libraries: vec![],
             native_search: vec![],
+            response_file: false,
         }
     }
 
@@ -5307,6 +5355,53 @@ mod tests {
             out.extend_from_slice(b"xx");
         }
         out
+    }
+
+    #[test]
+    fn response_files_expand_into_the_identity_and_feed_the_compile() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("cargo-args");
+        fs::write(
+            &file,
+            "--crate-name\nfixture\n--edition=2024\r\nsrc/lib.rs\n",
+        )
+        .unwrap();
+        let args = vec![
+            "-C".into(),
+            "opt-level=3".into(),
+            format!("@{}", file.display()),
+        ];
+        assert_eq!(
+            expand_response_files(args).unwrap(),
+            [
+                "-C",
+                "opt-level=3",
+                "--crate-name",
+                "fixture",
+                "--edition=2024",
+                "src/lib.rs"
+            ]
+        );
+        assert!(expand_response_files(vec!["@shell:x".into()]).is_err());
+        assert!(
+            expand_response_files(vec![format!("@{}", temp.path().join("gone").display())])
+                .is_err()
+        );
+
+        let mut invocation = test_invocation(temp.path(), &[], vec![]);
+        let args = ["--crate-name", "fixture", "src/lib.rs"].map(str::to_owned);
+        let (command, file) = rustc_command(&invocation, &args).unwrap();
+        assert!(file.is_none());
+        assert_eq!(command.get_args().count(), 3);
+        invocation.response_file = true;
+        let (command, file) = rustc_command(&invocation, &args).unwrap();
+        let file = file.expect("response file");
+        let passed = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(passed, [format!("@{}", file.display())]);
+        assert_eq!(fs::read_to_string(&file).unwrap(), args.join("\n"));
     }
 
     #[test]

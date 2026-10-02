@@ -31,6 +31,7 @@ const JOURNAL_FILE: &str = "journal.log";
 const BATCH: usize = 256;
 const TOP_CRATES: usize = 15;
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+const COARSE_CLOCK_SLACK_MS: u64 = 50;
 
 #[derive(Clone, Debug, Default)]
 pub struct GcOptions {
@@ -541,9 +542,9 @@ impl Plan {
                             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                             Err(error) => return Err(error.into()),
                         };
-                        // File times come from a coarse clock that can trail
-                        // the snapshot's clock by a tick; allow a second.
-                        if modified.saturating_add(1000) >= snapshot.started_ms
+                        // File times come from the kernel's coarse clock,
+                        // which trails the snapshot's clock by at most a tick.
+                        if modified.saturating_add(COARSE_CLOCK_SLACK_MS) >= snapshot.started_ms
                             || recent.blobs.contains(&blob.digest)
                         {
                             skipped += 1;
@@ -1043,7 +1044,20 @@ mod tests {
     fn a_blob_offered_again_during_collection_is_kept() {
         let fixture = Fixture::new("offered");
         let candidate = fixture.publish("only", 1, 1_000, PROTOCOL_VERSION);
-        // Not aged: as if a client re-offered the blob for a new record.
+        // Touched after the collection starts: a client re-offering the blob
+        // for a new record while the collection runs.
+        fixture.age_blobs();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(
+                fixture
+                    .store
+                    .blob_path(&candidate.artifacts[0].digest)
+                    .unwrap(),
+            )
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(60))
+            .unwrap();
         let report = fixture
             .store
             .collect(&fixture.options(0), &unserialized)

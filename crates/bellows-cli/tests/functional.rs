@@ -1468,7 +1468,7 @@ fn build_script_runs_are_restored_and_track_declared_inputs() {
             ("data.txt", "7"),
             (
                 "build.rs",
-                "fn main() {\n    println!(\"cargo:rerun-if-changed=data.txt\");\n    let value = std::fs::read_to_string(\"data.txt\").unwrap();\n    let out = std::env::var(\"OUT_DIR\").unwrap();\n    std::fs::write(format!(\"{out}/generated.rs\"), format!(\"pub fn value() -> u32 {{ {} }}\", value.trim())).unwrap();\n    println!(\"cargo:rustc-cfg=generated\");\n}\n",
+                "fn main() {\n    println!(\"cargo:rerun-if-changed=data.txt\");\n    let value = std::fs::read_to_string(\"data.txt\").unwrap();\n    let out = std::env::var(\"OUT_DIR\").unwrap();\n    std::fs::write(format!(\"{out}/generated.rs\"), format!(\"pub fn value() -> u32 {{ {} }}\", value.trim())).unwrap();\n    println!(\"cargo:rustc-cfg=generated\");\n    // Restored directives become later rustc arguments; spelled differently,\n    // they would split every dependent's cache key (Windows verbatim paths).\n    println!(\"cargo:rustc-link-search=native={out}\");\n    println!(\"cargo:rustc-link-search=native={}\", std::env::var(\"CARGO_MANIFEST_DIR\").unwrap());\n}\n",
             ),
         ],
     );

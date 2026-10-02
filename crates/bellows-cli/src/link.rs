@@ -108,6 +108,8 @@ pub struct LinkContext<'a> {
     /// rustc's working directory; relative linker arguments resolve here.
     pub cwd: &'a Path,
     pub msvc: bool,
+    /// rustc's sysroot, which holds self-contained linkers (`rust-lld`).
+    pub sysroot: &'a Path,
     /// Files and directories that belong to this unit's own outputs.
     pub outputs: &'a dyn Fn(&Path) -> bool,
 }
@@ -136,6 +138,7 @@ pub fn link_inputs(command: &LinkCommand, context: &LinkContext<'_>) -> Result<L
         .or_else(|| std::env::var("PATH").ok())
         .unwrap_or_default();
     let program = resolve_program(&command.program, &path_env, context.cwd)
+        .or_else(|error| sysroot_tool(&command.program, context.sysroot).ok_or(error))
         .with_context(|| format!("resolve linker {}", command.program))?;
     inputs.files.insert(program.clone());
 
@@ -385,6 +388,30 @@ pub fn resolve_program(program: &str, path_env: &str, cwd: &Path) -> Result<Path
     bail!("linker {program} is not on PATH")
 }
 
+/// A self-contained tool rustc ships in its sysroot (`rust-lld` for wasm and
+/// some MSVC targets, `wasm-component-ld`). rustc runs these from
+/// `<sysroot>/lib/rustlib/<host>/bin` without them being on `PATH`.
+pub fn sysroot_tool(program: &str, sysroot: &Path) -> Option<PathBuf> {
+    if Path::new(program).components().count() > 1 {
+        return None;
+    }
+    let hosts = std::fs::read_dir(sysroot.join("lib").join("rustlib")).ok()?;
+    for host in hosts.flatten() {
+        for dir in [
+            host.path().join("bin"),
+            host.path().join("bin").join("gcc-ld"),
+        ] {
+            for name in executable_names(program) {
+                let path = dir.join(&name);
+                if path.is_file() {
+                    return path.canonicalize().ok();
+                }
+            }
+        }
+    }
+    None
+}
+
 fn executable_names(program: &str) -> Vec<String> {
     if cfg!(windows) && !program.to_ascii_lowercase().ends_with(".exe") {
         vec![format!("{program}.exe"), program.to_owned()]
@@ -492,6 +519,35 @@ fn linker_script_references(path: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn self_contained_linkers_resolve_from_the_sysroot() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("lib/rustlib/x86_64-host/bin");
+        std::fs::create_dir_all(bin.join("gcc-ld")).unwrap();
+        let name = if cfg!(windows) {
+            "rust-lld.exe"
+        } else {
+            "rust-lld"
+        };
+        std::fs::write(bin.join(name), b"lld").unwrap();
+        std::fs::write(
+            bin.join("gcc-ld").join(if cfg!(windows) {
+                "ld.lld.exe"
+            } else {
+                "ld.lld"
+            }),
+            b"lld",
+        )
+        .unwrap();
+        assert_eq!(
+            sysroot_tool("rust-lld", temp.path()),
+            Some(bin.join(name).canonicalize().unwrap())
+        );
+        assert!(sysroot_tool("ld.lld", temp.path()).is_some());
+        assert_eq!(sysroot_tool("missing-linker", temp.path()), None);
+        assert_eq!(sysroot_tool("bin/rust-lld", temp.path()), None);
+    }
 
     #[test]
     fn parses_rustc_linker_command_rendering() {

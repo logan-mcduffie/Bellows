@@ -169,6 +169,14 @@ pub fn success(enabled: bool, subject: &str, detail: &str) -> String {
     }
 }
 
+/// A `doctor`-style line that needs the user's attention (`!` beside `✓`).
+pub fn attention(enabled: bool, subject: &str, detail: &str) -> String {
+    let mark = paint(enabled, YELLOW, "!");
+    let subject = paint(enabled, BOLD, subject);
+    let detail = paint(enabled, DIM, detail);
+    format!("{mark} {subject}  {detail}")
+}
+
 pub fn warning(enabled: bool, subject: &str, detail: &str) -> String {
     status(enabled, "fallback", subject, detail)
 }

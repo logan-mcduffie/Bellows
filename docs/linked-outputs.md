@@ -225,6 +225,11 @@ Each one keeps the guarantees above.
   `.git` file or a clone's `.git` directory) containing rustc's working
   directory. A cached input inside a *different* git checkout rejects the
   record, and such inputs are never stored.
+- **Restored dep-info carries this checkout's `env!` values (0.3.2).** A result
+  shared through a normalized path-valued `env!` dependency now records the
+  receiving checkout's value in its `# env-dep:` line, escaped as rustc
+  escapes it. The producer's value would make Cargo rebuild for any variable
+  it does not set itself.
 - **Memoized digests.** Files Bellows writes are recorded in the digest memo
   under their post-write identity, so link validation in a fresh worktree does
   not rehash every restored rlib. `rustc -vV` is memoized per concrete compiler

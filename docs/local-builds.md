@@ -17,6 +17,13 @@ The parent command performs store maintenance once, installs itself as Cargo's
 the store through a constant-time hot path and never construct the HTTP client.
 Nested Cargo commands inherit the wrapper and local-only environment.
 
+`bellows run` uses a `bellowsd` server instead (default
+`http://127.0.0.1:7878`). If the server does not answer, every compile falls
+back to plain, uncached rustc; `bellows run` says so before and after the
+build. Set `BELLOWS_REQUIRE_SERVER=1` to make an unreachable server an error
+instead, for example on a build machine that must never run uncached. On a
+machine with no server, use `bellows cargo …`.
+
 ## What gets faster
 
 Bellows complements Cargo rather than replacing its local fingerprints:

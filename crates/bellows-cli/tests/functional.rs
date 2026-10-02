@@ -1866,3 +1866,36 @@ fn collection_dry_runs_change_nothing_and_reuse_is_journaled() {
     assert!(!stderr(&rebuilt).contains("HIT"), "{}", stderr(&rebuilt));
     assert_eq!(f.value("target"), "42");
 }
+
+#[test]
+fn an_unreachable_server_is_reported_loudly_and_can_be_required() {
+    let f = Fixture::new(
+        "pub fn value() -> u32 { 42 }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    let run = || {
+        let mut command = f.command(BELLOWS);
+        command.args([
+            "run",
+            "--server",
+            "http://127.0.0.1:1",
+            "--",
+            "cargo",
+            "build",
+            "--release",
+            "--offline",
+        ]);
+        command
+    };
+    let fallback = checked(&mut run());
+    let text = stderr(&fallback);
+    assert_eq!(
+        text.matches("server unreachable").count(),
+        2,
+        "warned before and after the build: {text}"
+    );
+    assert_eq!(f.value("target"), "42");
+    let required = run().env("BELLOWS_REQUIRE_SERVER", "1").output().unwrap();
+    assert!(!required.status.success());
+    assert!(stderr(&required).contains("BELLOWS_REQUIRE_SERVER"));
+}

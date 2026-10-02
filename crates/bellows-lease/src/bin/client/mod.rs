@@ -1,0 +1,474 @@
+use anyhow::{Context, Result, bail};
+use bellows_lease::protocol::{AdminAction, ClientEvent, Hello, Reply, Request, StatusReport};
+use bellows_lease::{default_socket, default_state_dir, now_ms, parse_duration_secs};
+use clap::{Args, Parser, Subcommand};
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::time::{Duration, Instant};
+
+/// Exit code when the lease is refused or lost before the command ran.
+const EX_TEMPFAIL: i32 = 75;
+
+#[derive(Parser)]
+#[command(name = "lease", version, about = "Run commands under a machine lease")]
+struct Cli {
+    #[arg(long, env = "LEASE_SOCKET", global = true)]
+    socket: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Wait for the machine, run the command, release on exit.
+    Run(RunArgs),
+    /// Like `run`, but the command may run nested `lease run`s on the same
+    /// machine without queueing (one batch, never interleaved).
+    Hold(RunArgs),
+    /// Holders and queues.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Note that a CI job started sharing a machine (from a runner hook).
+    CiStart {
+        machine: String,
+        #[arg(long)]
+        job: String,
+    },
+    CiStop {
+        machine: String,
+        #[arg(long)]
+        job: String,
+    },
+    /// Administrative overrides (the coordinator's).
+    Admin {
+        #[arg(long, env = "LEASE_STATE_DIR")]
+        state_dir: Option<PathBuf>,
+        #[command(subcommand)]
+        action: AdminCommand,
+    },
+    /// The grant/release audit log.
+    Log {
+        #[arg(long, env = "LEASE_STATE_DIR")]
+        state_dir: Option<PathBuf>,
+        /// Only entries newer than this (e.g. 2h).
+        #[arg(long)]
+        since: Option<String>,
+    },
+}
+
+#[derive(Args)]
+struct RunArgs {
+    machine: String,
+    /// Expected duration (e.g. 20m); overruns past 1.5× are flagged.
+    #[arg(long)]
+    est: String,
+    #[arg(long, default_value_t = 0)]
+    prio: i32,
+    /// The pull request this serves; its merge-queue position ranks it.
+    #[arg(long)]
+    pr: Option<u32>,
+    #[arg(long)]
+    label: String,
+    #[arg(required = true, last = true)]
+    command: Vec<String>,
+}
+
+#[derive(Subcommand)]
+enum AdminCommand {
+    Reorder {
+        id: u64,
+        position: usize,
+    },
+    Pause {
+        machine: String,
+    },
+    Resume {
+        machine: String,
+    },
+    /// End a session at its next command boundary.
+    Preempt {
+        id: u64,
+    },
+    /// Grant only requests whose label contains LABEL, for a while.
+    Reserve {
+        machine: String,
+        #[arg(long)]
+        label: String,
+        #[arg(long = "for", default_value = "30m")]
+        duration: String,
+    },
+    Unreserve {
+        machine: String,
+    },
+    /// Drop a queued request, or revoke a lease (its job is killed).
+    Cancel {
+        id: u64,
+    },
+}
+
+pub fn main() -> i32 {
+    let cli = Cli::parse();
+    let socket = cli.socket.clone().unwrap_or_else(default_socket);
+    match run(cli.command, &socket) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("lease: {error:#}");
+            EX_TEMPFAIL
+        }
+    }
+}
+
+fn run(command: Commands, socket: &Path) -> Result<i32> {
+    match command {
+        Commands::Run(args) => lease_and_run(socket, args, false),
+        Commands::Hold(args) => lease_and_run(socket, args, true),
+        Commands::Status { json } => {
+            let report = match exchange(socket, &Hello::Status)? {
+                Reply::Status(report) => report,
+                other => bail!("unexpected reply {other:?}"),
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print_status(&report);
+            }
+            Ok(0)
+        }
+        Commands::CiStart { machine, job } => simple(socket, &Hello::CiStart { machine, job }),
+        Commands::CiStop { machine, job } => simple(socket, &Hello::CiStop { machine, job }),
+        Commands::Admin { state_dir, action } => {
+            let state_dir = state_dir.unwrap_or_else(default_state_dir);
+            let secret = std::fs::read_to_string(state_dir.join("admin.token"))
+                .context("read the admin token (only the daemon's owner can)")?
+                .trim()
+                .to_owned();
+            let action = match action {
+                AdminCommand::Reorder { id, position } => AdminAction::Reorder { id, position },
+                AdminCommand::Pause { machine } => AdminAction::Pause { machine },
+                AdminCommand::Resume { machine } => AdminAction::Resume { machine },
+                AdminCommand::Preempt { id } => AdminAction::Preempt { id },
+                AdminCommand::Reserve {
+                    machine,
+                    label,
+                    duration,
+                } => AdminAction::Reserve {
+                    machine,
+                    label,
+                    until_ms: now_ms() + parse_duration_secs(&duration)? * 1000,
+                },
+                AdminCommand::Unreserve { machine } => AdminAction::Unreserve { machine },
+                AdminCommand::Cancel { id } => AdminAction::Cancel { id },
+            };
+            simple(socket, &Hello::Admin { secret, action })
+        }
+        Commands::Log { state_dir, since } => {
+            let state_dir = state_dir.unwrap_or_else(default_state_dir);
+            let cutoff = match since {
+                Some(since) => now_ms().saturating_sub(parse_duration_secs(&since)? * 1000),
+                None => 0,
+            };
+            let text = std::fs::read_to_string(state_dir.join("log.jsonl")).unwrap_or_default();
+            for line in text.lines() {
+                let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                let at = entry.get("at_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                if at < cutoff {
+                    continue;
+                }
+                let field = |name: &str| {
+                    entry
+                        .get(name)
+                        .map(|value| {
+                            value
+                                .as_str()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| value.to_string())
+                        })
+                        .filter(|value| value != "null")
+                        .unwrap_or_default()
+                };
+                println!(
+                    "{:>8}s ago  {:<14} {:>5}  {:<8} {:<40} {}",
+                    now_ms().saturating_sub(at) / 1000,
+                    field("event"),
+                    field("id"),
+                    field("machine"),
+                    field("label"),
+                    field("detail")
+                );
+            }
+            Ok(0)
+        }
+    }
+}
+
+fn connect(socket: &Path) -> Result<UnixStream> {
+    UnixStream::connect(socket)
+        .with_context(|| format!("connect to leased at {} (is it running?)", socket.display()))
+}
+
+fn write_line(stream: &mut UnixStream, value: &impl serde::Serialize) -> Result<()> {
+    let mut line = serde_json::to_vec(value)?;
+    line.push(b'\n');
+    stream.write_all(&line)?;
+    Ok(())
+}
+
+fn exchange(socket: &Path, hello: &Hello) -> Result<Reply> {
+    let mut stream = connect(socket)?;
+    write_line(&mut stream, hello)?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line)?;
+    serde_json::from_str(&line).context("decode the daemon's reply")
+}
+
+fn simple(socket: &Path, hello: &Hello) -> Result<i32> {
+    match exchange(socket, hello)? {
+        Reply::Ok => Ok(0),
+        Reply::Refused { reason } => {
+            eprintln!("lease: refused: {reason}");
+            Ok(1)
+        }
+        other => bail!("unexpected reply {other:?}"),
+    }
+}
+
+fn print_status(report: &StatusReport) {
+    for machine in &report.machines {
+        let mut flags = Vec::new();
+        if machine.paused {
+            flags.push("PAUSED".to_owned());
+        }
+        if let Some(label) = &machine.reserved_for {
+            flags.push(format!("reserved for {label:?}"));
+        }
+        if !machine.ci_jobs.is_empty() {
+            flags.push(format!("CI: {}", machine.ci_jobs.join(", ")));
+        }
+        println!(
+            "{} (jobs {}) {}",
+            machine.machine,
+            machine.jobs,
+            flags.join(" · ")
+        );
+        match &machine.holder {
+            Some(holder) => println!(
+                "  held  #{:<4} {:<40} {}m of ~{}m{}{}",
+                holder.id,
+                holder.label,
+                holder.held_secs / 60,
+                holder.estimate_secs / 60,
+                if holder.session { " · session" } else { "" },
+                if holder.preempting {
+                    " · PREEMPTING"
+                } else {
+                    ""
+                },
+            ),
+            None => println!("  free"),
+        }
+        for (position, queued) in machine.queue.iter().enumerate() {
+            println!(
+                "  {:>2}.   #{:<4} {:<40} prio {} {}waited {}m, ~{}m",
+                position + 1,
+                queued.id,
+                queued.label,
+                queued.priority,
+                queued
+                    .merge_queue_position
+                    .map(|position| format!("merge queue #{} · ", position + 1))
+                    .or_else(|| queued.pr.map(|pr| format!("PR #{pr} · ")))
+                    .unwrap_or_default(),
+                queued.waited_secs / 60,
+                queued.estimate_secs / 60,
+            );
+        }
+    }
+}
+
+static SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+extern "C" fn on_signal(signal: libc::c_int) {
+    SIGNAL.store(signal, Ordering::SeqCst);
+}
+
+fn lease_and_run(socket: &Path, args: RunArgs, session: bool) -> Result<i32> {
+    // Inside a session on the same machine, the session's token runs us at once.
+    let token = (std::env::var("LEASE_MACHINE").ok().as_deref() == Some(args.machine.as_str()))
+        .then(|| std::env::var("LEASE_TOKEN").ok())
+        .flatten();
+    let mut stream = connect(socket)?;
+    write_line(
+        &mut stream,
+        &Hello::Request(Request {
+            machine: args.machine.clone(),
+            label: args.label.clone(),
+            priority: args.prio,
+            pr: args.pr,
+            estimate_secs: parse_duration_secs(&args.est)?,
+            session,
+            token,
+            client_pid: std::process::id(),
+        }),
+    )?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    // SAFETY: async-signal-safe handler that only stores an integer.
+    unsafe {
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            libc::signal(signal, on_signal as *const () as libc::sighandler_t);
+        }
+    }
+    let (id, jobs, session_token) = loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            eprintln!("lease: the daemon closed the connection before granting");
+            return Ok(EX_TEMPFAIL);
+        }
+        match serde_json::from_str::<Reply>(&line)? {
+            Reply::Queued {
+                id,
+                position,
+                holder,
+            } => eprintln!(
+                "lease: #{id} waiting for {} (position {}{})",
+                args.machine,
+                position + 1,
+                holder
+                    .map(|label| format!(", held by {label:?}"))
+                    .unwrap_or_default()
+            ),
+            Reply::Granted {
+                id,
+                jobs,
+                token,
+                nested,
+            } => {
+                if !nested {
+                    eprintln!("lease: #{id} granted {} ({jobs} jobs)", args.machine);
+                }
+                break (id, jobs, token);
+            }
+            Reply::Refused { reason } => {
+                eprintln!("lease: refused: {reason}");
+                return Ok(EX_TEMPFAIL);
+            }
+            _ => {}
+        }
+        if SIGNAL.load(Ordering::SeqCst) != 0 {
+            return Ok(EX_TEMPFAIL);
+        }
+    };
+
+    let (program, rest) = args.command.split_first().context("missing command")?;
+    let mut command = Command::new(program);
+    command
+        .args(rest)
+        .env("LEASE_ID", id.to_string())
+        .env("LEASE_MACHINE", &args.machine)
+        .env("LEASE_JOBS", jobs.to_string())
+        .env("CARGO_BUILD_JOBS", jobs.to_string())
+        .process_group(0);
+    if let Some(token) = &session_token {
+        command.env("LEASE_TOKEN", token);
+    }
+    #[cfg(target_os = "linux")]
+    // SAFETY: prctl is async-signal-safe; the child dies with this client.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            write_line(&mut stream, &ClientEvent::Done { code: 127 })?;
+            bail!("start {program}: {error}")
+        }
+    };
+    let pgid = child.id() as i32;
+    write_line(&mut stream, &ClientEvent::Spawned { pgid })?;
+
+    let revoked = Arc::new(AtomicBool::new(false));
+    let lost = Arc::new(AtomicBool::new(false));
+    {
+        let (revoked, lost) = (Arc::clone(&revoked), Arc::clone(&lost));
+        std::thread::spawn(move || {
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => {
+                        lost.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    Ok(_) => match serde_json::from_str::<Reply>(&line) {
+                        Ok(Reply::Revoked { reason }) => {
+                            eprintln!("lease: #{id} revoked: {reason}");
+                            revoked.store(true, Ordering::SeqCst);
+                        }
+                        Ok(Reply::Preempting) => eprintln!(
+                            "lease: #{id} preempted: the session ends at its next command"
+                        ),
+                        _ => {}
+                    },
+                }
+            }
+        });
+    }
+
+    let mut stopping: Option<Instant> = None;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        let signal = SIGNAL.load(Ordering::SeqCst);
+        let reason = if revoked.load(Ordering::SeqCst) {
+            Some("the lease was revoked")
+        } else if lost.load(Ordering::SeqCst) {
+            Some("the lease daemon went away, so the lease is no longer held")
+        } else if signal != 0 {
+            Some("interrupted")
+        } else {
+            None
+        };
+        match (reason, stopping) {
+            (Some(reason), None) => {
+                eprintln!("lease: #{id}: {reason}; stopping the job");
+                kill_group(pgid, libc::SIGTERM);
+                stopping = Some(Instant::now());
+            }
+            (_, Some(since)) if since.elapsed() > Duration::from_secs(5) => {
+                kill_group(pgid, libc::SIGKILL);
+            }
+            _ => {}
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    // Nothing the job left behind outlives the lease.
+    kill_group(pgid, libc::SIGKILL);
+    let code = status.code().unwrap_or_else(|| {
+        use std::os::unix::process::ExitStatusExt;
+        128 + status.signal().unwrap_or(0)
+    });
+    let _ = write_line(&mut stream, &ClientEvent::Done { code });
+    Ok(code)
+}
+
+fn kill_group(pgid: i32, signal: libc::c_int) {
+    if pgid > 1 {
+        // SAFETY: plain syscall; a group that is already gone is harmless.
+        unsafe {
+            libc::kill(-pgid, signal);
+        }
+    }
+}

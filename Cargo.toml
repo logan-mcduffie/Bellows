@@ -3,6 +3,7 @@ members = [
     "crates/bellows-core",
     "crates/bellows-cli",
     "crates/bellows-server",
+    "crates/bellows-lease",
 ]
 resolver = "2"
 

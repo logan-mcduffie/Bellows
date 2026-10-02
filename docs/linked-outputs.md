@@ -145,7 +145,7 @@ staleness. `explain` names the proc macros a restored result used.
 | 6. Proc macros | Enabled with the owner's approval. Residual risk documented above. |
 
 Anything the model cannot describe stays a visible bypass or capture fallback:
-an unresolvable `-l`, a directory output, a response file, `-L all=`, profile
+an unresolvable `-l`, a directory output, a shell-quoted (`@shell:`) response file, `-L all=`, profile
 or plugin inputs, `save-temps`, a custom sysroot or target JSON, or
 `target-cpu=native`.
 

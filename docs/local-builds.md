@@ -24,6 +24,11 @@ build. Set `BELLOWS_REQUIRE_SERVER=1` to make an unreachable server an error
 instead, for example on a build machine that must never run uncached. On a
 machine with no server, use `bellows cargo …`.
 
+Cargo passes rustc its arguments in a response file (`@path`) when the
+command line is too long for the platform, as `-Zbuild-std` builds are on
+Windows. Bellows reads the file's arguments into the identity (the file's own
+path is scratch) and compiles through a response file of its own.
+
 ## What gets faster
 
 Bellows complements Cargo rather than replacing its local fingerprints:

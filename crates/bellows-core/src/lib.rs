@@ -1750,6 +1750,20 @@ mod tests {
         );
     }
 
+    /// Every stored key and blob address is a BLAKE3 digest. A dependency
+    /// update that changed its output would silently re-key every store.
+    #[test]
+    fn digests_match_the_blake3_reference_vectors() {
+        assert_eq!(
+            digest_bytes(b""),
+            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+        );
+        assert_eq!(
+            digest_bytes(b"abc"),
+            "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
+        );
+    }
+
     #[test]
     fn content_keys_are_canonical_blake3_hex() {
         assert!(validate_content_key(&digest_bytes(b"valid")).is_ok());

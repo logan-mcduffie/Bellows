@@ -23,7 +23,7 @@ jobs:
         run: ./scripts/windows-extended.ps1 -ReportDirectory "$env:RUNNER_TEMP/bellows-windows-report/extended"
       - name: Teammate installation and first build
         run: ./scripts/install-check.ps1 -ReportDirectory "$env:RUNNER_TEMP/bellows-windows-report/install"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: windows-check-results
@@ -43,7 +43,7 @@ jobs:
       - run: cargo build --workspace --bins --release --locked
       # Operators run a branch's read-only commands (such as `gc --dry-run`)
       # against a live store without building on that machine.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-binaries
           path: |
@@ -65,7 +65,7 @@ jobs:
       - name: Teammate installation and first build
         shell: pwsh
         run: ./scripts/install-check.ps1 -ReportDirectory "$env:RUNNER_TEMP/bellows-extended/install"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: linux-extended-results

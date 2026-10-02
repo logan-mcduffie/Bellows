@@ -1,0 +1,66 @@
+# Machine leases (`leased`, `lease`)
+
+`bellows-lease` schedules shared build machines: each machine runs one leased
+job at a time, granted in order of priority, then merge-queue position, then
+arrival. It is a separate daemon from `bellowsd` and has nothing to do with the
+compiler cache.
+
+```sh
+leased --merge-queue-repo owner/name &      # one per scheduling host
+lease run laptop --est 20m --label "PR 587 clippy" -- cargo clippy --workspace
+lease hold desktop --est 30m --label "PR 579 desktop half" -- ./batch.sh
+lease status
+lease log --since 2h
+```
+
+## A lease is held by a connection
+
+`lease run` connects to the daemon's Unix socket, waits for its grant, runs the
+command in a new process group and reports the group to the daemon. The lease
+lasts exactly as long as that connection:
+
+- When the command exits, the client kills anything it left in its group and
+  releases the lease.
+- When the client is interrupted (`SIGINT`, `SIGTERM`, `SIGHUP`), the
+  administrator revokes the lease, or the daemon goes away, the client stops
+  the job (`SIGTERM`, then `SIGKILL` after 5 s).
+- When the client itself dies (even by `SIGKILL`), the job dies with it: the
+  job's leader has `PR_SET_PDEATHSIG`, and the daemon kills the whole process
+  group when the connection ends without a reported exit (`killed_orphan` in
+  the log).
+
+So a free machine never has a leased job still running on it. Restart `leased`
+only when `lease status` shows no holders: a restart ends every lease.
+
+`lease run` exits with the command's code, or 75 if the lease was refused or
+lost before the command ran.
+
+## Sessions
+
+`lease hold` grants a session and passes its command `LEASE_TOKEN` and
+`LEASE_MACHINE`. A nested `lease run` on the same machine with that token runs
+at once instead of queueing, so a multi-command batch is never interleaved with
+other requests. `lease admin preempt ID` ends a session at its next command
+boundary: running commands finish, and the next nested run is refused.
+
+## CI sharing
+
+`lease ci-start laptop --job ID` (from a CI runner's job-started hook) and
+`lease ci-stop laptop --job ID` (job-completed) mark a CI job sharing the
+machine. While one is active, grants on that machine still happen but carry the
+reduced job count (`--ci-jobs`, default 12 instead of `--jobs` 24), exported to
+the command as `LEASE_JOBS` and `CARGO_BUILD_JOBS`. A registration nobody
+stops expires after three hours.
+
+## Administration
+
+`lease admin` reads the daemon's admin token from its state directory
+(`$XDG_STATE_HOME/bellows-lease/admin.token`, mode 0600):
+`reorder ID POS`, `pause MACHINE`, `resume MACHINE`, `preempt ID`,
+`reserve MACHINE --label TEXT --for 30m`, `unreserve MACHINE`, and `cancel ID`
+(drops a queued request, or revokes a lease and stops its job). Every request,
+grant, release, overrun (past 1.5× the estimate), CI registration and
+administrative action is appended to `log.jsonl` in the same directory.
+
+Leases are cooperative for commands started outside `lease`: they run, but
+nothing schedules them.

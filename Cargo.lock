@@ -162,6 +162,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "bellows-lease"
+version = "0.3.7"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "bellows-server"
 version = "0.3.7"
 dependencies = [

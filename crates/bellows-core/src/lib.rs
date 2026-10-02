@@ -1290,11 +1290,31 @@ impl PathNormalizer {
     }
 
     pub fn localize(&self, value: &str) -> String {
-        self.bases
-            .iter()
+        self.localizations()
+            .into_iter()
             .fold(value.to_owned(), |text, (token, path)| {
                 text.replace(token, path)
             })
+    }
+
+    /// The one spelling each token localizes to: the ordinary drive path a
+    /// fresh process sees, never a Windows verbatim (`\\?\`) spelling. A
+    /// restored build-script directive such as `rustc-link-search` becomes a
+    /// later rustc argument, so it must be spelled as the script printed it.
+    fn localizations(&self) -> Vec<(&str, &str)> {
+        let mut chosen: Vec<(&str, &str)> = Vec::new();
+        for (token, path) in &self.bases {
+            let (token, path) = (token.as_str(), path.as_str());
+            if let Some(entry) = chosen.iter_mut().find(|entry| entry.0 == token) {
+                if entry.1.starts_with(r"\\?\") && !path.starts_with(r"\\?\") && !path.contains('/')
+                {
+                    entry.1 = path;
+                }
+            } else {
+                chosen.push((token, path));
+            }
+        }
+        chosen
     }
 
     pub fn normalize_bytes(&self, bytes: &[u8]) -> Vec<u8> {
@@ -1312,8 +1332,8 @@ impl PathNormalizer {
         replace_bytes(
             bytes,
             &self
-                .bases
-                .iter()
+                .localizations()
+                .into_iter()
                 .map(|(t, p)| (t.as_bytes(), p.as_bytes()))
                 .collect::<Vec<_>>(),
         )
@@ -1457,6 +1477,27 @@ mod tests {
             },
             proc_macros: vec![],
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn localizes_to_the_ordinary_drive_spelling() {
+        let n = PathNormalizer::new(vec![(
+            "$TARGET".into(),
+            PathBuf::from(r"\\?\C:\work\target"),
+        )]);
+        for spelling in [
+            r"\\?\C:\work\target\out",
+            r"C:\work\target\out",
+            "C:/work/target/out",
+        ] {
+            assert!(n.normalize(spelling).starts_with("$TARGET"), "{spelling}");
+        }
+        assert_eq!(n.localize(r"$TARGET\out"), r"C:\work\target\out");
+        assert_eq!(
+            n.localize_bytes(br"-L native=$TARGET\out"),
+            br"-L native=C:\work\target\out"
+        );
     }
 
     #[test]

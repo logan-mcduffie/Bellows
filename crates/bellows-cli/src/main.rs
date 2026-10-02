@@ -3291,15 +3291,16 @@ fn capture_outputs(
                     .and_then(OsStr::to_str)
                     .is_some_and(|name| invocation.owns(name))
         };
+        let sysroot = sysroot.canonicalize().unwrap_or(sysroot);
         let inputs = link::link_inputs(
             &command,
             &link::LinkContext {
                 cwd: &identity.workspace,
                 msvc: invocation.naming.msvc,
+                sysroot: &sysroot,
                 outputs: &outputs,
             },
         )?;
-        let sysroot = sysroot.canonicalize().unwrap_or(sysroot);
         for path in inputs.files {
             // Toolchain files are identified by `rustc -vV`; symlinked system
             // libraries (libfoo.so -> libfoo.so.1) are recorded by content.

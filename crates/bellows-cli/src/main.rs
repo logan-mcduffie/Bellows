@@ -2044,6 +2044,19 @@ fn source_spelling(workspace: &Path, source: Option<&Path>, root: &Path) -> Opti
     }))
 }
 
+/// A canonical path as a fresh process spells it: without a Windows
+/// verbatim (`\\?\` or `\\?\UNC\`) prefix.
+fn ordinary_spelling(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) => match rest.strip_prefix(r"UNC\") {
+            Some(unc) => format!(r"\\{unc}"),
+            None => rest.to_owned(),
+        },
+        None => text.into_owned(),
+    }
+}
+
 fn git_root(dir: &Path) -> Option<PathBuf> {
     dir.ancestors()
         .find(|ancestor| ancestor.join(".git").exists())
@@ -3590,13 +3603,17 @@ fn remap_plan(identity: &Identity) -> Vec<(String, String)> {
             })
             .collect::<Vec<_>>()
     };
+    // Cargo's spelling: one that differs from its own canonical form. On
+    // Windows canonicalize() adds a verbatim prefix, and the normalizer also
+    // records that path's ordinary drive form; neither is Cargo's spelling, so
+    // compare against the ordinary form (an 8.3 name or a symlink still differs).
     let as_given = |spellings: &[String]| {
         spellings
             .iter()
             .find(|spelling| {
                 Path::new(spelling)
                     .canonicalize()
-                    .is_ok_and(|canonical| canonical != Path::new(spelling))
+                    .is_ok_and(|canonical| ordinary_spelling(&canonical) != **spelling)
             })
             .or_else(|| spellings.first())
             .cloned()
@@ -5262,6 +5279,19 @@ mod tests {
         fs::create_dir(&real).unwrap();
         symlink(&real, &alias).unwrap();
         assert_eq!(canonical_base(alias), real.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn ordinary_spellings_drop_verbatim_prefixes() {
+        assert_eq!(
+            ordinary_spelling(Path::new(r"\\?\C:\Users\x")),
+            r"C:\Users\x"
+        );
+        assert_eq!(
+            ordinary_spelling(Path::new(r"\\?\UNC\server\share\x")),
+            r"\\server\share\x"
+        );
+        assert_eq!(ordinary_spelling(Path::new("/home/x")), "/home/x");
     }
 
     #[cfg(unix)]

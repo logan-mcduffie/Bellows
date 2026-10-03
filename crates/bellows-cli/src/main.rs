@@ -2609,9 +2609,7 @@ fn validate_candidate(
                 input.path
             ));
         }
-        let actual = identity
-            .digests
-            .file(&path)
+        let actual = build_script::input_digest(&identity.digests, &path)
             .map_err(|_| format!("input disappeared: {}", input.path))?;
         if actual != input.digest {
             return Err(format!("input changed: {}", input.path));
@@ -2624,9 +2622,7 @@ fn validate_candidate(
                 input.path
             ));
         }
-        let actual = identity
-            .digests
-            .file(Path::new(&input.path))
+        let actual = build_script::input_digest(&identity.digests, Path::new(&input.path))
             .map_err(|_| format!("input disappeared: {}", input.path))?;
         if actual != input.digest {
             return Err(format!("input changed: {}", input.path));

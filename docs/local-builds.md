@@ -71,7 +71,12 @@ place and Cargo runs that instead. The launcher restores a verified earlier
 run, or runs the real script and records it. Identity follows Cargo's rerun
 model: the script binary, `$RUSTC -vV`, the resolved C/C++ drivers, the
 relevant environment, and the declared `rerun-if-changed` paths (the whole
-package when none are declared) and `rerun-if-env-changed` values. Nested
+package when none are declared) and `rerun-if-env-changed` values. A
+directory input counts by its recursive listing as well as its files'
+contents, so adding, removing or renaming a file in it is a miss, as it is a
+rerun for Cargo. (Before 0.3.8 only the files present when a run was recorded
+were checked, so a file added later could restore a stale run; 0.3.8 records
+build scripts under a new identity and never reads those runs.) Nested
 Cargo target directories inside `OUT_DIR` (marked by `CACHEDIR.TAG`) are
 scratch and are not stored. Only runs that began with an empty `OUT_DIR` are
 published. Other host tools a script invokes are a trusted boundary, as for

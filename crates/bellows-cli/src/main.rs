@@ -1919,8 +1919,8 @@ fn passthrough(raw: &[OsString]) -> Result<ExitStatus> {
     Ok(Command::new(rustc).args(args).status()?)
 }
 
-fn normalizer(workspace: &Path, out_dir: &Path) -> PathNormalizer {
-    let mut bases = root_bases(workspace, out_dir);
+fn normalizer(workspace: &Path, out_dir: &Path, source: Option<&Path>) -> PathNormalizer {
+    let mut bases = root_bases(workspace, out_dir, source);
     let home = bellows_core::user_home();
     if let Some(cargo_home) = env::var_os("CARGO_HOME")
         .map(PathBuf::from)
@@ -1936,7 +1936,9 @@ fn normalizer(workspace: &Path, out_dir: &Path) -> PathNormalizer {
 }
 
 /// The per-checkout roots: the workspace and the Cargo target directory.
-fn root_bases(workspace: &Path, out_dir: &Path) -> Vec<(String, PathBuf)> {
+/// `source` is the compile's crate root, which locates its checkout when the
+/// working directory lies outside one (see `compile_checkout`).
+fn root_bases(workspace: &Path, out_dir: &Path, source: Option<&Path>) -> Vec<(String, PathBuf)> {
     let target = target_root(workspace, out_dir);
     let mut bases = vec![("$WORKSPACE".into(), workspace.to_path_buf())];
     // The source checkout containing this compile. Nested Cargo builds and
@@ -1944,10 +1946,12 @@ fn root_bases(workspace: &Path, out_dir: &Path) -> Vec<(String, PathBuf)> {
     // baking) paths elsewhere in the checkout. It is found from the source
     // tree, never from where `bellows run` happened to be launched: a session
     // started in a crate subdirectory must not shrink the checkout.
-    if let Some(checkout) = checkout_root(workspace)
+    if let Some(checkout) = compile_checkout(workspace, source)
         && checkout != workspace
     {
-        if let Some(given) = given_spelling(workspace, &checkout) {
+        if let Some(given) = given_spelling(workspace, &checkout)
+            .or_else(|| source_spelling(workspace, source, &checkout))
+        {
             bases.push(("$CHECKOUT".into(), given));
         }
         bases.push(("$CHECKOUT".into(), checkout));
@@ -2005,6 +2009,52 @@ fn checkout_root(dir: &Path) -> Option<PathBuf> {
             .map(canonical_base)
             .filter(|launch| dir.starts_with(launch))
     })
+}
+
+/// The checkout a compile belongs to: the one containing its working
+/// directory, or else the one containing its crate root. Cargo may run rustc
+/// from a directory outside every checkout (trybuild's generated project in a
+/// target directory that lives elsewhere) for a crate whose sources and path
+/// dependencies are in one; `/bellows/checkout` must still name that checkout,
+/// or the dependency paths its metadata carries resolve against the wrong
+/// directory in diagnostics.
+fn compile_checkout(workspace: &Path, source: Option<&Path>) -> Option<PathBuf> {
+    checkout_root(workspace).or_else(|| {
+        let source = source?;
+        let dir = absolute_path(source, workspace);
+        checkout_root(dir.parent()?)
+    })
+}
+
+/// Cargo's spelling of `root` (a checkout found from the crate root, not the
+/// working directory): the matching ancestor of the crate root as Cargo
+/// passed it, which may keep a Windows 8.3 name or a symlink that the
+/// canonical `root` has resolved.
+fn source_spelling(workspace: &Path, source: Option<&Path>, root: &Path) -> Option<PathBuf> {
+    let given = absolute_path(source?, workspace);
+    let canonical = canonical_base(given.clone());
+    let depth = canonical.strip_prefix(root).ok()?.components().count();
+    let spelling = given.ancestors().nth(depth)?.to_string_lossy().into_owned();
+    // A manifest path may use `/` on Windows; rustc spells the checkout's
+    // files (compiled from inside it) with native separators.
+    Some(PathBuf::from(if cfg!(windows) {
+        spelling.replace('/', "\\")
+    } else {
+        spelling
+    }))
+}
+
+/// A canonical path as a fresh process spells it: without a Windows
+/// verbatim (`\\?\` or `\\?\UNC\`) prefix.
+fn ordinary_spelling(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) => match rest.strip_prefix(r"UNC\") {
+            Some(unc) => format!(r"\\{unc}"),
+            None => rest.to_owned(),
+        },
+        None => text.into_owned(),
+    }
 }
 
 fn git_root(dir: &Path) -> Option<PathBuf> {
@@ -2192,8 +2242,10 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
     // rustc arguments and dep-info belong to that invocation's working dir,
     // not the parent Bellows session's launch directory.
     let workspace = env::current_dir()?.canonicalize()?;
-    let normalizer = normalizer(&workspace, &invocation.out_dir);
-    let root_normalizer = PathNormalizer::new(root_bases(&workspace, &invocation.out_dir));
+    let crate_root = invocation.explicit_inputs.first().map(PathBuf::as_path);
+    let normalizer = normalizer(&workspace, &invocation.out_dir, crate_root);
+    let root_normalizer =
+        PathNormalizer::new(root_bases(&workspace, &invocation.out_dir, crate_root));
     let digests = digests::Digests::new(&state_dir(&workspace));
     let compiler = compiler_identity(&invocation.rustc, &state_dir(&workspace))?;
     let normalized_args = normalized_compiler_arguments(invocation, &normalizer);
@@ -2295,7 +2347,7 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
     let virtual_env = stable_empty_directories(invocation, &root_normalizer);
     Ok(Identity {
         diagnostic_width: diagnostic_width(&invocation.args),
-        checkout: checkout_root(&workspace),
+        checkout: compile_checkout(&workspace, crate_root),
         virtual_env,
         fingerprint: diagnostics::Fingerprint {
             key: static_key.clone(),
@@ -3551,13 +3603,17 @@ fn remap_plan(identity: &Identity) -> Vec<(String, String)> {
             })
             .collect::<Vec<_>>()
     };
+    // Cargo's spelling: one that differs from its own canonical form. On
+    // Windows canonicalize() adds a verbatim prefix, and the normalizer also
+    // records that path's ordinary drive form; neither is Cargo's spelling, so
+    // compare against the ordinary form (an 8.3 name or a symlink still differs).
     let as_given = |spellings: &[String]| {
         spellings
             .iter()
             .find(|spelling| {
                 Path::new(spelling)
                     .canonicalize()
-                    .is_ok_and(|canonical| canonical != Path::new(spelling))
+                    .is_ok_and(|canonical| ordinary_spelling(&canonical) != **spelling)
             })
             .or_else(|| spellings.first())
             .cloned()
@@ -5223,6 +5279,45 @@ mod tests {
         fs::create_dir(&real).unwrap();
         symlink(&real, &alias).unwrap();
         assert_eq!(canonical_base(alias), real.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn ordinary_spellings_drop_verbatim_prefixes() {
+        assert_eq!(
+            ordinary_spelling(Path::new(r"\\?\C:\Users\x")),
+            r"C:\Users\x"
+        );
+        assert_eq!(
+            ordinary_spelling(Path::new(r"\\?\UNC\server\share\x")),
+            r"\\server\share\x"
+        );
+        assert_eq!(ordinary_spelling(Path::new("/home/x")), "/home/x");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_checkout_found_from_the_crate_root_keeps_cargos_spelling() {
+        use std::os::unix::fs::symlink;
+
+        // The checkout is reached through an alias (a symlink here, an 8.3
+        // name on Windows); the working directory is outside it.
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real checkout");
+        fs::create_dir_all(real.join(".git")).unwrap();
+        fs::create_dir_all(real.join("ui")).unwrap();
+        fs::write(real.join("ui/wrong.rs"), "").unwrap();
+        let alias = temp.path().join("alias");
+        symlink(&real, &alias).unwrap();
+        let elsewhere = temp.path().join("target/tests/trybuild/ui");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let source = alias.join("ui/wrong.rs");
+        let checkout = compile_checkout(&elsewhere, Some(&source)).unwrap();
+        assert_eq!(checkout, real.canonicalize().unwrap());
+        assert_eq!(
+            source_spelling(&elsewhere, Some(&source), &checkout),
+            Some(alias)
+        );
+        assert_eq!(compile_checkout(&elsewhere, None), None);
     }
 
     #[test]

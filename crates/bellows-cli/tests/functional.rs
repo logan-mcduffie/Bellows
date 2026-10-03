@@ -1849,6 +1849,72 @@ fn diagnostics_quote_restored_dependency_sources_like_plain_cargo() {
 }
 
 #[test]
+fn diagnostics_quote_checkout_sources_from_a_project_outside_the_checkout() {
+    // Like trybuild with a target directory outside the checkout: Cargo runs
+    // the consumer from a generated project there, but its crate root and the
+    // path dependency it quotes live in the checkout.
+    let f = Fixture::new("", "");
+    write_files(
+        &f.workspace,
+        &[
+            (
+                "engine/Cargo.toml",
+                "[package]\nname=\"engine\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[workspace]\n",
+            ),
+            (
+                "engine/src/lib.rs",
+                "pub struct Server;\npub trait Side {}\nimpl Side for Server {}\npub fn register<S: Side>() {}\n",
+            ),
+            (
+                "ui/wrong.rs",
+                "pub fn wrong() { engine::register::<u8>(); }\n",
+            ),
+        ],
+    );
+    let outside = f.temp.path().join("target outside/tests/trybuild/ui");
+    let path = |p: &std::path::Path| p.display().to_string().replace('\\', "/");
+    write_files(
+        &outside,
+        &[(
+            "Cargo.toml",
+            &format!(
+                "[package]\nname=\"ui\"\nversion=\"0.1.0\"\nedition=\"2024\"\n[lib]\npath=\"{}\"\n[dependencies]\nengine={{path=\"{}\"}}\n[workspace]\n",
+                path(&f.workspace.join("ui/wrong.rs")),
+                path(&f.workspace.join("engine")),
+            ),
+        )],
+    );
+    let build = |command: &mut Command, target: &str| {
+        command
+            .args(["build", "--offline", "--manifest-path"])
+            .arg(outside.join("Cargo.toml"))
+            .env("CARGO_TARGET_DIR", f.temp.path().join(target))
+            .output()
+            .unwrap()
+    };
+    let diagnostic = |output: &Output| {
+        let text = stderr(output);
+        let start = text.find("error[E0277]").expect(&text);
+        let end = text[start..]
+            .find("\n\n")
+            .map_or(text.len(), |end| start + end);
+        text[start..end].to_owned()
+    };
+    let bellows = build(f.local().arg("cargo"), "target outside");
+    let plain = build(&mut f.command("cargo"), "plain target");
+    let log = stderr(&bellows);
+    assert_eq!(diagnostic(&bellows), diagnostic(&plain), "{log}");
+    assert!(
+        diagnostic(&bellows).contains("pub fn register<S: Side>()"),
+        "{log}"
+    );
+    assert!(
+        !log.contains("/bellows/") && !log.contains("trybuild/ui/engine"),
+        "{log}"
+    );
+}
+
+#[test]
 fn sessions_launched_from_subdirectories_never_share_another_checkouts_inputs() {
     // Like manifold-mod-macros: a build script bakes the absolute path of a
     // sibling data tree (its WIT files), and the macro reads that path while

@@ -2034,7 +2034,14 @@ fn source_spelling(workspace: &Path, source: Option<&Path>, root: &Path) -> Opti
     let given = absolute_path(source?, workspace);
     let canonical = canonical_base(given.clone());
     let depth = canonical.strip_prefix(root).ok()?.components().count();
-    given.ancestors().nth(depth).map(Path::to_path_buf)
+    let spelling = given.ancestors().nth(depth)?.to_string_lossy().into_owned();
+    // A manifest path may use `/` on Windows; rustc spells the checkout's
+    // files (compiled from inside it) with native separators.
+    Some(PathBuf::from(if cfg!(windows) {
+        spelling.replace('/', "\\")
+    } else {
+        spelling
+    }))
 }
 
 fn git_root(dir: &Path) -> Option<PathBuf> {

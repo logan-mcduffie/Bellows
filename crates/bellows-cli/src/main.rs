@@ -1949,7 +1949,9 @@ fn root_bases(workspace: &Path, out_dir: &Path, source: Option<&Path>) -> Vec<(S
     if let Some(checkout) = compile_checkout(workspace, source)
         && checkout != workspace
     {
-        if let Some(given) = given_spelling(workspace, &checkout) {
+        if let Some(given) = given_spelling(workspace, &checkout)
+            .or_else(|| source_spelling(workspace, source, &checkout))
+        {
             bases.push(("$CHECKOUT".into(), given));
         }
         bases.push(("$CHECKOUT".into(), checkout));
@@ -2022,6 +2024,17 @@ fn compile_checkout(workspace: &Path, source: Option<&Path>) -> Option<PathBuf> 
         let dir = absolute_path(source, workspace);
         checkout_root(dir.parent()?)
     })
+}
+
+/// Cargo's spelling of `root` (a checkout found from the crate root, not the
+/// working directory): the matching ancestor of the crate root as Cargo
+/// passed it, which may keep a Windows 8.3 name or a symlink that the
+/// canonical `root` has resolved.
+fn source_spelling(workspace: &Path, source: Option<&Path>, root: &Path) -> Option<PathBuf> {
+    let given = absolute_path(source?, workspace);
+    let canonical = canonical_base(given.clone());
+    let depth = canonical.strip_prefix(root).ok()?.components().count();
+    given.ancestors().nth(depth).map(Path::to_path_buf)
 }
 
 fn git_root(dir: &Path) -> Option<PathBuf> {
@@ -5242,6 +5255,32 @@ mod tests {
         fs::create_dir(&real).unwrap();
         symlink(&real, &alias).unwrap();
         assert_eq!(canonical_base(alias), real.canonicalize().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_checkout_found_from_the_crate_root_keeps_cargos_spelling() {
+        use std::os::unix::fs::symlink;
+
+        // The checkout is reached through an alias (a symlink here, an 8.3
+        // name on Windows); the working directory is outside it.
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("real checkout");
+        fs::create_dir_all(real.join(".git")).unwrap();
+        fs::create_dir_all(real.join("ui")).unwrap();
+        fs::write(real.join("ui/wrong.rs"), "").unwrap();
+        let alias = temp.path().join("alias");
+        symlink(&real, &alias).unwrap();
+        let elsewhere = temp.path().join("target/tests/trybuild/ui");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let source = alias.join("ui/wrong.rs");
+        let checkout = compile_checkout(&elsewhere, Some(&source)).unwrap();
+        assert_eq!(checkout, real.canonicalize().unwrap());
+        assert_eq!(
+            source_spelling(&elsewhere, Some(&source), &checkout),
+            Some(alias)
+        );
+        assert_eq!(compile_checkout(&elsewhere, None), None);
     }
 
     #[test]

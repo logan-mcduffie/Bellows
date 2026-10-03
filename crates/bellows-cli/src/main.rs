@@ -543,6 +543,23 @@ fn run_command(server: String, token: Option<String>, command: Vec<OsString>) ->
             "{}",
             terminal::attention(terminal::stderr_color(), "server unreachable", message)
         );
+    } else {
+        // The server answered at the start but stopped during the build (a
+        // restart, say): say so once, whatever the output mode.
+        let lost = session.remote_fallbacks();
+        if lost > 0 {
+            eprintln!(
+                "{}",
+                terminal::attention(
+                    terminal::stderr_color(),
+                    "server unreachable",
+                    &format!(
+                        "{server} stopped answering during this build: {lost} compile(s) fell back to \
+                         plain, uncached rustc. `bellows doctor` checks it"
+                    ),
+                )
+            );
+        }
     }
     Ok(result?.code().unwrap_or(1))
 }

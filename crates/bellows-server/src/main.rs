@@ -167,7 +167,12 @@ async fn serve() -> Result<()> {
     if args.enable_execution {
         PlatformIdentity::detect().context("detect remote executor toolchain")?;
     }
-    let store = Store::open(&args.data_dir)?;
+    // `Store::open` walks the whole store for orphaned temporaries before
+    // returning; on a large store that kept the socket closed for about a
+    // minute (#33). Open without the walk, listen, then clean up in the
+    // background (it only removes temporaries an hour old or more, which no
+    // live write still owns).
+    let store = Store::open_for_access(&args.data_dir)?;
     store
         .check_writable()
         .context("verify writable server data directory")?;
@@ -241,6 +246,20 @@ async fn serve() -> Result<()> {
         env!("CARGO_PKG_VERSION"),
         args.listen
     );
+    let cleanup = Store::open_for_access(&args.data_dir)?;
+    tokio::task::spawn_blocking(move || {
+        // Tests stand in a slow walk for a large store (debug builds only).
+        if cfg!(debug_assertions)
+            && let Some(ms) = std::env::var("BELLOWSD_TEST_CLEANUP_DELAY_MS")
+                .ok()
+                .and_then(|ms| ms.parse().ok())
+        {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
+        if let Err(error) = cleanup.remove_orphan_temps() {
+            eprintln!("bellowsd: removing orphaned temporary files failed: {error:#}");
+        }
+    });
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;

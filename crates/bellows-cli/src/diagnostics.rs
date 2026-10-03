@@ -549,6 +549,23 @@ impl BuildSession {
             .env("BELLOWS_SESSION_ID", &self.id)
             .env("BELLOWS_EVENT_LOG", &self.log);
     }
+    /// Compiles in this session that fell back to plain rustc because the
+    /// server stopped answering after the session started.
+    pub fn remote_fallbacks(&self) -> usize {
+        read_log(&self.log)
+            .map(|events| {
+                events
+                    .iter()
+                    .filter(|e| {
+                        e.session_id.as_ref() == Some(&self.id)
+                            && e.kind == "fallback"
+                            && e.detail.starts_with("remote unavailable")
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     pub fn finish(&self, code: i32) {
         self.event(
             "build_end",

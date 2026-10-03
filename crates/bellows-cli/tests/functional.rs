@@ -2038,6 +2038,45 @@ fn collection_dry_runs_change_nothing_and_reuse_is_journaled() {
 }
 
 #[test]
+fn a_server_lost_during_a_build_is_reported_once() {
+    let f = Fixture::new(
+        "pub fn value() -> u32 { 42 }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    // A server that answers the session's health check, then goes away (a
+    // bellowsd restart mid-build).
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0u8; 4096];
+        let _ = stream.read(&mut request);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .unwrap();
+    });
+    let output = checked(f.command(BELLOWS).args([
+        "run",
+        "--server",
+        &format!("http://127.0.0.1:{port}"),
+        "--",
+        "cargo",
+        "build",
+        "--release",
+        "--offline",
+    ]));
+    server.join().unwrap();
+    let text = stderr(&output);
+    assert_eq!(
+        text.matches("stopped answering during this build").count(),
+        1,
+        "one warning for the session: {text}"
+    );
+    assert_eq!(f.value("target"), "42");
+}
+
+#[test]
 fn an_unreachable_server_is_reported_loudly_and_can_be_required() {
     let f = Fixture::new(
         "pub fn value() -> u32 { 42 }",

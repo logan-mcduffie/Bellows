@@ -721,6 +721,13 @@ impl Store {
         Self::open_inner(root.into(), false)
     }
 
+    /// Remove orphaned temporary files (an hour old or more) left by interrupted
+    /// writes. This walks the whole store: a service runs it in the background,
+    /// never before it starts answering.
+    pub fn remove_orphan_temps(&self) -> Result<()> {
+        cleanup_orphan_temps(&self.root, Duration::from_secs(60 * 60))
+    }
+
     fn open_inner(root: PathBuf, cleanup_temps: bool) -> Result<Self> {
         ensure_directory(&root)?;
         ensure_directory(&root.join("blobs"))?;

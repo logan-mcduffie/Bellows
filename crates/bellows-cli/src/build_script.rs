@@ -357,8 +357,9 @@ fn cached_run(
 fn identity(real: &Path, args: &[OsString], out_dir: &Path, crate_name: &str) -> Result<Identity> {
     // Cargo runs build scripts in the package directory.
     let workspace = env::current_dir()?.canonicalize()?;
-    let normalizer = normalizer(&workspace, out_dir);
-    let root_normalizer = PathNormalizer::new(root_bases(&workspace, out_dir));
+    // Cargo runs build scripts in their package directory, inside its checkout.
+    let normalizer = normalizer(&workspace, out_dir, None);
+    let root_normalizer = PathNormalizer::new(root_bases(&workspace, out_dir, None));
     let digests = super::digests::Digests::new(&state_dir(&workspace));
     let mut hasher = blake3::Hasher::new();
     hash_field(

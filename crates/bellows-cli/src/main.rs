@@ -1919,8 +1919,8 @@ fn passthrough(raw: &[OsString]) -> Result<ExitStatus> {
     Ok(Command::new(rustc).args(args).status()?)
 }
 
-fn normalizer(workspace: &Path, out_dir: &Path) -> PathNormalizer {
-    let mut bases = root_bases(workspace, out_dir);
+fn normalizer(workspace: &Path, out_dir: &Path, source: Option<&Path>) -> PathNormalizer {
+    let mut bases = root_bases(workspace, out_dir, source);
     let home = bellows_core::user_home();
     if let Some(cargo_home) = env::var_os("CARGO_HOME")
         .map(PathBuf::from)
@@ -1936,7 +1936,9 @@ fn normalizer(workspace: &Path, out_dir: &Path) -> PathNormalizer {
 }
 
 /// The per-checkout roots: the workspace and the Cargo target directory.
-fn root_bases(workspace: &Path, out_dir: &Path) -> Vec<(String, PathBuf)> {
+/// `source` is the compile's crate root, which locates its checkout when the
+/// working directory lies outside one (see `compile_checkout`).
+fn root_bases(workspace: &Path, out_dir: &Path, source: Option<&Path>) -> Vec<(String, PathBuf)> {
     let target = target_root(workspace, out_dir);
     let mut bases = vec![("$WORKSPACE".into(), workspace.to_path_buf())];
     // The source checkout containing this compile. Nested Cargo builds and
@@ -1944,7 +1946,7 @@ fn root_bases(workspace: &Path, out_dir: &Path) -> Vec<(String, PathBuf)> {
     // baking) paths elsewhere in the checkout. It is found from the source
     // tree, never from where `bellows run` happened to be launched: a session
     // started in a crate subdirectory must not shrink the checkout.
-    if let Some(checkout) = checkout_root(workspace)
+    if let Some(checkout) = compile_checkout(workspace, source)
         && checkout != workspace
     {
         if let Some(given) = given_spelling(workspace, &checkout) {
@@ -2004,6 +2006,21 @@ fn checkout_root(dir: &Path) -> Option<PathBuf> {
             .filter(|launch| launch.is_absolute())
             .map(canonical_base)
             .filter(|launch| dir.starts_with(launch))
+    })
+}
+
+/// The checkout a compile belongs to: the one containing its working
+/// directory, or else the one containing its crate root. Cargo may run rustc
+/// from a directory outside every checkout (trybuild's generated project in a
+/// target directory that lives elsewhere) for a crate whose sources and path
+/// dependencies are in one; `/bellows/checkout` must still name that checkout,
+/// or the dependency paths its metadata carries resolve against the wrong
+/// directory in diagnostics.
+fn compile_checkout(workspace: &Path, source: Option<&Path>) -> Option<PathBuf> {
+    checkout_root(workspace).or_else(|| {
+        let source = source?;
+        let dir = absolute_path(source, workspace);
+        checkout_root(dir.parent()?)
     })
 }
 
@@ -2192,8 +2209,10 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
     // rustc arguments and dep-info belong to that invocation's working dir,
     // not the parent Bellows session's launch directory.
     let workspace = env::current_dir()?.canonicalize()?;
-    let normalizer = normalizer(&workspace, &invocation.out_dir);
-    let root_normalizer = PathNormalizer::new(root_bases(&workspace, &invocation.out_dir));
+    let crate_root = invocation.explicit_inputs.first().map(PathBuf::as_path);
+    let normalizer = normalizer(&workspace, &invocation.out_dir, crate_root);
+    let root_normalizer =
+        PathNormalizer::new(root_bases(&workspace, &invocation.out_dir, crate_root));
     let digests = digests::Digests::new(&state_dir(&workspace));
     let compiler = compiler_identity(&invocation.rustc, &state_dir(&workspace))?;
     let normalized_args = normalized_compiler_arguments(invocation, &normalizer);
@@ -2295,7 +2314,7 @@ fn build_identity(invocation: &Invocation) -> Result<Identity> {
     let virtual_env = stable_empty_directories(invocation, &root_normalizer);
     Ok(Identity {
         diagnostic_width: diagnostic_width(&invocation.args),
-        checkout: checkout_root(&workspace),
+        checkout: compile_checkout(&workspace, crate_root),
         virtual_env,
         fingerprint: diagnostics::Fingerprint {
             key: static_key.clone(),

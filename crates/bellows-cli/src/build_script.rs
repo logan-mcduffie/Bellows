@@ -11,7 +11,9 @@
 //! as one Cargo would skip in an existing target directory: the script
 //! binary, `$RUSTC -vV`, the C/C++ drivers, the relevant environment, the
 //! `rerun-if-changed` paths (or the whole package when none are declared)
-//! and the `rerun-if-env-changed` values. Other host tools a script runs are
+//! and the `rerun-if-env-changed` values. A directory input counts by its
+//! recursive listing as well as its files' contents: Cargo reruns a script
+//! when a file appears in or disappears from a watched directory. Other host tools a script runs are
 //! part of the trusted toolchain boundary, as for declared actions. Only runs
 //! that start from an empty `OUT_DIR` are published.
 use super::{
@@ -38,6 +40,11 @@ pub static SILENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 const RECORD: &str = ".bellows-build-script.json";
 const REAL_PREFIX: &str = ".bellows-real-";
 const TREE: &str = "out-dir.tree";
+/// Environment-input prefix for the listing of a directory that is itself a
+/// normalized root (the package directory of a script that declares no
+/// inputs, or `rerun-if-changed=.`): a bare `$WORKSPACE` is not a valid
+/// input path, so its listing is computed at lookup like a virtual variable.
+const LISTING_PREFIX: &str = "BELLOWS_LISTING:";
 const TREE_MAGIC: &[u8] = b"BELLOWS-TREE-1\n";
 /// Larger trees are regenerated rather than stored.
 const MAX_TREE_BYTES: u64 = 512 * 1024 * 1024;
@@ -179,7 +186,7 @@ fn cached_run(
     out_dir: &Path,
     crate_name: &str,
 ) -> Result<ExitStatus> {
-    let identity = identity(real, args, out_dir, crate_name)?;
+    let mut identity = identity(real, args, out_dir, crate_name)?;
     let stores = stores(&identity.workspace);
     let mut reasons = Vec::new();
     let mut lookups = Vec::new();
@@ -196,6 +203,19 @@ fn cached_run(
         .map(|remote| remote.candidates(&identity.static_key))
     {
         lookups.push((index, true));
+    }
+    // Root directory listings the candidates were recorded with, as of now.
+    for (index, _) in &lookups {
+        for input in index.candidates.iter().flat_map(|c| &c.env) {
+            if let Some(root) = input.name.strip_prefix(LISTING_PREFIX)
+                && !identity.virtual_env.contains_key(&input.name)
+            {
+                let path = PathBuf::from(identity.normalizer.localize(root));
+                if let Ok(digest) = directory_listing_digest(&path) {
+                    identity.virtual_env.insert(input.name.clone(), digest);
+                }
+            }
+        }
     }
     for (index, remote) in lookups {
         for candidate in &index.candidates {
@@ -346,7 +366,9 @@ fn identity(real: &Path, args: &[OsString], out_dir: &Path, crate_name: &str) ->
         "protocol",
         PROTOCOL_VERSION.to_string().as_bytes(),
     );
-    hash_field(&mut hasher, "kind", b"build-script-run-v1");
+    // v2: directory inputs record their listing. A v1 record lists only the
+    // files that existed when it was made, so it must never be found again.
+    hash_field(&mut hasher, "kind", b"build-script-run-v2");
     hash_field(&mut hasher, "script", digests.file(real)?.as_bytes());
     for arg in args {
         hash_field(&mut hasher, "arg", arg.to_string_lossy().as_bytes());
@@ -523,14 +545,67 @@ fn declared_inputs(stdout: &[u8]) -> (Vec<String>, Vec<String>) {
     (files, environment)
 }
 
+/// A directory the input walk skips: build output and VCS metadata.
+fn skipped_directory(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name == "target" || name == ".git")
+        || is_cache_directory(path)
+}
+
+/// The digest of a directory input's recursive listing (relative path and
+/// kind of every entry the input walk visits), so that adding, removing or
+/// renaming a file changes the key even though no recorded file changed.
+/// Domain-separated from file digests.
+pub(crate) fn directory_listing_digest(root: &Path) -> Result<String> {
+    fn walk(root: &Path, dir: &Path, entries: &mut Vec<String>) -> Result<()> {
+        if skipped_directory(dir) {
+            return Ok(());
+        }
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            let relative = path
+                .strip_prefix(root)?
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            let kind = fs::symlink_metadata(&path)?.file_type();
+            if kind.is_dir() {
+                entries.push(format!("d {relative}"));
+                walk(root, &path, entries)?;
+            } else if kind.is_symlink() {
+                entries.push(format!("l {relative}"));
+            } else {
+                entries.push(format!("f {relative}"));
+            }
+        }
+        Ok(())
+    }
+    let mut entries = Vec::new();
+    walk(root, root, &mut entries)?;
+    entries.sort();
+    let mut listing = b"bellows-directory-listing-v1\0".to_vec();
+    for entry in entries {
+        listing.extend_from_slice(entry.as_bytes());
+        listing.push(0);
+    }
+    Ok(digest_bytes(&listing))
+}
+
+/// The digest a recorded input path is checked against: a directory's
+/// listing, or a file's contents.
+pub(crate) fn input_digest(digests: &super::digests::Digests, path: &Path) -> Result<String> {
+    if fs::symlink_metadata(path)?.is_dir() {
+        directory_listing_digest(path)
+    } else {
+        digests.file(path)
+    }
+}
+
 fn walk_inputs(path: &Path, files: &mut BTreeSet<PathBuf>) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.is_dir() {
-        if path
-            .file_name()
-            .is_some_and(|name| name == "target" || name == ".git")
-            || is_cache_directory(path)
-        {
+        if skipped_directory(path) {
             return Ok(());
         }
         for entry in fs::read_dir(path)? {
@@ -573,6 +648,7 @@ fn capture(
     let mut paths = BTreeSet::new();
     if declared_files.is_empty() {
         walk_inputs(&identity.workspace, &mut paths)?;
+        paths.insert(identity.workspace.clone());
     } else {
         for declared in &declared_files {
             let path = identity.workspace.join(declared);
@@ -582,13 +658,29 @@ fn capture(
                 ))));
             }
             walk_inputs(&path, &mut paths)?;
+            if fs::symlink_metadata(&path)?.is_dir() {
+                // The directory itself, by listing: see `directory_listing_digest`.
+                paths.insert(path);
+            }
         }
     }
     let mut files = Vec::new();
     let mut host_files = Vec::new();
+    let mut listings = Vec::new();
     for path in paths {
         let absolute = path.canonicalize().unwrap_or(path);
         let normalized = identity.normalizer.normalize(&absolute.to_string_lossy());
+        if normalized.starts_with('$')
+            && bellows_core::validate_normalized_input_path(&normalized).is_err()
+            && fs::symlink_metadata(&absolute)?.is_dir()
+        {
+            let digest = directory_listing_digest(&absolute)?;
+            listings.push(EnvInput::capture(
+                format!("{LISTING_PREFIX}{normalized}"),
+                Some(&digest),
+            ));
+            continue;
+        }
         if super::outside_checkout_roots(&normalized)
             && super::foreign_checkout(&absolute, identity.checkout.as_deref())
         {
@@ -597,7 +689,7 @@ fn capture(
                 absolute.display()
             ))));
         }
-        let digest = identity.digests.file(&absolute)?;
+        let digest = input_digest(&identity.digests, &absolute)?;
         if bellows_core::validate_normalized_input_path(&normalized).is_ok() {
             files.push(FileInput {
                 path: normalized,
@@ -627,6 +719,7 @@ fn capture(
             }
             Err(_) => EnvInput::capture(name, None),
         })
+        .chain(listings)
         .collect::<Vec<_>>();
     env_inputs.extend(
         identity

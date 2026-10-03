@@ -1,7 +1,7 @@
 use bellows_core::PROTOCOL_VERSION;
 use serde_json::Value;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 const BELLOWS: &str = env!("CARGO_BIN_EXE_bellows");
@@ -1506,6 +1506,110 @@ fn build_script_runs_are_restored_and_track_declared_inputs() {
     fs::write(f.workspace.join("data.txt"), "11").unwrap();
     checked(f.command("cargo").args(["build", "--release", "--offline"]));
     assert_eq!(f.value("target"), "11");
+}
+
+/// A fixture whose build script reports how many entries `notes/` holds,
+/// declaring the directory (or nothing at all, which makes the whole package
+/// its input).
+fn notes_fixture(declare: bool) -> Fixture {
+    let f = Fixture::new(
+        "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    let rerun = if declare {
+        "    println!(\"cargo:rerun-if-changed=notes\");\n"
+    } else {
+        ""
+    };
+    write_files(
+        &f.workspace,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\nbuild=\"build.rs\"\n[workspace]\n",
+            ),
+            (
+                "build.rs",
+                &format!(
+                    "fn main() {{\n{rerun}    let count = std::fs::read_dir(\"notes\").unwrap().count();\n    let out = std::env::var(\"OUT_DIR\").unwrap();\n    std::fs::write(format!(\"{{out}}/generated.rs\"), format!(\"pub fn value() -> usize {{{{ {{count}} }}}}\")).unwrap();\n}}\n"
+                ),
+            ),
+        ],
+    );
+    fs::create_dir_all(f.workspace.join("notes")).unwrap();
+    f.lock();
+    f
+}
+
+/// Build a fresh checkout after `change`; the script's value and its cache
+/// decision there.
+fn notes_checkout(f: &mut Fixture, name: &str, change: impl FnOnce(&Path)) -> (String, String) {
+    second_checkout(f, name);
+    change(&f.workspace.join("notes"));
+    let before = events(f).len();
+    f.build();
+    let decision = events(f)[before..]
+        .iter()
+        .filter(|e| e.crate_name == "build-script:fixture")
+        .map(|e| e.kind.clone())
+        .next()
+        .expect("a build-script decision");
+    (f.value("target"), decision)
+}
+
+#[test]
+fn build_script_directory_inputs_track_added_removed_and_renamed_files() {
+    let mut f = notes_fixture(true);
+    // Recorded with an empty watched directory, as manifold-net-protocol's
+    // protocol-bumps/ once was.
+    f.build();
+    assert_eq!(f.value("target"), "0");
+    let add = |notes: &Path| fs::write(notes.join("a.toml"), "").unwrap();
+    assert_eq!(
+        notes_checkout(&mut f, "added", add),
+        ("1".into(), "miss".into())
+    );
+    let rename = |notes: &Path| fs::rename(notes.join("a.toml"), notes.join("b.toml")).unwrap();
+    assert_eq!(
+        notes_checkout(&mut f, "renamed", rename),
+        ("1".into(), "miss".into())
+    );
+    let add_c = |notes: &Path| fs::write(notes.join("c.toml"), "").unwrap();
+    assert_eq!(
+        notes_checkout(&mut f, "two", add_c),
+        ("2".into(), "miss".into())
+    );
+    let remove = |notes: &Path| fs::remove_file(notes.join("b.toml")).unwrap();
+    assert_eq!(
+        notes_checkout(&mut f, "removed", remove),
+        ("1".into(), "miss".into())
+    );
+    let nested = |notes: &Path| fs::create_dir(notes.join("drafts")).unwrap();
+    assert_eq!(
+        notes_checkout(&mut f, "nested", nested),
+        ("2".into(), "miss".into())
+    );
+    // An unchanged directory is still a hit.
+    assert_eq!(
+        notes_checkout(&mut f, "same", |_| ()),
+        ("2".into(), "l1_hit".into())
+    );
+}
+
+#[test]
+fn build_scripts_without_declared_inputs_track_new_package_files() {
+    let mut f = notes_fixture(false);
+    f.build();
+    assert_eq!(f.value("target"), "0");
+    let add = |notes: &Path| fs::write(notes.join("a.toml"), "").unwrap();
+    assert_eq!(
+        notes_checkout(&mut f, "added", add),
+        ("1".into(), "miss".into())
+    );
+    assert_eq!(
+        notes_checkout(&mut f, "same", |_| ()),
+        ("1".into(), "l1_hit".into())
+    );
 }
 
 #[test]

@@ -2300,3 +2300,53 @@ fn undeclared_build_script_inputs_are_judged_by_the_package_listing() {
         "{removed:?}"
     );
 }
+
+/// A build script that declares no inputs is keyed by every file in its
+/// package directory, by content, not only by the directory's listing: an
+/// in-place edit with an unchanged listing reruns it.
+#[test]
+fn undeclared_build_script_inputs_track_content_edits() {
+    let mut f = Fixture::new(
+        "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    write_files(
+        &f.workspace,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\nbuild=\"build.rs\"\n[workspace]\n",
+            ),
+            ("data.txt", "7"),
+            (
+                "build.rs",
+                "fn main() {\n    let value = std::fs::read_to_string(\"data.txt\").unwrap();\n    let out = std::env::var(\"OUT_DIR\").unwrap();\n    std::fs::write(format!(\"{out}/generated.rs\"), format!(\"pub fn value() -> u32 {{ {} }}\", value.trim())).unwrap();\n}\n",
+            ),
+        ],
+    );
+    f.lock();
+    let script = |f: &Fixture, before: usize| {
+        events(f)[before..]
+            .iter()
+            .filter(|e| e.crate_name == "build-script:fixture")
+            .map(|e| e.kind.clone())
+            .next()
+            .expect("a build-script decision")
+    };
+    f.build();
+    assert_eq!(f.value("target"), "7");
+    // Same listing, new content.
+    second_checkout(&mut f, "edited");
+    fs::write(f.workspace.join("data.txt"), "9").unwrap();
+    let before = events(&f).len();
+    f.build();
+    assert_eq!(script(&f, before), "miss");
+    assert_eq!(f.value("target"), "9");
+    // The edited content is itself reusable.
+    second_checkout(&mut f, "edited again");
+    fs::write(f.workspace.join("data.txt"), "9").unwrap();
+    let before = events(&f).len();
+    f.build();
+    assert_eq!(script(&f, before), "l1_hit");
+    assert_eq!(f.value("target"), "9");
+}

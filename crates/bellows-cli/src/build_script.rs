@@ -284,6 +284,11 @@ fn cached_run(
     );
 
     let fresh = tree_is_empty(out_dir)?;
+    // A script that declares no inputs is recorded against its whole package
+    // directory. Cargo creates `target` there during a fresh checkout's first
+    // build, which moves the directory's timestamp without changing its
+    // listing; compare that listing instead (see `capture`).
+    let package_listing = directory_listing_digest(&identity.workspace).ok();
     let started = std::time::SystemTime::now();
     let mut child = Command::new(real)
         .args(args)
@@ -312,7 +317,15 @@ fn cached_run(
     } else if env::var("BELLOWS_READ_ONLY").as_deref() == Ok("1") {
         return Ok(status);
     } else {
-        capture(&identity, out_dir, &stdout, &stderr, crate_name, started)
+        capture(
+            &identity,
+            out_dir,
+            &stdout,
+            &stderr,
+            crate_name,
+            started,
+            package_listing.as_deref(),
+        )
     };
     match captured {
         Ok((candidate, blobs, pinned)) => {
@@ -633,6 +646,7 @@ fn capture(
     stderr: &[u8],
     crate_name: &str,
     started: std::time::SystemTime,
+    package_listing: Option<&str>,
 ) -> Result<Capture> {
     let tree = pack_tree(out_dir)?;
     let scanners = ["$CHECKOUT", "$WORKSPACE", "$TARGET"].map(|token| {
@@ -670,16 +684,28 @@ fn capture(
     let mut files = Vec::new();
     let mut host_files = Vec::new();
     let mut listings = Vec::new();
+    let package = identity
+        .workspace
+        .canonicalize()
+        .unwrap_or_else(|_| identity.workspace.clone());
     for path in paths {
         let absolute = path.canonicalize().unwrap_or(path);
         let normalized = identity.normalizer.normalize(&absolute.to_string_lossy());
         // As for compiler inputs (`changed_during_compile`): an input written
         // while the script ran may not be what it read. A directory's own
-        // timestamp moves when an entry is added or removed.
+        // timestamp moves when an entry is added or removed; the package
+        // directory is judged by its listing from before the run instead.
         let produced_by_cargo = ["$TARGET", "$PROFILE"]
             .iter()
             .any(|root| normalized.starts_with(root));
-        if !produced_by_cargo && super::changed_during_compile(&absolute, started) {
+        let changed = if absolute == package && absolute.is_dir() {
+            package_listing.is_none_or(|before| {
+                directory_listing_digest(&absolute).ok().as_deref() != Some(before)
+            })
+        } else {
+            !produced_by_cargo && super::changed_during_compile(&absolute, started)
+        };
+        if changed {
             return Err(anyhow::Error::new(NotStored(format!(
                 "{} changed while the build script ran",
                 absolute.display()

@@ -3178,6 +3178,27 @@ fn transform_dep_info(bytes: &[u8], normalizer: &PathNormalizer, localize: bool)
     .into_bytes()
 }
 
+/// Inputs whose writer always finishes before any unit that reads them starts,
+/// so a fresh timestamp says nothing about a change during the compile, and
+/// which no editor or checkout touches: Cargo's own outputs (dependency
+/// artifacts, build-script OUT_DIRs, written by earlier units under its
+/// target-dir lock), registry and git dependency sources (extracted from a
+/// checksum-verified archive or a pinned commit just before their first build,
+/// on a cold machine within milliseconds of it), and installed toolchains.
+pub(crate) fn written_before_its_readers(normalized: &str) -> bool {
+    let path = normalized.replace('\\', "/");
+    ["$TARGET", "$PROFILE"]
+        .iter()
+        .any(|root| path == *root || path.starts_with(&format!("{root}/")))
+        || [
+            "$CARGO_HOME/registry/src/",
+            "$CARGO_HOME/git/checkouts/",
+            "$RUSTUP_HOME/toolchains/",
+        ]
+        .iter()
+        .any(|root| path.starts_with(root))
+}
+
 /// Whether `path` may have changed after rustc read it. Inputs are hashed when
 /// rustc has finished; a file written during the compile (an editor save, a
 /// `git checkout` into the same worktree) would otherwise be recorded with the
@@ -3460,13 +3481,7 @@ fn capture_outputs(
                 absolute.display()
             )));
         }
-        // Cargo's own outputs (dependency artifacts, build-script OUT_DIRs)
-        // are written by earlier units of this build under its target-dir
-        // lock, and are complete before a unit that reads them starts.
-        let produced_by_cargo = ["$TARGET", "$PROFILE"]
-            .iter()
-            .any(|root| normalized.starts_with(root));
-        if !produced_by_cargo && changed_during_compile(absolute, started) {
+        if !written_before_its_readers(&normalized) && changed_during_compile(absolute, started) {
             return Err(not_stored(format!(
                 "{} changed during the compile",
                 absolute.display()
@@ -5714,6 +5729,34 @@ mod tests {
             validate_candidate(&candidate, &identity).unwrap_err(),
             format!("unsupported candidate protocol {}", PROTOCOL_VERSION - 1)
         );
+    }
+
+    #[test]
+    fn only_inputs_written_before_their_readers_skip_the_change_guard() {
+        for exempt in [
+            "$TARGET",
+            "$PROFILE/deps/libdep-abc.rlib",
+            "$TARGET/debug/build/x-1/out/gen.rs",
+            "$CARGO_HOME/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/build.rs",
+            "$CARGO_HOME\\registry\\src\\index.crates.io-1949cf8c6b5b557f\\serde-1.0.228\\build.rs",
+            "$CARGO_HOME/git/checkouts/dep-1234/abcdef0/src/lib.rs",
+            "$RUSTUP_HOME/toolchains/1.92.0-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core/src/lib.rs",
+        ] {
+            assert!(written_before_its_readers(exempt), "{exempt}");
+        }
+        for guarded in [
+            "$WORKSPACE/src/lib.rs",
+            "$CHECKOUT/crates/x/src/lib.rs",
+            // Elsewhere in Cargo's or rustup's home: config, credentials, the
+            // registry's archives and index, settings.
+            "$CARGO_HOME/config.toml",
+            "$CARGO_HOME/registry/cache/index.crates.io-1949cf8c6b5b557f/serde-1.0.228.crate",
+            "$RUSTUP_HOME/settings.toml",
+            "$TARGETS/x.rs",
+            "/abs/elsewhere/lib.rs",
+        ] {
+            assert!(!written_before_its_readers(guarded), "{guarded}");
+        }
     }
 
     #[test]

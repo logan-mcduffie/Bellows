@@ -695,15 +695,13 @@ fn capture(
         // while the script ran may not be what it read. A directory's own
         // timestamp moves when an entry is added or removed; the package
         // directory is judged by its listing from before the run instead.
-        let produced_by_cargo = ["$TARGET", "$PROFILE"]
-            .iter()
-            .any(|root| normalized.starts_with(root));
         let changed = if absolute == package && absolute.is_dir() {
             package_listing.is_none_or(|before| {
                 directory_listing_digest(&absolute).ok().as_deref() != Some(before)
             })
         } else {
-            !produced_by_cargo && super::changed_during_compile(&absolute, started)
+            !super::written_before_its_readers(&normalized)
+                && super::changed_during_compile(&absolute, started)
         };
         if changed {
             return Err(anyhow::Error::new(NotStored(format!(

@@ -253,25 +253,152 @@ fn advisory_runs_never_wait() {
         "advisory waited"
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ran");
-    assert!(String::from_utf8_lossy(&out.stderr).contains("running anyway"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("running UNLEASED on laptop"), "{stderr}");
+    assert!(stderr.contains("Recorded as `unleased`"), "{stderr}");
     wait_until("the advisory request to be withdrawn", || {
         daemon.log().contains("abandon")
     });
+    let unleased = log_events(&daemon, "unleased");
+    assert_eq!(unleased.len(), 1, "{}", daemon.log());
+    assert_eq!(unleased[0]["label"], "advisory");
+    assert!(unleased[0]["id"].is_u64(), "names the withdrawn request");
+    assert!(
+        unleased[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("held by \"holder\""),
+        "{}",
+        daemon.log()
+    );
     holder.kill().unwrap();
     holder.wait().unwrap();
 
-    // With the daemon down, an advisory run still runs.
+    // With the daemon down, an advisory run still runs, and the log still
+    // gets its entry.
     let socket = daemon.dir.path().join("nowhere.sock");
     let out = daemon
         .lease()
         .env("LEASE_SOCKET", &socket)
-        .env("LEASE_ADVISORY", "1")
         .args([
-            "run", "laptop", "--est", "1m", "--label", "down", "--", "true",
+            "run",
+            "laptop",
+            "--est",
+            "1m",
+            "--label",
+            "down",
+            "--advisory",
+            "--",
+            "true",
         ])
-        .status()
+        .output()
         .unwrap();
-    assert!(out.success());
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unreachable"), "{stderr}");
+    assert!(stderr.contains("Recorded as `unleased`"), "{stderr}");
+    let unleased = log_events(&daemon, "unleased");
+    assert_eq!(unleased.len(), 2, "{}", daemon.log());
+    assert_eq!(unleased[1]["label"], "down");
+}
+
+#[test]
+fn a_signal_ends_a_wait_at_once() {
+    let daemon = Daemon::start();
+    let started_file = daemon.dir.path().join("holder");
+    let mut holder = run_shell(
+        &daemon,
+        "holder",
+        &format!("touch {}; sleep 30", started_file.display()),
+    );
+    wait_until("the holder to start", || started_file.exists());
+    let mut waiter = run_shell(&daemon, "waiter", "true");
+    wait_until("the waiter to queue", || {
+        daemon.log().contains("\"label\":\"waiter\"")
+    });
+    let signalled = Instant::now();
+    // SAFETY: plain syscall on our own child.
+    unsafe {
+        libc::kill(waiter.id() as i32, libc::SIGTERM);
+    }
+    let status = waiter.wait().unwrap();
+    assert!(
+        signalled.elapsed() < Duration::from_secs(5),
+        "a queued client ignored SIGTERM"
+    );
+    assert_eq!(status.code(), Some(75));
+    wait_until("the request to be withdrawn", || {
+        daemon.log().contains("abandon")
+    });
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+}
+
+#[test]
+fn only_the_flag_makes_a_run_advisory() {
+    // An inherited LEASE_ADVISORY (or one a wrapper failed to clear) no longer
+    // lets a run skip the queue.
+    let daemon = Daemon::start();
+    let started_file = daemon.dir.path().join("holder");
+    let mut holder = run_shell(
+        &daemon,
+        "holder",
+        &format!("touch {}; sleep 30", started_file.display()),
+    );
+    wait_until("the holder to start", || started_file.exists());
+    let ran_file = daemon.dir.path().join("ran");
+    let mut waiter = daemon
+        .lease()
+        .env("LEASE_ADVISORY", "1")
+        .args(["run", "laptop", "--est", "1m", "--label", "waiter", "--"])
+        .args(["touch", ran_file.to_str().unwrap()])
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_until("the waiter to queue", || {
+        daemon.log().contains("\"label\":\"waiter\"")
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!ran_file.exists(), "LEASE_ADVISORY=1 skipped the queue");
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+    assert!(waiter.wait().unwrap().success());
+    assert!(ran_file.exists());
+    assert!(log_events(&daemon, "unleased").is_empty());
+}
+
+#[test]
+fn wrappers_record_runs_that_skip_the_lease() {
+    let daemon = Daemon::start();
+    let out = daemon
+        .lease()
+        .args(["unleased", "desktop", "--label", "pc-run x/y: cargo test"])
+        .args(["--reason", "LEASE_MODE=off"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("running UNLEASED on desktop"), "{stderr}");
+    let unleased = log_events(&daemon, "unleased");
+    assert_eq!(unleased.len(), 1, "{}", daemon.log());
+    assert_eq!(unleased[0]["machine"], "desktop");
+    assert_eq!(unleased[0]["detail"], "LEASE_MODE=off");
+    assert!(unleased[0]["id"].is_null());
+    let shown = daemon.lease().arg("log").output().unwrap();
+    let shown = String::from_utf8_lossy(&shown.stdout);
+    assert!(
+        shown.contains("unleased") && shown.contains("LEASE_MODE=off"),
+        "{shown}"
+    );
+}
+
+fn log_events(daemon: &Daemon, event: &str) -> Vec<serde_json::Value> {
+    daemon
+        .log()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|entry| entry["event"] == event)
+        .collect()
 }
 
 #[cfg(target_os = "linux")]

@@ -35,6 +35,15 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Record a command about to run on MACHINE without its lease (for
+    /// wrappers that skip the lease), and warn about it.
+    Unleased {
+        machine: String,
+        #[arg(long)]
+        label: String,
+        #[arg(long)]
+        reason: String,
+    },
     /// Note that a CI job started sharing a machine (from a runner hook).
     CiStart {
         machine: String,
@@ -77,8 +86,9 @@ struct RunArgs {
     #[arg(long)]
     label: String,
     /// Never wait: if the machine is busy or the daemon is down, run the
-    /// command anyway, unleased. For a trial rollout.
-    #[arg(long, env = "LEASE_ADVISORY", value_parser = clap::builder::BoolishValueParser::new())]
+    /// command anyway, unleased, with a warning and an `unleased` log entry.
+    /// Only this flag turns it on: no inherited environment variable does.
+    #[arg(long)]
     advisory: bool,
     #[arg(required = true, last = true)]
     command: Vec<String>,
@@ -143,6 +153,14 @@ fn run(command: Commands, socket: &Path) -> Result<i32> {
             } else {
                 print_status(&report);
             }
+            Ok(0)
+        }
+        Commands::Unleased {
+            machine,
+            label,
+            reason,
+        } => {
+            warn_unleased(socket, &machine, &label, None, &reason);
             Ok(0)
         }
         Commands::CiStart { machine, job } => simple(socket, &Hello::CiStart { machine, job }),
@@ -382,7 +400,8 @@ fn lease_and_run(socket: &Path, args: RunArgs, session: bool) -> Result<i32> {
     let mut stream = match connect(socket) {
         Ok(stream) => stream,
         Err(error) if args.advisory => {
-            eprintln!("lease: advisory: {error:#}; running unleased");
+            let reason = format!("advisory: the lease daemon is unreachable ({error:#})");
+            warn_unleased(socket, &args.machine, &args.label, None, &reason);
             return run_unleased(&args.command);
         }
         Err(error) => return Err(error),
@@ -407,29 +426,58 @@ fn lease_and_run(socket: &Path, args: RunArgs, session: bool) -> Result<i32> {
             libc::signal(signal, on_signal as *const () as libc::sighandler_t);
         }
     }
+    // While queued, wake regularly so a signal (^C, `timeout`) ends the wait:
+    // a blocking read is restarted after the handler runs, so would wait on.
+    stream.set_read_timeout(Some(Duration::from_millis(200)))?;
+    let mut line = Vec::new();
     let (id, jobs, session_token) = loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
-            eprintln!("lease: the daemon closed the connection before granting");
+        if SIGNAL.load(Ordering::SeqCst) != 0 {
+            eprintln!(
+                "lease: interrupted while waiting for {}; request withdrawn",
+                args.machine
+            );
             return Ok(EX_TEMPFAIL);
         }
-        match serde_json::from_str::<Reply>(&line)? {
+        // `read_until` keeps a partly read line across timeouts.
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) => {
+                eprintln!("lease: the daemon closed the connection before granting");
+                return Ok(EX_TEMPFAIL);
+            }
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        if !line.ends_with(b"\n") {
+            continue;
+        }
+        let reply = serde_json::from_slice::<Reply>(&line)?;
+        line.clear();
+        match reply {
             Reply::Queued {
                 id,
                 position,
                 holder,
             } if args.advisory => {
-                eprintln!(
-                    "lease: #{id} advisory: {} is busy (position {}{}); running anyway, unleased",
+                // Closing the connection withdraws the request.
+                drop(reader);
+                drop(stream);
+                let reason = format!(
+                    "advisory: {} is busy (position {}{})",
                     args.machine,
                     position + 1,
                     holder
                         .map(|label| format!(", held by {label:?}"))
                         .unwrap_or_default()
                 );
-                // Closing the connection withdraws the request.
-                drop(reader);
-                drop(stream);
+                warn_unleased(socket, &args.machine, &args.label, Some(id), &reason);
                 return run_unleased(&args.command);
             }
             Reply::Queued {
@@ -461,10 +509,8 @@ fn lease_and_run(socket: &Path, args: RunArgs, session: bool) -> Result<i32> {
             }
             _ => {}
         }
-        if SIGNAL.load(Ordering::SeqCst) != 0 {
-            return Ok(EX_TEMPFAIL);
-        }
     };
+    stream.set_read_timeout(None)?;
 
     let (program, rest) = args.command.split_first().context("missing command")?;
     let mut command = Command::new(program);
@@ -596,6 +642,62 @@ impl Drop for ForegroundTerminal {
             libc::tcsetpgrp(0, libc::getpgrp());
         }
     }
+}
+
+/// Says loudly that a command is about to share MACHINE with whoever holds
+/// it, and records that as `unleased` in the lease log: through the daemon,
+/// or, when it is down, by appending to its log directly.
+fn warn_unleased(socket: &Path, machine: &str, label: &str, id: Option<u64>, reason: &str) {
+    let recorded = exchange(
+        socket,
+        &Hello::Unleased {
+            machine: machine.to_owned(),
+            label: label.to_owned(),
+            id,
+            reason: reason.to_owned(),
+        },
+    )
+    .and_then(|reply| match reply {
+        Reply::Ok => Ok(()),
+        other => bail!("unexpected reply {other:?}"),
+    })
+    .or_else(|_| append_unleased(machine, label, id, reason));
+    let rule = "=".repeat(72);
+    eprintln!("lease: {rule}");
+    eprintln!("lease: WARNING: running UNLEASED on {machine}: {label}");
+    eprintln!("lease:   {reason}");
+    eprintln!("lease:   It competes with the lease holder for the machine; timeouts and");
+    eprintln!("lease:   slowness in this run are not evidence of a flake.");
+    match recorded {
+        Ok(()) => eprintln!("lease:   Recorded as `unleased` in `lease log`."),
+        Err(error) => eprintln!("lease:   NOT recorded in `lease log`: {error:#}"),
+    }
+    eprintln!("lease: {rule}");
+}
+
+fn append_unleased(machine: &str, label: &str, id: Option<u64>, reason: &str) -> Result<()> {
+    let state_dir = std::env::var_os("LEASE_STATE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_state_dir);
+    let mut line = serde_json::to_vec(&serde_json::json!({
+        "at_ms": now_ms(),
+        "event": "unleased",
+        "id": id,
+        "machine": machine,
+        "label": label,
+        "detail": reason,
+    }))?;
+    line.push(b'\n');
+    let path = state_dir.join("log.jsonl");
+    std::fs::create_dir_all(&state_dir)
+        .with_context(|| format!("create {}", state_dir.display()))?;
+    // One write of one line: appends from several writers do not interleave.
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut file| file.write_all(&line))
+        .with_context(|| format!("append to {}", path.display()))
 }
 
 /// Run the command as if no lease existed (advisory mode only).

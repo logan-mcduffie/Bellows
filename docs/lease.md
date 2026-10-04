@@ -35,9 +35,14 @@ only when `lease status` shows no holders: a restart ends every lease.
 `lease run` exits with the command's code, or 75 if the lease was refused or
 lost before the command ran.
 
-`--advisory` (or `LEASE_ADVISORY=1`) never waits: on a busy machine, or with
-the daemon down, the command runs anyway, unleased, and an abandoned request
-stays in the log. It exists for a trial rollout next to manual scheduling.
+`--advisory` never waits: on a busy machine, or with the daemon down, the
+command runs anyway, unleased. It says so on stderr in a banner and records an
+`unleased` entry in the log, which carries the reason and the withdrawn
+request's id. If the daemon is down, the client appends the entry to the log
+itself. Only the flag turns this on: the environment variable `LEASE_ADVISORY`
+no longer does, so an inherited setting cannot quietly skip the queue.
+Wrappers that skip the lease on purpose record the run with
+`lease unleased MACHINE --label TEXT --reason TEXT`.
 
 ## Sessions
 

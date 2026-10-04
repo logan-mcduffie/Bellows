@@ -211,6 +211,15 @@ async fn connection(shared: Arc<Shared>, stream: UnixStream) -> Result<()> {
             shared.changed.notify_waiters();
             send(&mut writer, &reply).await
         }
+        Hello::Unleased {
+            machine,
+            label,
+            id,
+            reason,
+        } => {
+            shared.log("unleased", id, Some(&machine), Some(&label), Some(reason));
+            send(&mut writer, &Reply::Ok).await
+        }
         Hello::Request(request) => lease(shared, request, lines, writer).await,
     }
 }

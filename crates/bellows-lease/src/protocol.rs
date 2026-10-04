@@ -21,6 +21,16 @@ pub enum Hello {
         secret: String,
         action: AdminAction,
     },
+    /// Note a command that runs on a machine without its lease (an advisory
+    /// run that did not wait, or a wrapper's `LEASE_MODE=off`).
+    Unleased {
+        machine: String,
+        label: String,
+        /// The request it withdrew, if it made one.
+        #[serde(default)]
+        id: Option<u64>,
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

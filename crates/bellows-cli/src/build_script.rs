@@ -284,6 +284,7 @@ fn cached_run(
     );
 
     let fresh = tree_is_empty(out_dir)?;
+    let started = std::time::SystemTime::now();
     let mut child = Command::new(real)
         .args(args)
         .stdout(Stdio::piped())
@@ -311,7 +312,7 @@ fn cached_run(
     } else if env::var("BELLOWS_READ_ONLY").as_deref() == Ok("1") {
         return Ok(status);
     } else {
-        capture(&identity, out_dir, &stdout, &stderr, crate_name)
+        capture(&identity, out_dir, &stdout, &stderr, crate_name, started)
     };
     match captured {
         Ok((candidate, blobs, pinned)) => {
@@ -631,6 +632,7 @@ fn capture(
     stdout: &[u8],
     stderr: &[u8],
     crate_name: &str,
+    started: std::time::SystemTime,
 ) -> Result<Capture> {
     let tree = pack_tree(out_dir)?;
     let scanners = ["$CHECKOUT", "$WORKSPACE", "$TARGET"].map(|token| {
@@ -671,6 +673,18 @@ fn capture(
     for path in paths {
         let absolute = path.canonicalize().unwrap_or(path);
         let normalized = identity.normalizer.normalize(&absolute.to_string_lossy());
+        // As for compiler inputs (`changed_during_compile`): an input written
+        // while the script ran may not be what it read. A directory's own
+        // timestamp moves when an entry is added or removed.
+        let produced_by_cargo = ["$TARGET", "$PROFILE"]
+            .iter()
+            .any(|root| normalized.starts_with(root));
+        if !produced_by_cargo && super::changed_during_compile(&absolute, started) {
+            return Err(anyhow::Error::new(NotStored(format!(
+                "{} changed while the build script ran",
+                absolute.display()
+            ))));
+        }
         if normalized.starts_with('$')
             && bellows_core::validate_normalized_input_path(&normalized).is_err()
             && fs::symlink_metadata(&absolute)?.is_dir()

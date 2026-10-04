@@ -165,6 +165,12 @@ the candidate manifest.
 
 A static command identity retains several dependency manifests, allowing old
 branches to become hits again. Every candidate is revalidated before restore.
+Inputs are hashed after rustc (or a build script) finishes, so a source,
+registry or toolchain file changed at or after the run started (an editor
+save, a `git checkout` into the same worktree) is never recorded with that
+result: the run stays local. Modification and change time both count, so a
+`cp -p` that keeps an old modification time is caught too. Files in the target directory are exempt; Cargo
+writes them under its target-dir lock before the units that read them start.
 Every output is scanned for the workspace, target, and session checkout paths
 after a remapped compile. A result that embeds one is pinned to that checkout;
 otherwise path-valued `env!` values compare relative to those roots, so

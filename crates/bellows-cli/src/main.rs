@@ -3178,6 +3178,106 @@ fn transform_dep_info(bytes: &[u8], normalizer: &PathNormalizer, localize: bool)
     .into_bytes()
 }
 
+/// Whether `path` may have changed after rustc read it. Inputs are hashed when
+/// rustc has finished; a file written during the compile (an editor save, a
+/// `git checkout` into the same worktree) would otherwise be recorded with the
+/// artifact compiled from its earlier content, and every later build of the new
+/// content would restore the old code. A safe miss: anything modified at or
+/// after the compile started, less the slack its timestamps need, is not
+/// stored. The change time (Unix ctime, NTFS ChangeTime) moves on every write
+/// or rename and no tool can set it, so it also catches a replacement that
+/// keeps an older modification time (`cp -p`, `rsync -t`, archive extraction).
+/// A timestamp that cannot be read counts as changed.
+fn changed_during_compile(path: &Path, started: std::time::SystemTime) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return true;
+    };
+    [metadata.modified().ok(), change_time(path, &metadata)]
+        .into_iter()
+        .any(|stamp| match stamp {
+            Some(stamp) => stamp >= started - timestamp_slack(stamp),
+            None => true,
+        })
+}
+
+#[cfg(unix)]
+fn change_time(_path: &Path, metadata: &fs::Metadata) -> Option<std::time::SystemTime> {
+    use std::os::unix::fs::MetadataExt;
+    let seconds = u64::try_from(metadata.ctime()).ok()?;
+    let nanos = u32::try_from(metadata.ctime_nsec()).ok()?;
+    Some(std::time::UNIX_EPOCH + Duration::new(seconds, nanos))
+}
+
+#[cfg(windows)]
+fn change_time(path: &Path, _metadata: &fs::Metadata) -> Option<std::time::SystemTime> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileBasicInfo {
+        creation_time: i64,
+        last_access_time: i64,
+        last_write_time: i64,
+        change_time: i64,
+        file_attributes: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandleEx(
+            file: *mut std::ffi::c_void,
+            class: i32,
+            information: *mut std::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000; // also opens directories
+    const FILE_BASIC_INFO_CLASS: i32 = 0;
+    // 100 ns intervals between 1601-01-01 and the Unix epoch.
+    const UNIX_EPOCH_AS_FILETIME: i64 = 116_444_736_000_000_000;
+    let file = fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .ok()?;
+    let mut info = FileBasicInfo::default();
+    // SAFETY: `file` is an open handle and `info` is a FILE_BASIC_INFO-sized
+    // buffer that outlives the call.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle().cast(),
+            FILE_BASIC_INFO_CLASS,
+            (&mut info as *mut FileBasicInfo).cast(),
+            std::mem::size_of::<FileBasicInfo>() as u32,
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let since_epoch = u64::try_from(info.change_time - UNIX_EPOCH_AS_FILETIME).ok()?;
+    Some(std::time::UNIX_EPOCH + Duration::from_nanos(since_epoch.checked_mul(100)?))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn change_time(_path: &Path, _metadata: &fs::Metadata) -> Option<std::time::SystemTime> {
+    None
+}
+
+/// How far a file timestamp may trail the clock. Kernels stamp files from a
+/// coarse clock (a scheduler tick on Linux, about 15.6 ms on Windows); some
+/// filesystems keep whole seconds (ext3, HFS+) or two (FAT), and their stamps
+/// have no sub-second part.
+fn timestamp_slack(stamp: std::time::SystemTime) -> Duration {
+    let whole_second = stamp
+        .duration_since(std::time::UNIX_EPOCH)
+        .is_ok_and(|since| since.subsec_nanos() == 0);
+    if whole_second {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_millis(50)
+    }
+}
+
 /// Outputs of a linked unit: every regular file named for this unit that
 /// rustc wrote during the compile. The predicted primary outputs must be
 /// among them; directory outputs (`.dSYM`) are not modeled.
@@ -3357,6 +3457,18 @@ fn capture_outputs(
         {
             return Err(not_stored(format!(
                 "reads {} from another checkout",
+                absolute.display()
+            )));
+        }
+        // Cargo's own outputs (dependency artifacts, build-script OUT_DIRs)
+        // are written by earlier units of this build under its target-dir
+        // lock, and are complete before a unit that reads them starts.
+        let produced_by_cargo = ["$TARGET", "$PROFILE"]
+            .iter()
+            .any(|root| normalized.starts_with(root));
+        if !produced_by_cargo && changed_during_compile(absolute, started) {
+            return Err(not_stored(format!(
+                "{} changed during the compile",
                 absolute.display()
             )));
         }
@@ -5637,7 +5749,8 @@ mod tests {
             &identity,
             stdout.clone(),
             stderr.clone(),
-            std::time::SystemTime::now(),
+            // The compile started after the source was written.
+            std::time::SystemTime::now() + Duration::from_secs(10),
             None,
         )
         .unwrap();

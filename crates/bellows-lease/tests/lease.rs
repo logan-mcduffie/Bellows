@@ -40,11 +40,17 @@ impl Daemon {
 
     fn lease(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_lease"));
+        // A test run under `lrun` or `lease hold` inherits that lease
+        // (LEASE_ID, LEASE_MACHINE, LEASE_ADVISORY, ...); a client that sees
+        // one runs at once as part of it, so these clients would never queue.
+        for (name, _) in std::env::vars_os() {
+            if name.to_string_lossy().starts_with("LEASE_") {
+                command.env_remove(name);
+            }
+        }
         command
             .env("LEASE_SOCKET", &self.socket)
-            .env("LEASE_STATE_DIR", &self.state)
-            .env_remove("LEASE_TOKEN")
-            .env_remove("LEASE_MACHINE");
+            .env("LEASE_STATE_DIR", &self.state);
         command
     }
 

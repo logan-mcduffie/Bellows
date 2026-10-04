@@ -2245,3 +2245,108 @@ fn a_build_script_input_edited_while_it_runs_is_never_stored() {
     f.build();
     assert_eq!(f.value("target"), "9");
 }
+
+/// A build script that declares no inputs is recorded against its whole
+/// package directory, judged by the directory's listing from before the run
+/// (Cargo creates `target` there just before, in a fresh checkout): a change
+/// that leaves the listing as it was keeps the result storable, and an entry
+/// removed meanwhile does not.
+#[test]
+fn undeclared_build_script_inputs_are_judged_by_the_package_listing() {
+    let run = |during: &str| {
+        let f = Fixture::new(
+            "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));",
+            "fn main() { println!(\"{}\", fixture::value()); }",
+        );
+        write_files(
+            &f.workspace,
+            &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\nbuild=\"build.rs\"\n[workspace]\n",
+                ),
+                ("spare.txt", "spare"),
+                (
+                    "build.rs",
+                    &format!(
+                        "fn main() {{\n    let out = std::env::var(\"OUT_DIR\").unwrap();\n    std::fs::write(format!(\"{{out}}/generated.rs\"), \"pub fn value() -> u32 {{ 1 }}\").unwrap();\n    {during}\n}}\n"
+                    ),
+                ),
+            ],
+        );
+        f.lock();
+        f.build();
+        events(&f)
+            .into_iter()
+            .filter(|e| e.crate_name == "build-script:fixture")
+            .map(|e| (e.kind, e.detail))
+            .collect::<Vec<_>>()
+    };
+    // The package directory's timestamp moves, its listing does not.
+    let unchanged = run(
+        "std::thread::sleep(std::time::Duration::from_millis(200)); std::fs::write(\"scratch.tmp\", \"\").unwrap(); std::fs::remove_file(\"scratch.tmp\").unwrap();",
+    );
+    assert!(
+        unchanged.iter().any(|(kind, _)| kind == "store"),
+        "{unchanged:?}"
+    );
+    // A package file disappears while the script runs.
+    let removed = run(
+        "std::thread::sleep(std::time::Duration::from_millis(200)); std::fs::remove_file(\"spare.txt\").unwrap();",
+    );
+    assert!(
+        removed.iter().any(|(kind, detail)| kind == "not_stored"
+            && detail.contains("changed while the build script ran")),
+        "{removed:?}"
+    );
+}
+
+/// A build script that declares no inputs is keyed by every file in its
+/// package directory, by content, not only by the directory's listing: an
+/// in-place edit with an unchanged listing reruns it.
+#[test]
+fn undeclared_build_script_inputs_track_content_edits() {
+    let mut f = Fixture::new(
+        "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    write_files(
+        &f.workspace,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\nbuild=\"build.rs\"\n[workspace]\n",
+            ),
+            ("data.txt", "7"),
+            (
+                "build.rs",
+                "fn main() {\n    let value = std::fs::read_to_string(\"data.txt\").unwrap();\n    let out = std::env::var(\"OUT_DIR\").unwrap();\n    std::fs::write(format!(\"{out}/generated.rs\"), format!(\"pub fn value() -> u32 {{ {} }}\", value.trim())).unwrap();\n}\n",
+            ),
+        ],
+    );
+    f.lock();
+    let script = |f: &Fixture, before: usize| {
+        events(f)[before..]
+            .iter()
+            .filter(|e| e.crate_name == "build-script:fixture")
+            .map(|e| e.kind.clone())
+            .next()
+            .expect("a build-script decision")
+    };
+    f.build();
+    assert_eq!(f.value("target"), "7");
+    // Same listing, new content.
+    second_checkout(&mut f, "edited");
+    fs::write(f.workspace.join("data.txt"), "9").unwrap();
+    let before = events(&f).len();
+    f.build();
+    assert_eq!(script(&f, before), "miss");
+    assert_eq!(f.value("target"), "9");
+    // The edited content is itself reusable.
+    second_checkout(&mut f, "edited again");
+    fs::write(f.workspace.join("data.txt"), "9").unwrap();
+    let before = events(&f).len();
+    f.build();
+    assert_eq!(script(&f, before), "l1_hit");
+    assert_eq!(f.value("target"), "9");
+}

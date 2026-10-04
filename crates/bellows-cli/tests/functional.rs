@@ -56,6 +56,7 @@ impl Fixture {
         cmd
     }
     fn local(&self) -> Command {
+        settle();
         let mut cmd = self.command(BELLOWS);
         cmd.args(["local", "--cache-dir"])
             .arg(&self.cache)
@@ -1000,9 +1001,9 @@ fn write_files(root: &std::path::Path, files: &[(&str, &str)]) {
 
 /// Copy the fixture's sources (not its target) into a sibling checkout.
 /// Let inputs written just now age past the slack within which Bellows treats
-/// a file as possibly changed during the compile (`changed_during_compile`):
-/// tests that call `bellows rustc` directly start compiling within milliseconds
-/// of writing their sources, unlike a cargo build.
+/// a file as possibly changed during the compile (`changed_during_compile`).
+/// Tests write a source and build within milliseconds, which no edit does;
+/// every `Fixture::local` invocation waits this long first.
 fn settle() {
     std::thread::sleep(std::time::Duration::from_millis(150));
 }
@@ -1189,7 +1190,6 @@ fn native_archive(f: &Fixture, value: i32) {
             "native/value.obj",
         ]));
     }
-    settle();
 }
 
 #[test]
@@ -1380,7 +1380,6 @@ fn restore_replaces_an_executable_that_is_still_running() {
             "--out-dir=out",
         ]))
     };
-    settle();
     assert_eq!(decisions(&link(), "app"), ["CACHE MISS"]);
     let binary = f
         .workspace
@@ -2119,13 +2118,12 @@ fn an_unreachable_server_is_reported_loudly_and_can_be_required() {
     assert!(stderr(&required).contains("BELLOWS_REQUIRE_SERVER"));
 }
 
-/// An input that changes while rustc runs (an editor save, or a `git checkout`
-/// into the same worktree) must never be recorded with the artifact compiled
-/// from its earlier content: the next build of the new content would restore
-/// the old code (Manifold #722 bisect, a stale `manifold_mod_types`).
+/// A compile whose input `src/value.rs` is rewritten from 42 to 43 by `edit`
+/// (a shell command run once, after the real rustc has read the old content
+/// and before Bellows hashes the inputs). Neither the edit nor any later build
+/// may restore the artifact compiled from 42.
 #[cfg(unix)]
-#[test]
-fn an_input_edited_during_the_compile_is_never_stored() {
+fn assert_input_edited_during_the_compile_is_never_stored(edit: &str) {
     use std::os::unix::fs::PermissionsExt;
     let f = Fixture::new(
         "mod value; pub fn value() -> u32 { value::value() }",
@@ -2133,10 +2131,10 @@ fn an_input_edited_during_the_compile_is_never_stored() {
     );
     let value = f.workspace.join("src/value.rs");
     fs::write(&value, "pub fn value() -> u32 { 42 }").unwrap();
-    // A rustc that, once, rewrites value.rs after compiling the library: the
-    // artifact holds 42 while the file Bellows then reads holds 43.
     let marker = f.temp.path().join("edit-once");
     fs::write(&marker, "").unwrap();
+    let staged = f.temp.path().join("value-43.rs");
+    fs::write(&staged, "pub fn value() -> u32 { 43 }").unwrap();
     let shim = f.temp.path().join("rustc-shim");
     let real = String::from_utf8(checked(Command::new("rustup").args(["which", "rustc"])).stdout)
         .unwrap()
@@ -2148,8 +2146,9 @@ fn an_input_edited_during_the_compile_is_never_stored() {
             "#!/bin/sh\n\"{real}\" \"$@\"\nstatus=$?\n\
              case \" $* \" in *\" --crate-name fixture \"*\"--crate-type lib\"*)\n\
              if [ -e \"{marker}\" ]; then rm \"{marker}\"; sleep 1; \
-             printf 'pub fn value() -> u32 {{ 43 }}' > \"{value}\"; fi ;;\nesac\nexit $status\n",
+             STAGED=\"{staged}\" VALUE=\"{value}\"; {edit}; fi ;;\nesac\nexit $status\n",
             marker = marker.display(),
+            staged = staged.display(),
             value = value.display(),
         ),
     )
@@ -2164,12 +2163,18 @@ fn an_input_edited_during_the_compile_is_never_stored() {
     };
     let first = build();
     assert!(!marker.exists(), "the shim never edited value.rs");
+    assert_eq!(
+        fs::read_to_string(&value).unwrap(),
+        "pub fn value() -> u32 { 43 }"
+    );
     assert!(
         stderr(&first).contains("changed during the compile"),
         "{}",
         stderr(&first)
     );
-    // value.rs is newer than cargo's record, so cargo recompiles the library.
+    // Rebuild until cargo has compiled the library again (an edit that keeps
+    // an old modification time does not make cargo's own record stale).
+    fs::remove_dir_all(f.workspace.join("target")).unwrap();
     let second = build();
     assert!(
         !stderr(&second).contains("LOCAL HIT fixture"),
@@ -2177,6 +2182,26 @@ fn an_input_edited_during_the_compile_is_never_stored() {
         stderr(&second)
     );
     assert_eq!(f.value("target"), "43");
+}
+
+/// An input that changes while rustc runs (an editor save, or a `git checkout`
+/// into the same worktree) must never be recorded with the artifact compiled
+/// from its earlier content: the next build of the new content would restore
+/// the old code (Manifold #722 bisect, a stale `manifold_mod_types`).
+#[cfg(unix)]
+#[test]
+fn an_input_edited_during_the_compile_is_never_stored() {
+    assert_input_edited_during_the_compile_is_never_stored("cat \"$STAGED\" > \"$VALUE\"");
+}
+
+/// The same when the replacement keeps an older modification time (`cp -p`,
+/// `rsync -t`, archive extraction): the change time still moves.
+#[cfg(unix)]
+#[test]
+fn an_input_replaced_with_an_old_modification_time_is_never_stored() {
+    assert_input_edited_during_the_compile_is_never_stored(
+        "touch -d '2001-01-01' \"$STAGED\"; cp -p \"$STAGED\" \"$VALUE\"",
+    );
 }
 
 /// The build-script counterpart of `an_input_edited_during_the_compile_is_never_stored`:

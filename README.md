@@ -166,7 +166,8 @@ the candidate manifest.
 A static command identity retains several dependency manifests, allowing old
 branches to become hits again. Every candidate is revalidated before restore.
 Inputs are hashed after rustc (or a build script) finishes, so a source,
-registry or toolchain file modified at or after the run started (an editor
+registry or toolchain file changed at or after the run started (by its change
+time, which also catches `cp -p`; an editor
 save, a `git checkout` into the same worktree) is never recorded with that
 result: the run stays local. Files in the target directory are exempt; Cargo
 writes them under its target-dir lock before the units that read them start.

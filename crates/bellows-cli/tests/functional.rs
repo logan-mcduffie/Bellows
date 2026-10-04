@@ -999,6 +999,14 @@ fn write_files(root: &std::path::Path, files: &[(&str, &str)]) {
 }
 
 /// Copy the fixture's sources (not its target) into a sibling checkout.
+/// Let inputs written just now age past the slack within which Bellows treats
+/// a file as possibly changed during the compile (`changed_during_compile`):
+/// tests that call `bellows rustc` directly start compiling within milliseconds
+/// of writing their sources, unlike a cargo build.
+fn settle() {
+    std::thread::sleep(std::time::Duration::from_millis(150));
+}
+
 fn second_checkout(f: &mut Fixture, name: &str) {
     fn copy(from: &std::path::Path, to: &std::path::Path) {
         fs::create_dir_all(to).unwrap();
@@ -1181,6 +1189,7 @@ fn native_archive(f: &Fixture, value: i32) {
             "native/value.obj",
         ]));
     }
+    settle();
 }
 
 #[test]
@@ -1371,6 +1380,7 @@ fn restore_replaces_an_executable_that_is_still_running() {
             "--out-dir=out",
         ]))
     };
+    settle();
     assert_eq!(decisions(&link(), "app"), ["CACHE MISS"]);
     let binary = f
         .workspace
@@ -2107,4 +2117,106 @@ fn an_unreachable_server_is_reported_loudly_and_can_be_required() {
     let required = run().env("BELLOWS_REQUIRE_SERVER", "1").output().unwrap();
     assert!(!required.status.success());
     assert!(stderr(&required).contains("BELLOWS_REQUIRE_SERVER"));
+}
+
+/// An input that changes while rustc runs (an editor save, or a `git checkout`
+/// into the same worktree) must never be recorded with the artifact compiled
+/// from its earlier content: the next build of the new content would restore
+/// the old code (Manifold #722 bisect, a stale `manifold_mod_types`).
+#[cfg(unix)]
+#[test]
+fn an_input_edited_during_the_compile_is_never_stored() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new(
+        "mod value; pub fn value() -> u32 { value::value() }",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    let value = f.workspace.join("src/value.rs");
+    fs::write(&value, "pub fn value() -> u32 { 42 }").unwrap();
+    // A rustc that, once, rewrites value.rs after compiling the library: the
+    // artifact holds 42 while the file Bellows then reads holds 43.
+    let marker = f.temp.path().join("edit-once");
+    fs::write(&marker, "").unwrap();
+    let shim = f.temp.path().join("rustc-shim");
+    let real = String::from_utf8(checked(Command::new("rustup").args(["which", "rustc"])).stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\n\"{real}\" \"$@\"\nstatus=$?\n\
+             case \" $* \" in *\" --crate-name fixture \"*\"--crate-type lib\"*)\n\
+             if [ -e \"{marker}\" ]; then rm \"{marker}\"; sleep 1; \
+             printf 'pub fn value() -> u32 {{ 43 }}' > \"{value}\"; fi ;;\nesac\nexit $status\n",
+            marker = marker.display(),
+            value = value.display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    let build = || {
+        checked(
+            f.local()
+                .env("RUSTC", &shim)
+                .args(["cargo", "build", "--release", "--offline"]),
+        )
+    };
+    let first = build();
+    assert!(!marker.exists(), "the shim never edited value.rs");
+    assert!(
+        stderr(&first).contains("changed during the compile"),
+        "{}",
+        stderr(&first)
+    );
+    // value.rs is newer than cargo's record, so cargo recompiles the library.
+    let second = build();
+    assert!(
+        !stderr(&second).contains("LOCAL HIT fixture"),
+        "{}",
+        stderr(&second)
+    );
+    assert_eq!(f.value("target"), "43");
+}
+
+/// The build-script counterpart of `an_input_edited_during_the_compile_is_never_stored`:
+/// a declared input rewritten while the script runs must not be recorded with
+/// the output generated from its earlier content.
+#[test]
+fn a_build_script_input_edited_while_it_runs_is_never_stored() {
+    let f = Fixture::new(
+        "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));",
+        "fn main() { println!(\"{}\", fixture::value()); }",
+    );
+    let marker = f.temp.path().join("edit-once");
+    fs::write(&marker, "").unwrap();
+    write_files(
+        &f.workspace,
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2024\"\nbuild=\"build.rs\"\n[workspace]\n",
+            ),
+            ("data.txt", "7"),
+            (
+                "build.rs",
+                &format!(
+                    "fn main() {{\n    println!(\"cargo:rerun-if-changed=data.txt\");\n    let value = std::fs::read_to_string(\"data.txt\").unwrap();\n    let out = std::env::var(\"OUT_DIR\").unwrap();\n    std::fs::write(format!(\"{{out}}/generated.rs\"), format!(\"pub fn value() -> u32 {{{{ {{}} }}}}\", value.trim())).unwrap();\n    // Once: the input changes after the script read it.\n    if std::fs::remove_file({marker:?}).is_ok() {{\n        std::thread::sleep(std::time::Duration::from_millis(200));\n        std::fs::write(\"data.txt\", \"9\").unwrap();\n    }}\n}}\n",
+                    marker = marker.to_string_lossy()
+                ),
+            ),
+        ],
+    );
+    f.lock();
+    let first = f.build();
+    assert!(!marker.exists(), "the build script never edited data.txt");
+    assert!(
+        stderr(&first).contains("changed while the build script ran"),
+        "{}",
+        stderr(&first)
+    );
+    assert_eq!(f.value("target"), "7");
+    // data.txt is newer than cargo's record: the script reruns, and it reads 9.
+    f.build();
+    assert_eq!(f.value("target"), "9");
 }

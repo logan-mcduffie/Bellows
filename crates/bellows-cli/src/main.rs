@@ -3178,6 +3178,49 @@ fn transform_dep_info(bytes: &[u8], normalizer: &PathNormalizer, localize: bool)
     .into_bytes()
 }
 
+/// Whether `path` may have changed after rustc read it. Inputs are hashed when
+/// rustc has finished; a file written during the compile (an editor save, a
+/// `git checkout` into the same worktree) would otherwise be recorded with the
+/// artifact compiled from its earlier content, and every later build of the new
+/// content would restore the old code. A safe miss: anything modified at or
+/// after the compile started, less the slack its timestamps need, is not
+/// stored. Unix ctime also catches writers that preserve the modification time.
+fn changed_during_compile(path: &Path, started: std::time::SystemTime) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return true;
+    };
+    let stamps = [
+        metadata.modified().ok(),
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Some(
+                std::time::UNIX_EPOCH
+                    + Duration::new(metadata.ctime().max(0) as u64, metadata.ctime_nsec() as u32),
+            )
+        },
+    ];
+    stamps.into_iter().any(|stamp| match stamp {
+        Some(stamp) => stamp >= started - timestamp_slack(stamp),
+        None => true,
+    })
+}
+
+/// How far a file timestamp may trail the clock. Kernels stamp files from a
+/// coarse clock (a scheduler tick on Linux, about 15.6 ms on Windows); some
+/// filesystems keep whole seconds (ext3, HFS+) or two (FAT), and their stamps
+/// have no sub-second part.
+fn timestamp_slack(stamp: std::time::SystemTime) -> Duration {
+    let whole_second = stamp
+        .duration_since(std::time::UNIX_EPOCH)
+        .is_ok_and(|since| since.subsec_nanos() == 0);
+    if whole_second {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_millis(50)
+    }
+}
+
 /// Outputs of a linked unit: every regular file named for this unit that
 /// rustc wrote during the compile. The predicted primary outputs must be
 /// among them; directory outputs (`.dSYM`) are not modeled.
@@ -3357,6 +3400,18 @@ fn capture_outputs(
         {
             return Err(not_stored(format!(
                 "reads {} from another checkout",
+                absolute.display()
+            )));
+        }
+        // Cargo's own outputs (dependency artifacts, build-script OUT_DIRs)
+        // are written by earlier units of this build under its target-dir
+        // lock, and are complete before a unit that reads them starts.
+        let produced_by_cargo = ["$TARGET", "$PROFILE"]
+            .iter()
+            .any(|root| normalized.starts_with(root));
+        if !produced_by_cargo && changed_during_compile(absolute, started) {
+            return Err(not_stored(format!(
+                "{} changed during the compile",
                 absolute.display()
             )));
         }
@@ -5637,7 +5692,8 @@ mod tests {
             &identity,
             stdout.clone(),
             stderr.clone(),
-            std::time::SystemTime::now(),
+            // The compile started after the source was written.
+            std::time::SystemTime::now() + Duration::from_secs(10),
             None,
         )
         .unwrap();
